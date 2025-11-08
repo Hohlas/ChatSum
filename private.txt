@@ -1,0 +1,10 @@
+# Telegram API
+TELEGRAM_API_ID=ваш_api_id
+TELEGRAM_API_HASH=ваш_api_hash
+TELEGRAM_PHONE=+79001234567
+
+# Perplexity API
+PERPLEXITY_API_KEY=ваш_perplexity_ключ
+
+# ID чата для мониторинга
+CHAT_ID=3074915751
