@@ -30,7 +30,7 @@
 
 ```powershell
 # 1. Клонировать репозиторий
-git clone https://github.com/ваш-username/chat-filter.git
+git clone https://github.com/Hohlas/chat-filter.git
 cd chat-filter
 
 # 2. Установить зависимости
@@ -48,7 +48,7 @@ python main.py
 
 ```bash
 # 1. Клонировать репозиторий
-git clone https://github.com/ваш-username/chat-filter.git
+git clone https://github.com/Hohlas/chat-filter.git
 cd chat-filter
 
 # 2. Установить зависимости
