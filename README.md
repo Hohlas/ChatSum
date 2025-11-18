@@ -42,8 +42,9 @@ Telegram userbot для анализа сообщений чата с помощ
 ### Шаг 2: Клонирование репозитория
 
 ```bash
-git clone <url-репозитория>
+git clone https://github.com/Hohlas/chat-filter.git
 cd chat-filter
+git update-index --skip-worktree private.txt # игнорировать локальные изменения в файле
 ```
 
 ### Шаг 3: Установка зависимостей
