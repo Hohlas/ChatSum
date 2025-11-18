@@ -12,6 +12,9 @@ API_ID = int(os.getenv('TELEGRAM_API_ID'))
 API_HASH = os.getenv('TELEGRAM_API_HASH')
 PHONE = os.getenv('TELEGRAM_PHONE')
 
+# ID канала для результатов (если не указан - используется "Избранное")
+RESULTS_DESTINATION = os.getenv('TELEGRAM_GROUP_ID', 'me')
+
 # Инициализация клиента
 telegram_client = TelegramClient('session_name', API_ID, API_HASH)
 
@@ -104,7 +107,7 @@ async def handle_test_command(event):
                 limit = int(parts[1])
             except ValueError:
                 await event.delete()
-                await telegram_client.send_message('me', "❌ Неверный формат. Используйте: /test или /test 5")
+                await telegram_client.send_message(RESULTS_DESTINATION, "❌ Неверный формат. Используйте: /test или /test 5")
                 return
         
         # Получаем название чата для информации
@@ -114,31 +117,31 @@ async def handle_test_command(event):
         # Информируем о начале (удаляем своё сообщение с командой для чистоты)
         await event.delete()
         
-        # Отправляем уведомление в Избранное
-        await telegram_client.send_message('me', f"🔄 ТЕСТ: Загружаю {limit} последних сообщений из чата '{chat_name}'...")
+        # Отправляем уведомление в канал/Избранное
+        await telegram_client.send_message(RESULTS_DESTINATION, f"🔄 ТЕСТ: Загружаю {limit} последних сообщений из чата '{chat_name}'...")
         
         # Собираем сообщения
         messages_data = await collect_messages_test(event.chat_id, limit=limit)
         
         if not messages_data:
-            await telegram_client.send_message('me', f"❌ Не найдено текстовых сообщений в чате '{chat_name}'")
+            await telegram_client.send_message(RESULTS_DESTINATION, f"❌ Не найдено текстовых сообщений в чате '{chat_name}'")
             return
         
-        # Форматируем и отправляем результат В ИЗБРАННОЕ
+        # Форматируем и отправляем результат в канал/Избранное
         display_text = f"📍 Чат: **{chat_name}**\n\n" + format_messages_display(messages_data)
         
-        # Отправляем в Избранное (разбиваем на части если нужно)
+        # Отправляем в канал/Избранное (разбиваем на части если нужно)
         max_length = 4096  # Ограничение Telegram
         if len(display_text) > max_length:
             # Отправляем первую часть
-            await telegram_client.send_message('me', display_text[:max_length])
+            await telegram_client.send_message(RESULTS_DESTINATION, display_text[:max_length])
             # Отправляем остаток
             remaining = display_text[max_length:]
             while remaining:
-                await telegram_client.send_message('me', remaining[:max_length])
+                await telegram_client.send_message(RESULTS_DESTINATION, remaining[:max_length])
                 remaining = remaining[max_length:]
         else:
-            await telegram_client.send_message('me', display_text)
+            await telegram_client.send_message(RESULTS_DESTINATION, display_text)
         
         print("✅ Тест успешно завершён")
         
@@ -148,7 +151,7 @@ async def handle_test_command(event):
     except Exception as e:
         error_msg = f"❌ Ошибка при выполнении команды: {e}"
         print(error_msg)
-        await telegram_client.send_message('me', error_msg)
+        await telegram_client.send_message(RESULTS_DESTINATION, error_msg)
 
 
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/help'))
@@ -172,7 +175,7 @@ async def handle_help_command(event):
 ✅ Форматирование дат и текста
 
 **🔒 Приватность:**
-Результаты отправляются в ваше "Избранное".
+Результаты отправляются в ваш приватный канал/Избранное.
 Ваше сообщение с командой автоматически удаляется.
 Никто в чате не увидит ни команду, ни результаты!
 
@@ -181,7 +184,7 @@ async def handle_help_command(event):
 Просто проверяем загрузку сообщений.
 """
     await event.delete()
-    await telegram_client.send_message('me', help_text)
+    await telegram_client.send_message(RESULTS_DESTINATION, help_text)
 
 
 async def main():
@@ -193,6 +196,13 @@ async def main():
     
     await telegram_client.start(phone=PHONE)
     print("✅ Подключение к Telegram установлено")
+    
+    # Показываем куда будут отправляться результаты
+    destination_text = "приватный канал" if RESULTS_DESTINATION != 'me' else "Избранное"
+    print(f"\n📮 Результаты будут отправляться в: {destination_text}")
+    if RESULTS_DESTINATION != 'me':
+        print(f"   ID канала: {RESULTS_DESTINATION}")
+    
     print("\n📌 Доступные тестовые команды:")
     print("  /test - загрузить 2 последних сообщения")
     print("  /test 5 - загрузить 5 последних сообщений")

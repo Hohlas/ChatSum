@@ -15,6 +15,9 @@ API_HASH = os.getenv('TELEGRAM_API_HASH')
 PHONE = os.getenv('TELEGRAM_PHONE')
 CHAT_ID = int(os.getenv('CHAT_ID'))
 
+# ID канала для результатов (если не указан - используется "Избранное")
+RESULTS_DESTINATION = os.getenv('TELEGRAM_GROUP_ID', 'me')
+
 # Конфигурация Perplexity
 PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY')
 
@@ -185,14 +188,14 @@ async def handle_analyze_command(event):
         # Удаляем команду из чата (для приватности)
         await event.delete()
         
-        # Информируем о начале анализа В ИЗБРАННОМ
-        await telegram_client.send_message('me', f"🔄 Начинаю анализ чата '{chat_name}' за последние {days} дней и {hours} часов...")
+        # Информируем о начале анализа в канале/Избранном
+        await telegram_client.send_message(RESULTS_DESTINATION, f"🔄 Начинаю анализ чата '{chat_name}' за последние {days} дней и {hours} часов...")
         
         # Собираем сообщения
         messages_data = await collect_messages(event.chat_id, hours=hours, days=days)
         
         if not messages_data:
-            await telegram_client.send_message('me', f"❌ За указанный период не найдено сообщений в чате '{chat_name}'")
+            await telegram_client.send_message(RESULTS_DESTINATION, f"❌ За указанный период не найдено сообщений в чате '{chat_name}'")
             return
         
         # Создаем выжимку
@@ -201,7 +204,7 @@ async def handle_analyze_command(event):
         # Сохраняем результаты
         save_analysis(messages_data, summary)
         
-        # Отправляем выжимку пользователю В ИЗБРАННОЕ
+        # Отправляем выжимку пользователю в канал/Избранное
         response = f"📍 Чат: **{chat_name}**\n\n"
         response += f"📊 **Выжимка чата**\n\n"
         response += f"Период: последние {days} дней и {hours} часов\n"
@@ -212,21 +215,21 @@ async def handle_analyze_command(event):
         max_length = 4096  # Ограничение Telegram
         if len(response) > max_length:
             # Отправляем первую часть
-            await telegram_client.send_message('me', response[:max_length])
+            await telegram_client.send_message(RESULTS_DESTINATION, response[:max_length])
             # Отправляем остаток
             remaining = response[max_length:]
             while remaining:
-                await telegram_client.send_message('me', remaining[:max_length])
+                await telegram_client.send_message(RESULTS_DESTINATION, remaining[:max_length])
                 remaining = remaining[max_length:]
         else:
-            await telegram_client.send_message('me', response)
+            await telegram_client.send_message(RESULTS_DESTINATION, response)
         
         print("✅ Анализ успешно завершён и отправлен пользователю")
         
     except Exception as e:
         error_msg = f"❌ Ошибка при выполнении команды: {e}"
         print(error_msg)
-        await telegram_client.send_message('me', error_msg)
+        await telegram_client.send_message(RESULTS_DESTINATION, error_msg)
 
 
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/help'))
@@ -255,13 +258,13 @@ async def handle_help_command(event):
 
 **🔒 Приватность:**
 • Ваша команда автоматически удаляется из чата
-• Результаты отправляются только в "Избранное"
+• Результаты отправляются в ваш приватный канал/Избранное
 • Никто в чате не узнает, что вы делали анализ
 
 **Примечание:** Бот реагирует только на ваши собственные команды (исходящие сообщения).
 """
     await event.delete()
-    await telegram_client.send_message('me', help_text)
+    await telegram_client.send_message(RESULTS_DESTINATION, help_text)
 
 
 async def main():
@@ -271,6 +274,13 @@ async def main():
     
     await telegram_client.start(phone=PHONE)
     print("✅ Подключение к Telegram установлено")
+    
+    # Показываем куда будут отправляться результаты
+    destination_text = "приватный канал" if RESULTS_DESTINATION != 'me' else "Избранное"
+    print(f"\n📮 Результаты будут отправляться в: {destination_text}")
+    if RESULTS_DESTINATION != 'me':
+        print(f"   ID канала: {RESULTS_DESTINATION}")
+    
     print("\n📌 Доступные команды:")
     print("  /analyze - анализ чата за последние 24 часа")
     print("  /analyze [время] - анализ за указанный период")
