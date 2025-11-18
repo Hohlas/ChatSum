@@ -14,6 +14,13 @@ PHONE = os.getenv('TELEGRAM_PHONE')
 
 # ID канала для результатов (если не указан - используется "Избранное")
 RESULTS_DESTINATION = os.getenv('TELEGRAM_GROUP_ID', 'me')
+if RESULTS_DESTINATION != 'me':
+    try:
+        RESULTS_DESTINATION = int(RESULTS_DESTINATION)
+    except ValueError:
+        print(f"⚠️  Неверный формат TELEGRAM_GROUP_ID: {RESULTS_DESTINATION}")
+        print("   Использую 'Избранное' вместо канала")
+        RESULTS_DESTINATION = 'me'
 
 # Инициализация клиента
 telegram_client = TelegramClient('session_name', API_ID, API_HASH)
@@ -202,6 +209,15 @@ async def main():
     print(f"\n📮 Результаты будут отправляться в: {destination_text}")
     if RESULTS_DESTINATION != 'me':
         print(f"   ID канала: {RESULTS_DESTINATION}")
+        # Проверяем доступность канала
+        try:
+            channel = await telegram_client.get_entity(RESULTS_DESTINATION)
+            channel_name = channel.title if hasattr(channel, 'title') else "Канал"
+            print(f"   ✅ Канал найден: {channel_name}")
+        except Exception as e:
+            print(f"   ⚠️  Не могу получить доступ к каналу: {e}")
+            print(f"   💡 Убедитесь что вы являетесь владельцем/админом канала")
+            print(f"   💡 Или закомментируйте TELEGRAM_GROUP_ID в private.txt")
     
     print("\n📌 Доступные тестовые команды:")
     print("  /test - загрузить 2 последних сообщения")
