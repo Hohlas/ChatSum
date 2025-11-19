@@ -28,7 +28,8 @@ if RESULTS_DESTINATION != 'me':
         RESULTS_DESTINATION = 'me'
 
 # Конфигурация Perplexity
-PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY')
+# Очищаем API ключ от возможных невидимых символов и пробелов
+PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY', '').strip()
 
 # Конфигурация фильтрации сообщений
 MIN_MESSAGE_LENGTH = 3  # Минимальная длина сообщения (символов)
@@ -221,8 +222,37 @@ CURRENT_MODEL, USE_REASONING = load_model_config(MODEL_CONFIG_FILE)
 # Инициализация клиентов
 telegram_client = TelegramClient('session_name', API_ID, API_HASH)
 
-# Создаем httpx клиент с правильной кодировкой для Unicode
-http_client = httpx.Client(
+# Убеждаемся что API ключ содержит только ASCII символы
+try:
+    PERPLEXITY_API_KEY.encode('ascii')
+except UnicodeEncodeError:
+    print("⚠️  ВНИМАНИЕ: API ключ содержит не-ASCII символы!")
+    print(f"   Проблемные символы: {[c for c in PERPLEXITY_API_KEY if ord(c) > 127]}")
+    # Удаляем все не-ASCII символы
+    PERPLEXITY_API_KEY = PERPLEXITY_API_KEY.encode('ascii', errors='ignore').decode('ascii')
+
+# Создаем httpx клиент с явной обработкой заголовков
+class ASCIIHeadersClient(httpx.Client):
+    """Custom httpx client that ensures all headers are ASCII-safe"""
+    def build_request(self, *args, **kwargs):
+        request = super().build_request(*args, **kwargs)
+        # Конвертируем все заголовки в ASCII-безопасный формат
+        safe_headers = {}
+        for key, value in request.headers.items():
+            try:
+                # Пытаемся закодировать значение в ASCII
+                if isinstance(value, str):
+                    value.encode('ascii')
+                safe_headers[key] = value
+            except (UnicodeEncodeError, AttributeError):
+                # Если не получается - конвертируем в безопасную строку
+                safe_value = str(value).encode('ascii', errors='ignore').decode('ascii')
+                safe_headers[key] = safe_value
+                print(f"⚠️  Исправлен заголовок '{key}': '{value}' -> '{safe_value}'")
+        request.headers = httpx.Headers(safe_headers)
+        return request
+
+http_client = ASCIIHeadersClient(
     timeout=60.0,
     limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
 )
@@ -230,7 +260,8 @@ http_client = httpx.Client(
 perplexity_client = OpenAI(
     api_key=PERPLEXITY_API_KEY,
     base_url='https://api.perplexity.ai',
-    http_client=http_client
+    http_client=http_client,
+    max_retries=2
 )
 
 
