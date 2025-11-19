@@ -31,6 +31,9 @@ if RESULTS_DESTINATION != 'me':
 # Очищаем API ключ от возможных невидимых символов и пробелов
 PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY', '').strip()
 
+if not PERPLEXITY_API_KEY:
+    print("⚠️  ВНИМАНИЕ: PERPLEXITY_API_KEY не найден в private.txt!")
+
 # Конфигурация фильтрации сообщений
 MIN_MESSAGE_LENGTH = 3  # Минимальная длина сообщения (символов)
 NOISE_PATTERNS = [
@@ -222,14 +225,24 @@ CURRENT_MODEL, USE_REASONING = load_model_config(MODEL_CONFIG_FILE)
 # Инициализация клиентов
 telegram_client = TelegramClient('session_name', API_ID, API_HASH)
 
+# Диагностика API ключа
+print(f"🔑 Проверка Perplexity API ключа:")
+print(f"   Длина: {len(PERPLEXITY_API_KEY)} символов")
+print(f"   Первые 10 символов: {PERPLEXITY_API_KEY[:10]}...")
+print(f"   Последние 10 символов: ...{PERPLEXITY_API_KEY[-10:]}")
+
 # Убеждаемся что API ключ содержит только ASCII символы
+has_non_ascii = False
 try:
     PERPLEXITY_API_KEY.encode('ascii')
+    print(f"   ✅ Ключ содержит только ASCII символы")
 except UnicodeEncodeError:
-    print("⚠️  ВНИМАНИЕ: API ключ содержит не-ASCII символы!")
+    has_non_ascii = True
+    print("   ⚠️  ВНИМАНИЕ: API ключ содержит не-ASCII символы!")
     print(f"   Проблемные символы: {[c for c in PERPLEXITY_API_KEY if ord(c) > 127]}")
     # Удаляем все не-ASCII символы
     PERPLEXITY_API_KEY = PERPLEXITY_API_KEY.encode('ascii', errors='ignore').decode('ascii')
+    print(f"   После очистки: {len(PERPLEXITY_API_KEY)} символов")
 
 # Создаем httpx клиент с явной обработкой заголовков
 class ASCIIHeadersClient(httpx.Client):
