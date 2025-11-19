@@ -614,15 +614,21 @@ async def create_summary(messages_data, model='sonar', use_reasoning=False):
         summary = response.choices[0].message.content
         print("✅ Выжимка успешно создана")
         
-        # Показываем статистику использования токенов
+        # Собираем статистику использования токенов
+        usage_info = None
         if hasattr(response, 'usage'):
             usage = response.usage
+            usage_info = {
+                'prompt_tokens': usage.prompt_tokens if hasattr(usage, 'prompt_tokens') else 0,
+                'completion_tokens': usage.completion_tokens if hasattr(usage, 'completion_tokens') else 0,
+                'total_tokens': usage.total_tokens if hasattr(usage, 'total_tokens') else 0
+            }
             print(f"   📊 Использовано токенов:")
-            print(f"      Промпт: {usage.prompt_tokens if hasattr(usage, 'prompt_tokens') else 'N/A'}")
-            print(f"      Ответ: {usage.completion_tokens if hasattr(usage, 'completion_tokens') else 'N/A'}")
-            print(f"      Всего: {usage.total_tokens if hasattr(usage, 'total_tokens') else 'N/A'}")
+            print(f"      Промпт: {usage_info['prompt_tokens']}")
+            print(f"      Ответ: {usage_info['completion_tokens']}")
+            print(f"      Всего: {usage_info['total_tokens']}")
         
-        return summary
+        return summary, usage_info
         
     except Exception as e:
         error_msg = f"❌ Ошибка при создании выжимки: {e}"
@@ -636,7 +642,7 @@ async def create_summary(messages_data, model='sonar', use_reasoning=False):
         print("   Подробная трассировка:")
         traceback.print_exc()
         
-        return error_msg
+        return error_msg, None
 
 
 def save_analysis(messages_data, summary):
@@ -747,19 +753,31 @@ async def process_chat_command(event, use_ai=True):
         # Ветвление: с AI или без
         if use_ai:
             # Режим /sum - анализ с AI
-            summary = await create_summary(optimized_messages, model=CURRENT_MODEL, use_reasoning=USE_REASONING)
+            summary, usage_info = await create_summary(optimized_messages, model=CURRENT_MODEL, use_reasoning=USE_REASONING)
             save_analysis(optimized_messages, summary)
             
-            # Отправляем выжимку
-            response = f"📍 Чат: **{chat_name}**\n\n"
-            response += f"📊 **Выжимка чата**\n\n"
-            if limit:
-                response += f"Режим: последние {limit} сообщений\n"
-            else:
-                response += f"Период: последние {days or 0} дней и {hours or 0} часов\n"
-            response += f"Загружено сообщений: {len(messages_data)}\n"
-            response += f"Проанализировано после фильтрации: {len(optimized_messages)}\n\n"
-            response += f"**Результат анализа:**\n\n{summary}"
+            # Отправляем выжимку (без лишней информации)
+            response = summary
+            
+            # Добавляем информацию о токенах и стоимости
+            if usage_info:
+                prompt_tokens = usage_info['prompt_tokens']
+                completion_tokens = usage_info['completion_tokens']
+                total_tokens = usage_info['total_tokens']
+                
+                # Расчет стоимости для sonar-pro
+                # https://docs.perplexity.ai/guides/pricing
+                # sonar-pro: $3 per 1M input tokens, $15 per 1M output tokens
+                input_cost = (prompt_tokens / 1_000_000) * 3.0
+                output_cost = (completion_tokens / 1_000_000) * 15.0
+                total_cost = input_cost + output_cost
+                
+                response += f"\n\n---\n\n"
+                response += f"📊 **Использовано токенов:**\n"
+                response += f"• Промпт: {prompt_tokens:,}\n"
+                response += f"• Ответ: {completion_tokens:,}\n"
+                response += f"• Всего: {total_tokens:,}\n"
+                response += f"💰 Стоимость: ${total_cost:.4f}"
             
             # Если сообщение слишком длинное, разбиваем на части
             max_length = 4096
