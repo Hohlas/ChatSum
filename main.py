@@ -355,51 +355,83 @@ def optimize_messages(messages_data, chat_id_str):
     return optimized
 
 
-async def collect_messages(chat_id, hours=24, days=0):
+async def collect_messages(chat_id, hours=None, days=None, limit=None):
     """
-    Собирает сообщения из чата за указанный период
+    Собирает сообщения из чата за указанный период или количество
     
     Args:
         chat_id: ID чата для анализа
-        hours: Количество часов назад (по умолчанию 24)
-        days: Количество дней назад (по умолчанию 0)
+        hours: Количество часов назад (опционально)
+        days: Количество дней назад (опционально)
+        limit: Количество последних сообщений (опционально)
     
     Returns:
         Кортеж (список сообщений, chat_id_str для ссылок)
     """
-    print(f"🔄 Загрузка сообщений за последние {days} дней и {hours} часов...")
-    
-    # Вычисляем временную границу
-    time_limit = datetime.now() - timedelta(days=days, hours=hours)
-    
     # Получаем информацию о чате для формирования ссылок
     chat = await telegram_client.get_entity(chat_id)
     # Преобразуем chat_id в формат для ссылок (убираем -100 префикс)
     chat_id_str = str(chat_id).replace('-100', '')
     
     messages_data = []
-    async for message in telegram_client.iter_messages(chat_id):
-        # Прерываем, если достигли временного предела
-        if message.date < time_limit:
-            break
-            
-        if message.text:
-            sender = await message.get_sender()
-            sender_name = "Unknown"
-            
-            if hasattr(sender, 'first_name'):
-                sender_name = sender.first_name
-                if hasattr(sender, 'last_name') and sender.last_name:
-                    sender_name += f" {sender.last_name}"
-            elif hasattr(sender, 'title'):
-                sender_name = sender.title
-            
-            messages_data.append({
-                'sender': sender_name,
-                'text': message.text,
-                'date': message.date.strftime('%Y-%m-%d %H:%M:%S'),
-                'message_id': message.id
-            })
+    
+    if limit:
+        # Режим: последние N сообщений
+        print(f"🔄 Загрузка последних {limit} сообщений...")
+        count = 0
+        async for message in telegram_client.iter_messages(chat_id):
+            if count >= limit:
+                break
+            if message.text:
+                sender = await message.get_sender()
+                sender_name = "Unknown"
+                
+                if hasattr(sender, 'first_name'):
+                    sender_name = sender.first_name
+                    if hasattr(sender, 'last_name') and sender.last_name:
+                        sender_name += f" {sender.last_name}"
+                elif hasattr(sender, 'title'):
+                    sender_name = sender.title
+                
+                messages_data.append({
+                    'sender': sender_name,
+                    'text': message.text,
+                    'date': message.date.strftime('%Y-%m-%d %H:%M:%S'),
+                    'message_id': message.id
+                })
+                count += 1
+    else:
+        # Режим: за период времени
+        hours = hours or 0
+        days = days or 0
+        if hours == 0 and days == 0:
+            hours = 24  # По умолчанию 24 часа
+        
+        print(f"🔄 Загрузка сообщений за последние {days} дней и {hours} часов...")
+        time_limit = datetime.now() - timedelta(days=days, hours=hours)
+        
+        async for message in telegram_client.iter_messages(chat_id):
+            # Прерываем, если достигли временного предела
+            if message.date < time_limit:
+                break
+                
+            if message.text:
+                sender = await message.get_sender()
+                sender_name = "Unknown"
+                
+                if hasattr(sender, 'first_name'):
+                    sender_name = sender.first_name
+                    if hasattr(sender, 'last_name') and sender.last_name:
+                        sender_name += f" {sender.last_name}"
+                elif hasattr(sender, 'title'):
+                    sender_name = sender.title
+                
+                messages_data.append({
+                    'sender': sender_name,
+                    'text': message.text,
+                    'date': message.date.strftime('%Y-%m-%d %H:%M:%S'),
+                    'message_id': message.id
+                })
     
     # Сортируем по времени (от старых к новым)
     messages_data.reverse()
@@ -537,32 +569,47 @@ def save_analysis(messages_data, summary):
     print(f"💾 Результаты сохранены в {filename}")
 
 
-@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/analyze'))
-async def handle_analyze_command(event):
+async def process_chat_command(event, use_ai=True):
     """
-    Обработчик команды /analyze для запуска анализа чата
+    Универсальная функция обработки команд /sum и /copy
     
-    Примеры использования:
-    /analyze - анализ за последние 24 часа
-    /analyze 12h - анализ за последние 12 часов
-    /analyze 2d - анализ за последние 2 дня
-    /analyze 3d 6h - анализ за последние 3 дня и 6 часов
+    Args:
+        event: Событие Telegram
+        use_ai: True для /sum (с AI анализом), False для /copy (только экспорт)
     """
     try:
         # Парсим параметры команды
         message_text = event.raw_text
         parts = message_text.split()
         
-        hours = 24
-        days = 0
+        hours = None
+        days = None
+        limit = None
         
         # Обрабатываем параметры
-        for part in parts[1:]:
-            part = part.lower()
-            if 'h' in part:
-                hours = int(part.replace('h', ''))
-            elif 'd' in part:
-                days = int(part.replace('d', ''))
+        if len(parts) > 1:
+            param = parts[1].lower()
+            
+            # Проверяем, что это - время или количество
+            if 'h' in param:
+                hours = int(param.replace('h', ''))
+            elif 'd' in param:
+                days = int(param.replace('d', ''))
+            elif param.isdigit():
+                # Это количество сообщений
+                limit = int(param)
+            
+            # Если есть второй параметр (например, 3d 6h)
+            if len(parts) > 2:
+                param2 = parts[2].lower()
+                if 'h' in param2:
+                    hours = int(param2.replace('h', ''))
+                elif 'd' in param2:
+                    days = int(param2.replace('d', ''))
+        
+        # Если ничего не указано, по умолчанию 24 часа
+        if hours is None and days is None and limit is None:
+            hours = 24
         
         # Получаем название чата для информации
         chat = await event.get_chat()
@@ -574,15 +621,22 @@ async def handle_analyze_command(event):
         # Получаем или создаем тему для этого чата
         topic_id = await get_or_create_topic(chat_name)
         
-        # Информируем о начале анализа в канале/Избранном/Теме
+        # Формируем сообщение о начале
+        action = "анализ" if use_ai else "экспорт"
+        if limit:
+            status_msg = f"🔄 Начинаю {action} последних {limit} сообщений из чата '{chat_name}'..."
+        else:
+            status_msg = f"🔄 Начинаю {action} чата '{chat_name}' за последние {days or 0} дней и {hours or 0} часов..."
+        
+        # Информируем о начале в канале/Избранном/Теме
         await telegram_client.send_message(
             RESULTS_DESTINATION, 
-            f"🔄 Начинаю анализ чата '{chat_name}' за последние {days} дней и {hours} часов...",
+            status_msg,
             reply_to=topic_id
         )
         
         # Собираем сообщения
-        messages_data, chat_id_str = await collect_messages(event.chat_id, hours=hours, days=days)
+        messages_data, chat_id_str = await collect_messages(event.chat_id, hours=hours, days=days, limit=limit)
         
         if not messages_data:
             await telegram_client.send_message(
@@ -598,52 +652,89 @@ async def handle_analyze_command(event):
         if not optimized_messages:
             await telegram_client.send_message(
                 RESULTS_DESTINATION, 
-                f"⚠️ После фильтрации не осталось сообщений для анализа.\n"
-                f"Загружено: {len(messages_data)}, но все были отфильтрованы как шум или от исключенных пользователей.",
+                f"⚠️ После фильтрации не осталось сообщений.\n"
+                f"Загружено: {len(messages_data)}, все отфильтрованы.",
                 reply_to=topic_id
             )
             return
         
-        # Создаем выжимку с использованием настроенной модели
-        summary = await create_summary(optimized_messages, model=CURRENT_MODEL, use_reasoning=USE_REASONING)
-        
-        # Сохраняем результаты (сохраняем оптимизированные данные)
-        save_analysis(optimized_messages, summary)
-        
-        # Отправляем выжимку пользователю в канал/Избранное/Тему
-        response = f"📍 Чат: **{chat_name}**\n\n"
-        response += f"📊 **Выжимка чата**\n\n"
-        response += f"Период: последние {days} дней и {hours} часов\n"
-        response += f"Загружено сообщений: {len(messages_data)}\n"
-        response += f"Проанализировано после фильтрации: {len(optimized_messages)}\n\n"
-        response += f"**Результат анализа:**\n\n{summary}"
-        
-        # Если сообщение слишком длинное, разбиваем на части
-        max_length = 4096  # Ограничение Telegram
-        if len(response) > max_length:
-            # Отправляем первую часть
-            await telegram_client.send_message(
-                RESULTS_DESTINATION, 
-                response[:max_length],
-                reply_to=topic_id
-            )
-            # Отправляем остаток
-            remaining = response[max_length:]
-            while remaining:
+        # Ветвление: с AI или без
+        if use_ai:
+            # Режим /sum - анализ с AI
+            summary = await create_summary(optimized_messages, model=CURRENT_MODEL, use_reasoning=USE_REASONING)
+            save_analysis(optimized_messages, summary)
+            
+            # Отправляем выжимку
+            response = f"📍 Чат: **{chat_name}**\n\n"
+            response += f"📊 **Выжимка чата**\n\n"
+            if limit:
+                response += f"Режим: последние {limit} сообщений\n"
+            else:
+                response += f"Период: последние {days or 0} дней и {hours or 0} часов\n"
+            response += f"Загружено сообщений: {len(messages_data)}\n"
+            response += f"Проанализировано после фильтрации: {len(optimized_messages)}\n\n"
+            response += f"**Результат анализа:**\n\n{summary}"
+            
+            # Если сообщение слишком длинное, разбиваем на части
+            max_length = 4096
+            if len(response) > max_length:
                 await telegram_client.send_message(
                     RESULTS_DESTINATION, 
-                    remaining[:max_length],
+                    response[:max_length],
                     reply_to=topic_id
                 )
-                remaining = remaining[max_length:]
+                remaining = response[max_length:]
+                while remaining:
+                    await telegram_client.send_message(
+                        RESULTS_DESTINATION, 
+                        remaining[:max_length],
+                        reply_to=topic_id
+                    )
+                    remaining = remaining[max_length:]
+            else:
+                await telegram_client.send_message(
+                    RESULTS_DESTINATION, 
+                    response,
+                    reply_to=topic_id
+                )
+            
+            print("✅ Анализ с AI успешно завершён")
+        
         else:
-            await telegram_client.send_message(
-                RESULTS_DESTINATION, 
-                response,
+            # Режим /copy - экспорт без AI
+            export_data = {
+                'chat_name': chat_name,
+                'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'total_messages': len(messages_data),
+                'filtered_messages': len(optimized_messages),
+                'messages': optimized_messages
+            }
+            
+            # Создаем JSON строку
+            json_export = json.dumps(export_data, ensure_ascii=False, indent=2)
+            
+            # Сохраняем в файл
+            filename = f"export_{chat_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(json_export)
+            
+            # Отправляем файл
+            await telegram_client.send_file(
+                RESULTS_DESTINATION,
+                filename,
+                caption=f"📋 **Экспорт сообщений**\n\n"
+                       f"Чат: {chat_name}\n"
+                       f"Всего: {len(messages_data)} сообщений\n"
+                       f"После фильтрации: {len(optimized_messages)} сообщений\n\n"
+                       f"💡 Готово для копирования в Perplexity!\n"
+                       f"Формат: JSON с метаданными",
                 reply_to=topic_id
             )
-        
-        print("✅ Анализ успешно завершён и отправлен пользователю")
+            
+            # Удаляем временный файл
+            os.remove(filename)
+            
+            print(f"✅ Экспорт завершен: {len(optimized_messages)} сообщений")
         
     except Exception as e:
         error_msg = f"❌ Ошибка при выполнении команды: {e}"
@@ -973,6 +1064,30 @@ async def handle_reload_config_command(event):
     await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
 
 
+@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/sum'))
+async def handle_sum_command(event):
+    """
+    Обработчик команды /sum для анализа чата с AI
+    
+    Примеры:
+    /sum 3h - анализ за 3 часа
+    /sum 45 - анализ 45 сообщений
+    """
+    await process_chat_command(event, use_ai=True)
+
+
+@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/copy'))
+async def handle_copy_command(event):
+    """
+    Обработчик команды /copy для экспорта без AI
+    
+    Примеры:
+    /copy 3h - экспорт за 3 часа
+    /copy 45 - экспорт 45 сообщений
+    """
+    await process_chat_command(event, use_ai=False)
+
+
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/help'))
 async def handle_help_command(event):
     """Обработчик команды /help - показывает справку по командам"""
@@ -981,13 +1096,19 @@ async def handle_help_command(event):
 
 **📊 Основные команды:**
 
-`/analyze` - анализ чата за последние 24 часа
-
-`/analyze [время]` - анализ за указанный период
+`/sum` - анализ и выжимка чата (с AI)
 Примеры:
-  • `/analyze 12h` - за последние 12 часов
-  • `/analyze 2d` - за последние 2 дня
-  • `/analyze 3d 6h` - за последние 3 дня и 6 часов
+  • `/sum` - за последние 24 часа
+  • `/sum 3h` - за последние 3 часа
+  • `/sum 2d` - за последние 2 дня
+  • `/sum 45` - последние 45 сообщений
+  • `/sum 100` - последние 100 сообщений
+
+`/copy` - экспорт без анализа (для ручной обработки)
+Примеры:
+  • `/copy 3h` - экспорт за 3 часа
+  • `/copy 50` - экспорт 50 сообщений
+  • Результат: JSON файл + текст для Perplexity
 
 `/help` - показать эту справку
 
@@ -1014,11 +1135,19 @@ async def handle_help_command(event):
 ⚠️ Claude, GPT доступны только в веб-интерфейсе Perplexity Pro
 
 **Как это работает:**
-1. Бот собирает все сообщения из текущего чата за указанный период
-2. Фильтрует шум и бессодержательные сообщения (экономия токенов API)
-3. Отправляет оптимизированные данные в Perplexity AI для анализа
-4. Получает структурированную выжимку по темам с ссылками
-5. Отправляет результат в ваш приватный канал/Избранное
+
+**`/sum` (с AI анализом):**
+1. Собирает сообщения (по времени или количеству)
+2. Фильтрует шум и исключенных пользователей
+3. Отправляет в Perplexity AI (модель Sonar Pro)
+4. Получает структурированную выжимку по темам
+5. Отправляет результат в ваш канал
+
+**`/copy` (без AI, только экспорт):**
+1. Собирает и фильтрует сообщения
+2. Создает JSON файл с метаданными
+3. Отправляет вам для ручного анализа
+4. Удобно для копирования в Perplexity вручную
 
 **🔍 Что анализируется:**
 • Основные темы обсуждений (включая микро-дискуссии)
@@ -1098,8 +1227,12 @@ async def main():
     
     print("\n📌 Доступные команды:")
     print("  Анализ:")
-    print("    /analyze - анализ чата за последние 24 часа")
-    print("    /analyze [время] - анализ за указанный период")
+    print("    /sum - анализ чата с AI (по времени или количеству)")
+    print("    /sum 3h - последние 3 часа")
+    print("    /sum 45 - последние 45 сообщений")
+    print("  Экспорт:")
+    print("    /copy - экспорт без AI (для ручного анализа)")
+    print("    /copy 50 - экспорт 50 сообщений")
     print("  Конфигурация:")
     print("    /config - показать конфигурацию")
     print("    /show_model - показать настройки модели AI")
@@ -1109,7 +1242,8 @@ async def main():
     print("    /reload_config - перезагрузить из файлов")
     print("  Справка:")
     print("    /help - полная справка по командам")
-    print("\n💡 Отправьте команду /analyze в любом чате для начала анализа")
+    print("\n💡 Отправьте команду /sum в любом чате для анализа с AI")
+    print("💡 Используйте /copy для экспорта без затрат на API")
     print("=" * 60)
     print("\n👀 Ожидание команд...")
     
