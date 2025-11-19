@@ -15,7 +15,6 @@ load_dotenv('private.txt')
 API_ID = int(os.getenv('TELEGRAM_API_ID'))
 API_HASH = os.getenv('TELEGRAM_API_HASH')
 PHONE = os.getenv('TELEGRAM_PHONE')
-CHAT_ID = int(os.getenv('CHAT_ID'))
 
 # ID канала для результатов (если не указан - используется "Избранное")
 RESULTS_DESTINATION = os.getenv('TELEGRAM_GROUP_ID', 'me')
