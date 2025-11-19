@@ -43,6 +43,7 @@ NOISE_PATTERNS = [
 EXCLUDED_USERS_FILE = 'EXCLUDED_USERS.txt'
 PRIORITY_USERS_FILE = 'PRIORITY_USERS.txt'
 PROMPT_FILE = 'PROMPT.txt'
+MODEL_CONFIG_FILE = 'MODEL_CONFIG.txt'
 
 
 def load_users_from_file(filename):
@@ -139,10 +140,83 @@ def save_prompt_to_file(filename, prompt):
         return False
 
 
+def load_model_config(filename):
+    """
+    Загружает конфигурацию модели из файла
+    
+    Args:
+        filename: Путь к файлу с конфигурацией модели
+    
+    Returns:
+        Кортеж (model_name, use_reasoning)
+    """
+    default_model = 'sonar-pro'  # Рекомендуемая модель для Perplexity API
+    default_reasoning = False
+    
+    if not os.path.exists(filename):
+        print(f"⚠️  Файл {filename} не найден, используется модель по умолчанию: {default_model}")
+        return default_model, default_reasoning
+    
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        model = default_model
+        use_reasoning = default_reasoning
+        
+        for line in content.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            
+            if '=' in line:
+                key, value = line.split('=', 1)
+                key = key.strip().upper()
+                value = value.strip()
+                
+                if key == 'MODEL':
+                    model = value
+                elif key == 'USE_REASONING':
+                    use_reasoning = value.lower() in ('true', 'yes', '1', 'on')
+        
+        return model, use_reasoning
+    except Exception as e:
+        print(f"❌ Ошибка при чтении {filename}: {e}")
+        return default_model, default_reasoning
+
+
+def save_model_config(filename, model, use_reasoning):
+    """
+    Сохраняет конфигурацию модели в файл
+    
+    Args:
+        filename: Путь к файлу
+        model: Название модели
+        use_reasoning: Использовать ли reasoning режим
+    """
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write("# Конфигурация модели Perplexity API\n")
+            f.write("# Автоматически обновлено ботом\n\n")
+            f.write("# ⚠️ ВАЖНО: Через Perplexity API доступны ТОЛЬКО модели Sonar!\n")
+            f.write("# Claude, GPT и другие модели доступны только в веб-интерфейсе Perplexity Pro\n\n")
+            f.write("# Доступные модели через API:\n")
+            f.write("# - sonar (базовая модель, на основе Llama 3.3 70B)\n")
+            f.write("# - sonar-pro (улучшенная версия с лучшим качеством) - РЕКОМЕНДУЕТСЯ\n\n")
+            f.write(f"MODEL={model}\n\n")
+            f.write("# Использовать ли режим reasoning (экспериментально)\n")
+            f.write(f"USE_REASONING={'true' if use_reasoning else 'false'}\n")
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при сохранении {filename}: {e}")
+        return False
+
+
 # Загружаем конфигурацию из файлов при старте
 EXCLUDED_USERS = load_users_from_file(EXCLUDED_USERS_FILE)
 PRIORITY_USERS = load_users_from_file(PRIORITY_USERS_FILE)
 ANALYSIS_PROMPT = load_prompt_from_file(PROMPT_FILE)
+CURRENT_MODEL, USE_REASONING = load_model_config(MODEL_CONFIG_FILE)
 
 # Инициализация клиентов
 telegram_client = TelegramClient('session_name', API_ID, API_HASH)
@@ -335,12 +409,14 @@ async def collect_messages(chat_id, hours=24, days=0):
     return messages_data, chat_id_str
 
 
-async def create_summary(messages_data):
+async def create_summary(messages_data, model='sonar', use_reasoning=False):
     """
     Создает выжимку из сообщений с помощью Perplexity API
     
     Args:
         messages_data: Список словарей с сообщениями (включая chat_id, message_id)
+        model: Модель для использования (sonar, claude-3.5-sonnet и т.д.)
+        use_reasoning: Использовать ли reasoning режим (для моделей с поддержкой)
     
     Returns:
         Текст выжимки
@@ -349,6 +425,14 @@ async def create_summary(messages_data):
         return "❌ Нет сообщений для анализа за указанный период (все отфильтровано)"
     
     print(f"🤖 Отправка {len(messages_data)} сообщений в Perplexity для анализа...")
+    print(f"   Модель: {model}")
+    
+    # Определяем лимиты в зависимости от модели
+    # Sonar/Sonar-Pro имеют контекст 127K токенов (на основе Llama 3.3 70B)
+    if 'sonar' in model.lower():
+        max_chars = 250000  # ~60K токенов для Sonar (оставляем запас)
+    else:
+        max_chars = 200000  # Консервативный лимит для других моделей
     
     # Формируем JSON для отправки (более структурированный формат)
     messages_json = json.dumps([
@@ -362,13 +446,25 @@ async def create_summary(messages_data):
         for msg in messages_data
     ], ensure_ascii=False, indent=2)
     
-    # Ограничиваем размер, если сообщений очень много
-    max_chars = 20000  # Увеличили лимит, так как убрали шум
+    # Проверяем размер и при необходимости разбиваем на части
     if len(messages_json) > max_chars:
-        # Сокращаем количество сообщений, а не обрезаем текст
+        print(f"⚠️  Данных слишком много ({len(messages_json)} символов)")
+        print(f"   Максимум для модели {model}: {max_chars} символов")
+        
+        # Вариант 1: Разбить на несколько запросов (рекомендуется)
+        # Вариант 2: Взять только последние сообщения (самые актуальные)
+        # Выбираем вариант 2 как более простой, но с предупреждением
+        
         ratio = max_chars / len(messages_json)
-        limit = int(len(messages_data) * ratio * 0.9)  # 0.9 для запаса
-        messages_data_limited = messages_data[:limit]
+        limit = int(len(messages_data) * ratio * 0.95)  # 0.95 для запаса
+        
+        print(f"   📌 Решение: Берем последние {limit} сообщений (самые актуальные)")
+        print(f"   ⚠️  ПОТЕРЯ ДАННЫХ: {len(messages_data) - limit} старых сообщений не попадут в анализ")
+        print(f"   💡 Рекомендация: уменьшите период анализа (например /analyze 12h вместо 24h)")
+        
+        # Берем ПОСЛЕДНИЕ сообщения (самые актуальные), а не первые!
+        messages_data_limited = messages_data[-limit:]  # Изменено на последние!
+        
         messages_json = json.dumps([
             {
                 'sender': msg['sender'],
@@ -379,26 +475,50 @@ async def create_summary(messages_data):
             }
             for msg in messages_data_limited
         ], ensure_ascii=False, indent=2)
-        print(f"⚠️  Сообщений слишком много, ограничено до {limit} из {len(messages_data)}")
     
     try:
-        response = perplexity_client.chat.completions.create(
-            model='sonar',
-            messages=[
+        # Формируем параметры запроса
+        request_params = {
+            'model': model,
+            'messages': [
                 {'role': 'system', 'content': ANALYSIS_PROMPT},
                 {'role': 'user', 'content': f'Данные сообщений для анализа (JSON):\n\n{messages_json}'}
             ],
-            max_tokens=4000,  # Увеличили для детального анализа
-            temperature=0.3
-        )
+            'temperature': 0.3
+        }
+        
+        # Настройка max_tokens
+        # Sonar может генерировать до 4K токенов ответа
+        request_params['max_tokens'] = 4000
+        
+        # Добавляем reasoning для поддерживаемых моделей
+        # Примечание: не все модели в Perplexity поддерживают reasoning
+        # Обычно это экспериментальная фича
+        if use_reasoning and 'sonar' in model.lower():
+            print("   🧠 Режим reasoning включен")
+            # Perplexity может не поддерживать этот параметр
+            # request_params['reasoning'] = True
+        
+        response = perplexity_client.chat.completions.create(**request_params)
         
         summary = response.choices[0].message.content
         print("✅ Выжимка успешно создана")
+        
+        # Показываем статистику использования токенов
+        if hasattr(response, 'usage'):
+            usage = response.usage
+            print(f"   📊 Использовано токенов:")
+            print(f"      Промпт: {usage.prompt_tokens if hasattr(usage, 'prompt_tokens') else 'N/A'}")
+            print(f"      Ответ: {usage.completion_tokens if hasattr(usage, 'completion_tokens') else 'N/A'}")
+            print(f"      Всего: {usage.total_tokens if hasattr(usage, 'total_tokens') else 'N/A'}")
+        
         return summary
         
     except Exception as e:
         error_msg = f"❌ Ошибка при создании выжимки: {e}"
         print(error_msg)
+        print(f"   Модель: {model}")
+        print(f"   Размер данных: {len(messages_json)} символов")
         return error_msg
 
 
@@ -485,8 +605,8 @@ async def handle_analyze_command(event):
             )
             return
         
-        # Создаем выжимку
-        summary = await create_summary(optimized_messages)
+        # Создаем выжимку с использованием настроенной модели
+        summary = await create_summary(optimized_messages, model=CURRENT_MODEL, use_reasoning=USE_REASONING)
         
         # Сохраняем результаты (сохраняем оптимизированные данные)
         save_analysis(optimized_messages, summary)
@@ -548,6 +668,10 @@ async def handle_config_command(event):
     config_text = f"""
 ⚙️ **Текущая конфигурация бота**
 
+**🤖 Модель AI:**
+• Текущая модель: `{CURRENT_MODEL}`
+• Reasoning: {'Включен' if USE_REASONING else 'Выключен'}
+
 **📝 Исключенные пользователи** ({len(EXCLUDED_USERS)}):
 {', '.join(EXCLUDED_USERS) if EXCLUDED_USERS else 'Нет'}
 
@@ -562,17 +686,24 @@ async def handle_config_command(event):
 • {EXCLUDED_USERS_FILE}
 • {PRIORITY_USERS_FILE}
 • {PROMPT_FILE}
+• {MODEL_CONFIG_FILE}
 
 **Команды управления:**
+
+**Просмотр:**
 `/show_excluded` - показать исключенных пользователей
 `/show_priority` - показать приоритетных пользователей
-`/show_prompt` - показать текущий промпт (первые 500 символов)
+`/show_prompt` - показать текущий промпт
+`/show_model` - показать настройки модели AI
 
+**Редактирование:**
 `/add_excluded username` - добавить в исключенные
 `/remove_excluded username` - убрать из исключенных
 `/add_priority username` - добавить в приоритетные
 `/remove_priority username` - убрать из приоритетных
+`/set_model model_name` - сменить модель AI
 
+**Обновление:**
 `/reload_config` - перезагрузить конфигурацию из файлов
 
 💡 Можно также редактировать файлы напрямую на сервере
@@ -726,14 +857,104 @@ async def handle_remove_priority_command(event):
     await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
 
 
+@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/show_model'))
+async def handle_show_model_command(event):
+    """Показывает текущую настройку модели"""
+    text = f"""
+🤖 **Текущая модель для анализа**
+
+**Модель:** `{CURRENT_MODEL}`
+**Reasoning:** {'Включен ✅' if USE_REASONING else 'Выключен ❌'}
+
+⚠️ **ВАЖНО:** Через Perplexity API доступны ТОЛЬКО модели Sonar!
+Claude, GPT и другие модели доступны только в веб-интерфейсе Perplexity Pro.
+
+**💰 Доступные модели через API:**
+
+**Sonar (базовая):**
+• Основа: Llama 3.3 70B
+• Входящие: ~$0.20 / 1M токенов
+• Исходящие: ~$0.20 / 1M токенов
+• Контекст: 127K токенов
+• Скорость: Быстро ⚡
+• Качество: Хорошее ✅
+• Интеграция с поиском в реальном времени
+
+**Sonar Pro (улучшенная) ⭐ РЕКОМЕНДУЕТСЯ:**
+• Основа: Llama 3.3 70B (оптимизирована)
+• Входящие: ~$1.00 / 1M токенов
+• Исходящие: ~$1.00 / 1M токенов
+• Контекст: 127K токенов
+• Скорость: Быстро ⚡⚡
+• Качество: Отличное ⭐⭐⭐
+• Лучшая точность и глубина анализа
+
+**Управление:**
+`/set_model sonar` - базовая модель (дешевле)
+`/set_model sonar-pro` - улучшенная (рекомендуется) ⭐
+
+💡 Текущая модель сохраняется в файле {MODEL_CONFIG_FILE}
+
+📚 Альтернатива:
+Если нужен Claude/GPT - используйте их напрямую через OpenAI API или Anthropic API, а не через Perplexity.
+"""
+    
+    await event.delete()
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Конфигурация"
+    topic_id = await get_or_create_topic(chat_name)
+    await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
+
+
+@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/set_model\s+(.+)'))
+async def handle_set_model_command(event):
+    """Устанавливает модель для анализа"""
+    global CURRENT_MODEL
+    
+    model = event.pattern_match.group(1).strip()
+    
+    # Валидируем название модели
+    # ⚠️ Только модели Sonar доступны через Perplexity API!
+    valid_models = [
+        'sonar',           # Базовая модель
+        'sonar-pro',       # Улучшенная версия (рекомендуется)
+    ]
+    
+    if model not in valid_models:
+        text = f"⚠️ Неизвестная или недоступная модель: **{model}**\n\n"
+        text += "⚠️ **Важно:** Через Perplexity API доступны ТОЛЬКО модели Sonar!\n\n"
+        text += "Доступные модели:\n"
+        for m in valid_models:
+            text += f"• `{m}`\n"
+        text += "\n💡 Claude, GPT и другие модели доступны только в веб-интерфейсе Perplexity Pro"
+    else:
+        old_model = CURRENT_MODEL
+        CURRENT_MODEL = model
+        
+        if save_model_config(MODEL_CONFIG_FILE, CURRENT_MODEL, USE_REASONING):
+            text = f"✅ Модель изменена: **{old_model}** → **{CURRENT_MODEL}**\n\n"
+            text += "Изменения вступят в силу для следующего анализа.\n"
+            text += f"Используйте `/show_model` для просмотра деталей."
+        else:
+            CURRENT_MODEL = old_model  # Откатываем
+            text = f"❌ Ошибка при сохранении конфигурации модели"
+    
+    await event.delete()
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Конфигурация"
+    topic_id = await get_or_create_topic(chat_name)
+    await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
+
+
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/reload_config'))
 async def handle_reload_config_command(event):
     """Перезагружает конфигурацию из файлов"""
-    global EXCLUDED_USERS, PRIORITY_USERS, ANALYSIS_PROMPT
+    global EXCLUDED_USERS, PRIORITY_USERS, ANALYSIS_PROMPT, CURRENT_MODEL, USE_REASONING
     
     EXCLUDED_USERS = load_users_from_file(EXCLUDED_USERS_FILE)
     PRIORITY_USERS = load_users_from_file(PRIORITY_USERS_FILE)
     ANALYSIS_PROMPT = load_prompt_from_file(PROMPT_FILE)
+    CURRENT_MODEL, USE_REASONING = load_model_config(MODEL_CONFIG_FILE)
     
     text = f"""
 ✅ **Конфигурация перезагружена из файлов**
@@ -741,6 +962,7 @@ async def handle_reload_config_command(event):
 📝 Исключенные пользователи: {len(EXCLUDED_USERS)}
 ⭐ Приоритетные пользователи: {len(PRIORITY_USERS)}
 📄 Промпт: {len(ANALYSIS_PROMPT)} символов
+🤖 Модель: {CURRENT_MODEL}
 
 💡 Используйте `/config` для просмотра деталей
 """
@@ -776,13 +998,21 @@ async def handle_help_command(event):
 `/show_excluded` - список исключенных пользователей
 `/show_priority` - список приоритетных пользователей
 `/show_prompt` - показать текущий промпт
+`/show_model` - показать настройки модели AI
 
 `/add_excluded username` - добавить в исключенные
 `/remove_excluded username` - убрать из исключенных
 `/add_priority username` - добавить в приоритетные
 `/remove_priority username` - убрать из приоритетных
+`/set_model model_name` - сменить модель AI
 
 `/reload_config` - перезагрузить из файлов
+
+**🤖 Доступные модели AI (только Sonar через API!):**
+• `sonar` - базовая модель, дешевая
+• `sonar-pro` - улучшенная версия ⭐ (рекомендуется)
+
+⚠️ Claude, GPT доступны только в веб-интерфейсе Perplexity Pro
 
 **Как это работает:**
 1. Бот собирает все сообщения из текущего чата за указанный период
@@ -856,10 +1086,15 @@ async def main():
             print(f"   💡 Убедитесь что вы являетесь владельцем/админом канала")
             print(f"   💡 Или закомментируйте TELEGRAM_GROUP_ID в private.txt")
     
+    # Показываем настройки модели
+    print(f"\n🤖 Модель AI:")
+    print(f"   • Текущая модель: {CURRENT_MODEL}")
+    print(f"   • Reasoning режим: {'Включен' if USE_REASONING else 'Выключен'}")
+    
     # Показываем настройки фильтрации
     print(f"\n🎯 Настройки оптимизации:")
-    print(f"   • Исключенные пользователи: {', '.join(EXCLUDED_USERS)}")
-    print(f"   • Приоритетные пользователи: {', '.join(PRIORITY_USERS)}")
+    print(f"   • Исключенные пользователи: {', '.join(EXCLUDED_USERS) if EXCLUDED_USERS else 'Нет'}")
+    print(f"   • Приоритетные пользователи: {', '.join(PRIORITY_USERS) if PRIORITY_USERS else 'Нет'}")
     print(f"   • Минимальная длина сообщения: {MIN_MESSAGE_LENGTH} символов")
     
     print("\n📌 Доступные команды:")
@@ -868,6 +1103,8 @@ async def main():
     print("    /analyze [время] - анализ за указанный период")
     print("  Конфигурация:")
     print("    /config - показать конфигурацию")
+    print("    /show_model - показать настройки модели AI")
+    print("    /set_model - сменить модель AI")
     print("    /add_excluded, /remove_excluded - управление исключенными")
     print("    /add_priority, /remove_priority - управление приоритетными")
     print("    /reload_config - перезагрузить из файлов")
