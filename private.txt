@@ -9,5 +9,3 @@ TELEGRAM_GROUP_ID=-100...
 # Perplexity API (получите на https://www.perplexity.ai/settings/api)
 PERPLEXITY_API_KEY=ваш_perplexity_ключ
 
-# ID чата для мониторинга (необязательно, можно удалить)
-CHAT_ID=3074915751

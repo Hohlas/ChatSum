@@ -3,9 +3,9 @@
 # Можно использовать любые разделители: пробел, запятая, перенос строки
 # Строки начинающиеся с # игнорируются (комментарии)
 
-Zinur
-Restyle Pon
-Lex
+izinur
+restyle77
+Sinprier
 ProMint
-Sergey
+syroamst
 
