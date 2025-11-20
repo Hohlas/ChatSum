@@ -944,8 +944,11 @@ def publish_to_telegraph(title, content, author_name="Chat Filter Bot"):
                 if in_list:
                     html_paragraphs.append('</ul>')
                     in_list = False
-                # Добавляем эмодзи 💡 в начало заголовка и делаем жирным
+                # Убираем Markdown форматирование из заголовка
                 text = line_stripped.strip()
+                text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)  # Убираем ** (заголовок и так будет жирным)
+                text = re.sub(r'\*([^\*]+)\*', r'\1', text)  # Убираем одинарные *
+                # Добавляем эмодзи 💡 в начало заголовка и делаем жирным
                 html_paragraphs.append(f'<h3><b>💡 {text}</b></h3>')
                 next_is_title = False
                 next_is_summary = True  # Следующая непустая строка будет summary
@@ -962,8 +965,15 @@ def publish_to_telegraph(title, content, author_name="Chat Filter Bot"):
                 if in_list:
                     html_paragraphs.append('</ul>')
                     in_list = False
-                # Делаем курсивом (наклонным)
+                # Убираем "Summary: " если есть
                 summary_text = line_stripped.strip()
+                if summary_text.startswith('Summary:'):
+                    summary_text = summary_text[8:].strip()  # Убираем "Summary:" (8 символов)
+                # Конвертируем Markdown в HTML (перед тем как делать курсивом)
+                summary_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', summary_text)  # Жирный
+                summary_text = re.sub(r'\*([^\*]+)\*', r'\1', summary_text)  # Убираем одинарные * (они будут курсивом через <i>)
+                summary_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', summary_text)  # Ссылки
+                # Делаем курсивом (наклонным) - весь summary
                 html_paragraphs.append(f'<p><i>{summary_text}</i></p>')
                 next_is_summary = False
                 continue
