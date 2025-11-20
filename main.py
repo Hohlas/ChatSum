@@ -419,7 +419,8 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None):
         limit: Количество последних сообщений (опционально)
     
     Returns:
-        Кортеж (список сообщений, chat_id_str для ссылок)
+        Кортеж (список сообщений, chat_id_str для ссылок, period_start_date)
+        period_start_date - дата первого сообщения исходного периода (до догрузки родительских)
     """
     # Получаем информацию о чате для формирования ссылок
     chat = await telegram_client.get_entity(chat_id)
@@ -517,6 +518,10 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None):
     # Сортируем по времени (от старых к новым)
     messages_data.reverse()
     
+    # Сохраняем дату первого сообщения исходного периода (ДО догрузки родительских)
+    period_start_date = messages_data[0].get('date', '') if messages_data else ''
+    initial_messages_count = len(messages_data)
+    
     print(f"✅ Загружено {len(messages_data)} сообщений")
     
     # Догружаем недостающие родительские сообщения для контекста
@@ -563,7 +568,7 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None):
         except Exception as e:
             print(f"⚠️  Не удалось загрузить некоторые родительские сообщения: {e}")
     
-    return messages_data, chat_id_str
+    return messages_data, chat_id_str, period_start_date
 
 
 def safe_str(value):
@@ -635,7 +640,7 @@ def build_tree_structure(messages_data):
     return root_messages
 
 
-def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, total_messages=None, filtered_messages=None):
+def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, total_messages=None, filtered_messages=None, period_start_date=None):
     """
     Формирует оптимизированную JSON структуру для экспорта/анализа
     
@@ -647,12 +652,16 @@ def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, t
         chat_name: Название чата (опционально, для экспорта)
         total_messages: Общее количество сообщений (опционально, для экспорта)
         filtered_messages: Количество отфильтрованных сообщений (опционально, для экспорта)
+        period_start_date: Дата первого сообщения исходного периода (до догрузки родительских)
     
     Returns:
         Словарь с оптимизированной структурой: {'metadata': {...}, 'messages': [...]}
     """
-    # Получаем дату первого сообщения для metadata
-    period_start = messages_data[0].get('date', '') if messages_data else ''
+    # Используем переданную дату начала периода, или берем из первого сообщения (запасной вариант)
+    if period_start_date:
+        period_start = period_start_date
+    else:
+        period_start = messages_data[0].get('date', '') if messages_data else ''
     
     # Строим древовидную структуру с вложенными replies
     tree_messages = build_tree_structure(messages_data)
@@ -678,7 +687,7 @@ def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, t
     }
 
 
-async def create_summary(messages_data, chat_id_str, model='sonar', use_reasoning=False):
+async def create_summary(messages_data, chat_id_str, model='sonar', use_reasoning=False, period_start_date=None):
     """
     Создает выжимку из сообщений с помощью Perplexity API
     
@@ -706,7 +715,7 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
     
     # Формируем ОПТИМИЗИРОВАННЫЙ JSON для экономии токенов
     # Используем общую функцию для единообразия с /copy
-    optimized_structure = build_optimized_json_structure(messages_data, chat_id_str)
+    optimized_structure = build_optimized_json_structure(messages_data, chat_id_str, period_start_date=period_start_date)
     
     # Используем ensure_ascii=False для сохранения кириллицы
     messages_json = json.dumps(optimized_structure, ensure_ascii=False, indent=2)
@@ -731,7 +740,9 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
         messages_data_limited = messages_data[-limit:]  # Изменено на последние!
         
         # Используем общую функцию для формирования структуры
-        optimized_structure = build_optimized_json_structure(messages_data_limited, chat_id_str)
+        # Используем period_start_date из ограниченной выборки (первое сообщение)
+        period_start_limited = messages_data_limited[0].get('date', '') if messages_data_limited else period_start_date
+        optimized_structure = build_optimized_json_structure(messages_data_limited, chat_id_str, period_start_date=period_start_limited)
         
         messages_json = json.dumps(optimized_structure, ensure_ascii=False, indent=2)
     
@@ -988,7 +999,7 @@ async def process_chat_command(event, use_ai=True):
         )
         
         # Собираем сообщения
-        messages_data, chat_id_str = await collect_messages(event.chat_id, hours=hours, days=days, limit=limit)
+        messages_data, chat_id_str, period_start_date = await collect_messages(event.chat_id, hours=hours, days=days, limit=limit)
         
         if not messages_data:
             await telegram_client.send_message(
@@ -1013,7 +1024,7 @@ async def process_chat_command(event, use_ai=True):
         # Ветвление: с AI или без
         if use_ai:
             # Режим /sum - анализ с AI
-            summary, usage_info = await create_summary(optimized_messages, chat_id_str, model=CURRENT_MODEL, use_reasoning=USE_REASONING)
+            summary, usage_info = await create_summary(optimized_messages, chat_id_str, model=CURRENT_MODEL, use_reasoning=USE_REASONING, period_start_date=period_start_date)
             save_analysis(optimized_messages, summary)
             
             # Подсчитываем количество тем (по разделителю "---")
@@ -1058,18 +1069,16 @@ async def process_chat_command(event, use_ai=True):
                 full_content += f"• Всего: {total_tokens:,}\n"
                 full_content += f"💰 Стоимость: ${total_cost:.4f}\n"
             
-            # Получаем время начала анализа (дата первого сообщения)
+            # Получаем время начала анализа из period_start_date (дата первого сообщения исходного периода)
             period_start_time = ""
-            if optimized_messages and len(optimized_messages) > 0:
-                first_message_date = optimized_messages[0].get('date', '')
-                if first_message_date:
-                    # Парсим дату из формата "2025-11-20 08:23:45" и берем только дату и время до минут
-                    try:
-                        dt = datetime.strptime(first_message_date, '%Y-%m-%d %H:%M:%S')
-                        period_start_time = dt.strftime('%Y-%m-%d %H:%M')
-                    except (ValueError, TypeError):
-                        # Если формат не совпадает, используем как есть или берем первые 16 символов
-                        period_start_time = first_message_date[:16] if len(first_message_date) >= 16 else first_message_date
+            if period_start_date:
+                try:
+                    # Парсим дату из формата "2025-11-20 12:01:31" и берем только дату и время до минут
+                    dt = datetime.strptime(period_start_date, '%Y-%m-%d %H:%M:%S')
+                    period_start_time = dt.strftime('%Y-%m-%d %H:%M')
+                except (ValueError, TypeError):
+                    # Если формат не совпадает, используем как есть или берем первые 16 символов
+                    period_start_time = period_start_date[:16] if len(period_start_date) >= 16 else period_start_date
             
             # Если не удалось получить время начала, используем текущее время
             if not period_start_time:
@@ -1115,7 +1124,8 @@ async def process_chat_command(event, use_ai=True):
                 chat_id_str,
                 chat_name=chat_name,
                 total_messages=len(messages_data),
-                filtered_messages=len(optimized_messages)
+                filtered_messages=len(optimized_messages),
+                period_start_date=period_start_date
             )
             
             # Создаем JSON строку
