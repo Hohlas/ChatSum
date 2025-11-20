@@ -606,6 +606,12 @@ def build_tree_structure(messages_data):
             print(f"🔗 Сообщение {msg_id} добавлено в replies сообщения {reply_to} (всего replies: {parent_replies_count})")
         # Если reply_to отсутствует или родитель не найден, сообщение будет корневым
     
+    # Проверка: убеждаемся, что все replies сохранены правильно
+    print("\n🔍 Проверка структуры перед очисткой:")
+    for msg_id, msg_obj in messages_by_id.items():
+        if 'replies' in msg_obj and len(msg_obj['replies']) > 1:
+            print(f"  ✅ Сообщение {msg_id}: {len(msg_obj['replies'])} replies")
+    
     # Собираем корневые сообщения (те, которые не являются ответами)
     root_messages = []
     for msg in messages_data:
@@ -618,11 +624,36 @@ def build_tree_structure(messages_data):
         if not msg['replies']:
             del msg['replies']
         else:
+            # Отладочный вывод перед очисткой
+            replies_count = len(msg['replies'])
+            if replies_count > 1:
+                print(f"📊 Сообщение {msg['id']} имеет {replies_count} replies перед очисткой")
             for reply in msg['replies']:
                 clean_empty_replies(reply)
+            # Проверяем после рекурсивной очистки
+            if 'replies' in msg and len(msg['replies']) > 1:
+                print(f"✅ Сообщение {msg['id']} сохранило {len(msg['replies'])} replies после очистки")
     
     for msg in root_messages:
         clean_empty_replies(msg)
+    
+    # Финальная проверка структуры
+    def count_replies_in_tree(msg, depth=0):
+        """Подсчитывает replies в дереве для отладки"""
+        count = 0
+        if 'replies' in msg:
+            count = len(msg['replies'])
+            print(f"{'  ' * depth}📌 Сообщение {msg['id']}: {count} replies")
+            for reply in msg['replies']:
+                count += count_replies_in_tree(reply, depth + 1)
+        return count
+    
+    print("\n🌳 Финальная структура дерева:")
+    total_replies = 0
+    for msg in root_messages:
+        if 'replies' in msg:
+            total_replies += count_replies_in_tree(msg)
+    print(f"📊 Всего replies в дереве: {total_replies}\n")
     
     return root_messages
 
