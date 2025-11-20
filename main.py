@@ -737,7 +737,14 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
     try:
         # Формируем параметры запроса
         # Важно: убеждаемся что все строки в Unicode и правильно закодированы
-        system_content = safe_str(ANALYSIS_PROMPT)
+        # Подставляем список приоритетных пользователей в промпт
+        prompt_with_priority = ANALYSIS_PROMPT
+        if PRIORITY_USERS:
+            priority_list = ', '.join(PRIORITY_USERS)
+            # Заменяем плейсхолдер {PRIORITY_USERS} на список пользователей
+            prompt_with_priority = prompt_with_priority.replace('{PRIORITY_USERS}', priority_list)
+        
+        system_content = safe_str(prompt_with_priority)
         user_content = safe_str(f'Данные сообщений для анализа (JSON):\n\n{messages_json}')
         
         # Проверяем что контент корректный Unicode
