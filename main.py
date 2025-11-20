@@ -6,7 +6,7 @@ from telethon import TelegramClient, events
 from openai import OpenAI
 from dotenv import load_dotenv
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import httpx
 
 # Загрузка переменных окружения
@@ -470,11 +470,21 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None):
             hours = 24  # По умолчанию 24 часа
         
         print(f"🔄 Загрузка сообщений за последние {days} дней и {hours} часов...")
-        time_limit = datetime.now() - timedelta(days=days, hours=hours)
+        # Используем UTC для сравнения с message.date (Telegram API возвращает UTC)
+        time_limit = datetime.now(timezone.utc) - timedelta(days=days, hours=hours)
         
         async for message in telegram_client.iter_messages(chat_id):
             # Прерываем, если достигли временного предела
-            if message.date < time_limit:
+            # Приводим message.date к UTC, если он не имеет timezone
+            msg_date = message.date
+            if msg_date.tzinfo is None:
+                # Если message.date без timezone, считаем его UTC
+                msg_date = msg_date.replace(tzinfo=timezone.utc)
+            elif msg_date.tzinfo != timezone.utc:
+                # Если message.date с другим timezone, конвертируем в UTC
+                msg_date = msg_date.astimezone(timezone.utc)
+            
+            if msg_date < time_limit:
                 break
                 
             if message.text:
@@ -1524,6 +1534,7 @@ async def main():
     print("    /sum 45 - последние 45 сообщений")
     print("  Экспорт:")
     print("    /copy - экспорт без AI (для ручного анализа)")
+    print("    /copy 3h - экспорт за 3 часа")
     print("    /copy 50 - экспорт 50 сообщений")
     print("  Конфигурация:")
     print("    /config - показать конфигурацию")
