@@ -925,13 +925,24 @@ async def process_chat_command(event, use_ai=True):
             print("✅ Анализ с AI успешно завершён")
         
         else:
-            # Режим /copy - экспорт без AI
+            # Режим /copy - экспорт без AI (с оптимизированной структурой v2.0)
+            # Получаем дату первого сообщения для metadata
+            period_start = optimized_messages[0].get('date', '') if optimized_messages else ''
+            
+            # Строим древовидную структуру с вложенными replies
+            tree_messages = build_tree_structure(optimized_messages)
+            
+            # Создаем оптимизированную структуру (такая же как в /sum)
             export_data = {
-                'chat_name': chat_name,
-                'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'total_messages': len(messages_data),
-                'filtered_messages': len(optimized_messages),
-                'messages': optimized_messages
+                'metadata': {
+                    'chat_name': chat_name,
+                    'chat_id': chat_id_str,
+                    'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'period_start': period_start,
+                    'total_messages': len(messages_data),
+                    'filtered_messages': len(optimized_messages)
+                },
+                'messages': tree_messages
             }
             
             # Создаем JSON строку
@@ -951,7 +962,10 @@ async def process_chat_command(event, use_ai=True):
                        f"Всего: {len(messages_data)} сообщений\n"
                        f"После фильтрации: {len(optimized_messages)} сообщений\n\n"
                        f"💡 Готово для копирования в Perplexity!\n"
-                       f"Формат: JSON с метаданными",
+                       f"📊 Формат: Оптимизированный JSON v2.0\n"
+                       f"   • Древовидная структура с replies\n"
+                       f"   • Без полей date и chat_id в сообщениях\n"
+                       f"   • Метаданные в metadata",
                 reply_to=topic_id
             )
             
