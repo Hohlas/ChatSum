@@ -267,7 +267,7 @@ class ASCIIHeadersClient(httpx.Client):
         return request
 
 http_client = ASCIIHeadersClient(
-    timeout=60.0,
+    timeout=180.0,  # Увеличен до 3 минут для больших запросов
     limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
 )
 
@@ -787,8 +787,32 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
             # Perplexity может не поддерживать этот параметр
             # request_params['reasoning'] = True
         
-        # Отправляем запрос с явной кодировкой
-        response = perplexity_client.chat.completions.create(**request_params)
+        # Выводим информацию о размере запроса
+        total_chars = len(system_content) + len(user_content)
+        print(f"   📊 Размер запроса: {total_chars:,} символов")
+        
+        # Оцениваем примерное время обработки
+        estimated_time = max(30, total_chars // 500)  # ~500 символов/секунду
+        if estimated_time > 60:
+            print(f"   ⏱️  Ожидаемое время обработки: ~{estimated_time} сек")
+            print(f"   ⏳ Пожалуйста, подождите...")
+        
+        # Отправляем запрос с повторными попытками при таймауте
+        max_retries = 2
+        retry_count = 0
+        
+        while retry_count <= max_retries:
+            try:
+                response = perplexity_client.chat.completions.create(**request_params)
+                break  # Успешно - выходим из цикла
+            except Exception as retry_error:
+                if 'timeout' in str(retry_error).lower() and retry_count < max_retries:
+                    retry_count += 1
+                    print(f"   ⚠️  Таймаут. Повторная попытка {retry_count}/{max_retries}...")
+                    continue
+                else:
+                    # Если это не таймаут или исчерпаны попытки - пробрасываем исключение
+                    raise
         
         summary = response.choices[0].message.content
         print("✅ Выжимка успешно создана")
