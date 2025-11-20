@@ -1058,8 +1058,25 @@ async def process_chat_command(event, use_ai=True):
                 full_content += f"• Всего: {total_tokens:,}\n"
                 full_content += f"💰 Стоимость: ${total_cost:.4f}\n"
             
+            # Получаем время начала анализа (дата первого сообщения)
+            period_start_time = ""
+            if optimized_messages and len(optimized_messages) > 0:
+                first_message_date = optimized_messages[0].get('date', '')
+                if first_message_date:
+                    # Парсим дату из формата "2025-11-20 08:23:45" и берем только дату и время до минут
+                    try:
+                        dt = datetime.strptime(first_message_date, '%Y-%m-%d %H:%M:%S')
+                        period_start_time = dt.strftime('%Y-%m-%d %H:%M')
+                    except (ValueError, TypeError):
+                        # Если формат не совпадает, используем как есть или берем первые 16 символов
+                        period_start_time = first_message_date[:16] if len(first_message_date) >= 16 else first_message_date
+            
+            # Если не удалось получить время начала, используем текущее время
+            if not period_start_time:
+                period_start_time = datetime.now().strftime('%Y-%m-%d %H:%M')
+            
             # Публикуем статью в Telegraph
-            article_title = f"Анализ чата: {chat_name} ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
+            article_title = f"Анализ чата: {chat_name} ({period_start_time})"
             article_url = publish_to_telegraph(article_title, full_content, author_name="Chat Filter Bot")
             
             if article_url:
