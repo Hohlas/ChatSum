@@ -893,11 +893,6 @@ def publish_to_telegraph(title, content, author_name="Chat Filter Bot"):
         in_list = False
         current_paragraph = []
         
-        # Отслеживаем структуру темы: после --- первая строка = заголовок, вторая = summary
-        after_separator = False
-        next_is_title = False
-        next_is_summary = False
-        
         for line in lines:
             line_stripped = line.strip()
             
@@ -908,6 +903,7 @@ def publish_to_telegraph(title, content, author_name="Chat Filter Bot"):
                     para_text = ' '.join(current_paragraph)
                     # Конвертируем Markdown элементы
                     para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
+                    para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
                     para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
                     html_paragraphs.append(f'<p>{para_text}</p>')
                     current_paragraph = []
@@ -921,6 +917,7 @@ def publish_to_telegraph(title, content, author_name="Chat Filter Bot"):
                 if current_paragraph:
                     para_text = ' '.join(current_paragraph)
                     para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
+                    para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
                     para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
                     html_paragraphs.append(f'<p>{para_text}</p>')
                     current_paragraph = []
@@ -928,66 +925,33 @@ def publish_to_telegraph(title, content, author_name="Chat Filter Bot"):
                     html_paragraphs.append('</ul>')
                     in_list = False
                 html_paragraphs.append('<hr>')
-                # После разделителя следующая непустая строка будет заголовком
-                next_is_title = True
-                next_is_summary = False
                 continue
             
-            # Обрабатываем заголовок темы (первая непустая строка после ---)
-            if next_is_title and line_stripped:
+            # Заголовок темы (начинается с 💡)
+            if line_stripped.startswith('💡'):
                 if current_paragraph:
                     para_text = ' '.join(current_paragraph)
                     para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
+                    para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
                     para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
                     html_paragraphs.append(f'<p>{para_text}</p>')
                     current_paragraph = []
                 if in_list:
                     html_paragraphs.append('</ul>')
                     in_list = False
-                # Убираем Markdown форматирование из заголовка
-                text = line_stripped.strip()
-                text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)  # Убираем ** (заголовок и так будет жирным)
-                text = re.sub(r'\*([^\*]+)\*', r'\1', text)  # Убираем одинарные *
-                # Добавляем эмодзи 💡 в начало заголовка и делаем жирным
-                html_paragraphs.append(f'<h3><b>💡 {text}</b></h3>')
-                next_is_title = False
-                next_is_summary = True  # Следующая непустая строка будет summary
+                # Конвертируем Markdown в заголовке
+                text = line_stripped
+                text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)  # **text** -> <b>text</b>
+                text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', text)    # *text* -> <i>text</i>
+                html_paragraphs.append(f'<h3>{text}</h3>')
                 continue
-            
-            # Обрабатываем summary (вторая непустая строка после ---, если не начинается с "[")
-            if next_is_summary and line_stripped and not line_stripped.startswith('['):
-                if current_paragraph:
-                    para_text = ' '.join(current_paragraph)
-                    para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                    para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-                    html_paragraphs.append(f'<p>{para_text}</p>')
-                    current_paragraph = []
-                if in_list:
-                    html_paragraphs.append('</ul>')
-                    in_list = False
-                # Убираем "Summary: " если есть
-                summary_text = line_stripped.strip()
-                if summary_text.startswith('Summary:'):
-                    summary_text = summary_text[8:].strip()  # Убираем "Summary:" (8 символов)
-                # Конвертируем Markdown в HTML (перед тем как делать курсивом)
-                summary_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', summary_text)  # Жирный
-                summary_text = re.sub(r'\*([^\*]+)\*', r'\1', summary_text)  # Убираем одинарные * (они будут курсивом через <i>)
-                summary_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', summary_text)  # Ссылки
-                # Делаем курсивом (наклонным) - весь summary
-                html_paragraphs.append(f'<p><i>{summary_text}</i></p>')
-                next_is_summary = False
-                continue
-            
-            # Если начинается с "[", значит это уже цитаты - summary пропущен
-            if next_is_summary and line_stripped and line_stripped.startswith('['):
-                next_is_summary = False
-                # Продолжаем обычную обработку этой строки
             
             # Список
             if line_stripped.startswith('- ') or line_stripped.startswith('* '):
                 if current_paragraph:
                     para_text = ' '.join(current_paragraph)
                     para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
+                    para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
                     para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
                     html_paragraphs.append(f'<p>{para_text}</p>')
                     current_paragraph = []
@@ -997,6 +961,7 @@ def publish_to_telegraph(title, content, author_name="Chat Filter Bot"):
                 item_text = line_stripped.lstrip('- *').strip()
                 # Конвертируем Markdown элементы в списке
                 item_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', item_text)
+                item_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', item_text)
                 item_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', item_text)
                 html_paragraphs.append(f'<li>{item_text}</li>')
                 continue
@@ -1011,6 +976,7 @@ def publish_to_telegraph(title, content, author_name="Chat Filter Bot"):
         if current_paragraph:
             para_text = ' '.join(current_paragraph)
             para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
+            para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
             para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
             html_paragraphs.append(f'<p>{para_text}</p>')
         
