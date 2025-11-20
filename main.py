@@ -555,6 +555,15 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None):
     return messages_data, chat_id_str
 
 
+def safe_str(value):
+    """Безопасное преобразование в строку с обработкой кириллицы"""
+    if value is None:
+        return ''
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='ignore')
+    return str(value)
+
+
 def build_tree_structure(messages_data):
     """
     Преобразует плоский список сообщений в древовидную структуру
@@ -605,6 +614,49 @@ def build_tree_structure(messages_data):
     return root_messages
 
 
+def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, total_messages=None, filtered_messages=None):
+    """
+    Формирует оптимизированную JSON структуру для экспорта/анализа
+    
+    Единая функция для /sum и /copy - устраняет дублирование кода.
+    
+    Args:
+        messages_data: Плоский список сообщений (после фильтрации)
+        chat_id_str: ID чата для ссылок
+        chat_name: Название чата (опционально, для экспорта)
+        total_messages: Общее количество сообщений (опционально, для экспорта)
+        filtered_messages: Количество отфильтрованных сообщений (опционально, для экспорта)
+    
+    Returns:
+        Словарь с оптимизированной структурой: {'metadata': {...}, 'messages': [...]}
+    """
+    # Получаем дату первого сообщения для metadata
+    period_start = messages_data[0].get('date', '') if messages_data else ''
+    
+    # Строим древовидную структуру с вложенными replies
+    tree_messages = build_tree_structure(messages_data)
+    
+    # Формируем metadata
+    metadata = {
+        'chat_id': safe_str(chat_id_str),
+        'period_start': safe_str(period_start)
+    }
+    
+    # Дополнительные поля для экспорта (/copy)
+    if chat_name is not None:
+        metadata['chat_name'] = chat_name
+        metadata['export_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if total_messages is not None:
+        metadata['total_messages'] = total_messages
+    if filtered_messages is not None:
+        metadata['filtered_messages'] = filtered_messages
+    
+    return {
+        'metadata': metadata,
+        'messages': tree_messages
+    }
+
+
 async def create_summary(messages_data, chat_id_str, model='sonar', use_reasoning=False):
     """
     Создает выжимку из сообщений с помощью Perplexity API
@@ -632,29 +684,8 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
         max_chars = 200000  # Консервативный лимит для других моделей
     
     # Формируем ОПТИМИЗИРОВАННЫЙ JSON для экономии токенов
-    # Санитизируем данные: убеждаемся что все строки в Unicode
-    def safe_str(value):
-        """Безопасное преобразование в строку с обработкой кириллицы"""
-        if value is None:
-            return ''
-        if isinstance(value, bytes):
-            return value.decode('utf-8', errors='ignore')
-        return str(value)
-    
-    # Получаем дату первого сообщения для metadata
-    period_start = messages_data[0].get('date', '') if messages_data else ''
-    
-    # Строим древовидную структуру с вложенными replies
-    tree_messages = build_tree_structure(messages_data)
-    
-    # Создаем финальную структуру с metadata
-    optimized_structure = {
-        'metadata': {
-            'chat_id': safe_str(chat_id_str),
-            'period_start': safe_str(period_start)
-        },
-        'messages': tree_messages
-    }
+    # Используем общую функцию для единообразия с /copy
+    optimized_structure = build_optimized_json_structure(messages_data, chat_id_str)
     
     # Используем ensure_ascii=False для сохранения кириллицы
     messages_json = json.dumps(optimized_structure, ensure_ascii=False, indent=2)
@@ -678,19 +709,8 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
         # Берем ПОСЛЕДНИЕ сообщения (самые актуальные), а не первые!
         messages_data_limited = messages_data[-limit:]  # Изменено на последние!
         
-        # Получаем дату первого сообщения из ограниченной выборки
-        period_start = messages_data_limited[0].get('date', '') if messages_data_limited else ''
-        
-        # Строим древовидную структуру с ограниченными данными
-        tree_messages = build_tree_structure(messages_data_limited)
-        
-        optimized_structure = {
-            'metadata': {
-                'chat_id': safe_str(chat_id_str),
-                'period_start': safe_str(period_start)
-            },
-            'messages': tree_messages
-        }
+        # Используем общую функцию для формирования структуры
+        optimized_structure = build_optimized_json_structure(messages_data_limited, chat_id_str)
         
         messages_json = json.dumps(optimized_structure, ensure_ascii=False, indent=2)
     
@@ -925,25 +945,15 @@ async def process_chat_command(event, use_ai=True):
             print("✅ Анализ с AI успешно завершён")
         
         else:
-            # Режим /copy - экспорт без AI (с оптимизированной структурой v2.0)
-            # Получаем дату первого сообщения для metadata
-            period_start = optimized_messages[0].get('date', '') if optimized_messages else ''
-            
-            # Строим древовидную структуру с вложенными replies
-            tree_messages = build_tree_structure(optimized_messages)
-            
-            # Создаем оптимизированную структуру (такая же как в /sum)
-            export_data = {
-                'metadata': {
-                    'chat_name': chat_name,
-                    'chat_id': chat_id_str,
-                    'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'period_start': period_start,
-                    'total_messages': len(messages_data),
-                    'filtered_messages': len(optimized_messages)
-                },
-                'messages': tree_messages
-            }
+            # Режим /copy - экспорт без AI
+            # Используем общую функцию для формирования структуры (такая же как в /sum)
+            export_data = build_optimized_json_structure(
+                optimized_messages,
+                chat_id_str,
+                chat_name=chat_name,
+                total_messages=len(messages_data),
+                filtered_messages=len(optimized_messages)
+            )
             
             # Создаем JSON строку
             json_export = json.dumps(export_data, ensure_ascii=False, indent=2)
