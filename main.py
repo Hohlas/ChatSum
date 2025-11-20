@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 import json
 from datetime import datetime, timedelta, timezone
 import httpx
+from telegraph import Telegraph
 
 # Загрузка переменных окружения
 load_dotenv('private.txt')
@@ -828,6 +829,98 @@ def save_analysis(messages_data, summary):
     print(f"💾 Результаты сохранены в {filename}")
 
 
+def publish_to_telegraph(title, content, author_name="Chat Filter Bot"):
+    """
+    Публикует статью в Telegraph
+    
+    Args:
+        title: Заголовок статьи
+        content: Содержимое статьи (Markdown текст)
+        author_name: Имя автора (опционально)
+    
+    Returns:
+        URL опубликованной статьи или None при ошибке
+    """
+    try:
+        # Создаем экземпляр Telegraph (анонимный аккаунт)
+        telegraph = Telegraph()
+        
+        # Создаем аккаунт (анонимный, можно использовать один для всех публикаций)
+        account = telegraph.create_account(short_name=author_name)
+        telegraph = Telegraph(access_token=account['access_token'])
+        
+        # Конвертируем Markdown в HTML для Telegraph
+        # Telegraph поддерживает HTML теги
+        html_content = content
+        
+        # Простая конвертация Markdown в HTML
+        # Заменяем основные Markdown элементы на HTML
+        html_content = html_content.replace('\n---\n', '<hr>')
+        html_content = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', html_content)
+        html_content = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', html_content)
+        
+        # Разбиваем на параграфы и обрабатываем
+        paragraphs = html_content.split('\n\n')
+        html_paragraphs = []
+        in_list = False
+        
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                if in_list:
+                    html_paragraphs.append('</ul>')
+                    in_list = False
+                continue
+                
+            # Если это заголовок (начинается с #)
+            if para.startswith('#'):
+                if in_list:
+                    html_paragraphs.append('</ul>')
+                    in_list = False
+                level = len(para) - len(para.lstrip('#'))
+                text = para.lstrip('# ').strip()
+                html_paragraphs.append(f'<h{min(level, 6)}>{text}</h{min(level, 6)}>')
+            # Если это список
+            elif para.startswith('- ') or para.startswith('* '):
+                if not in_list:
+                    html_paragraphs.append('<ul>')
+                    in_list = True
+                items = [item.strip('- *').strip() for item in para.split('\n') if item.strip().startswith(('- ', '* '))]
+                for item in items:
+                    html_paragraphs.append(f'<li>{item}</li>')
+            else:
+                if in_list:
+                    html_paragraphs.append('</ul>')
+                    in_list = False
+                html_paragraphs.append(f'<p>{para}</p>')
+        
+        if in_list:
+            html_paragraphs.append('</ul>')
+        
+        html_content = ''.join(html_paragraphs)
+        
+        # Публикуем статью
+        response = telegraph.create_page(
+            title=title,
+            html_content=html_content,
+            author_name=author_name
+        )
+        
+        if response and 'url' in response:
+            article_url = response['url']
+            print(f"✅ Статья опубликована в Telegraph: {article_url}")
+            return article_url
+        else:
+            print(f"❌ Ошибка при публикации в Telegraph: {response}")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Ошибка при публикации в Telegraph: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 async def process_chat_command(event, use_ai=True):
     """
     Универсальная функция обработки команд /sum и /copy
@@ -935,6 +1028,11 @@ async def process_chat_command(event, use_ai=True):
             stats_message += f"• Тем: {topics_count}\n"
             
             # Добавляем информацию о токенах и стоимости
+            prompt_tokens = None
+            completion_tokens = None
+            total_tokens = None
+            total_cost = None
+            
             if usage_info:
                 prompt_tokens = usage_info['prompt_tokens']
                 completion_tokens = usage_info['completion_tokens']
@@ -950,40 +1048,45 @@ async def process_chat_command(event, use_ai=True):
                 stats_message += f"• Токенов: {total_tokens:,}\n"
                 stats_message += f"• Стоимость: ${total_cost:.4f}\n"
             
-            stats_message += f"\n📄 Полный анализ в прикрепленном файле"
+            # Формируем полный контент для Telegraph (с статистикой в конце)
+            full_content = summary
+            if usage_info and prompt_tokens is not None:
+                full_content += f"\n\n---\n\n"
+                full_content += f"📊 **Использовано токенов:**\n"
+                full_content += f"• Промпт: {prompt_tokens:,}\n"
+                full_content += f"• Ответ: {completion_tokens:,}\n"
+                full_content += f"• Всего: {total_tokens:,}\n"
+                full_content += f"💰 Стоимость: ${total_cost:.4f}\n"
             
-            # Сохраняем полный анализ в .md файл
-            filename = f"analysis_{chat_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(summary)
-                # Добавляем статистику в конец файла
-                if usage_info:
-                    f.write(f"\n\n---\n\n")
-                    f.write(f"📊 **Использовано токенов:**\n")
-                    f.write(f"• Промпт: {prompt_tokens:,}\n")
-                    f.write(f"• Ответ: {completion_tokens:,}\n")
-                    f.write(f"• Всего: {total_tokens:,}\n")
-                    f.write(f"💰 Стоимость: ${total_cost:.4f}\n")
+            # Публикуем статью в Telegraph
+            article_title = f"Анализ чата: {chat_name} ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
+            article_url = publish_to_telegraph(article_title, full_content, author_name="Chat Filter Bot")
             
-            # Отправляем статистику в сообщении
+            if article_url:
+                stats_message += f"\n\n📰 **Статья в Telegraph:**\n{article_url}"
+            else:
+                # Если не удалось опубликовать в Telegraph, сохраняем в файл как запасной вариант
+                stats_message += f"\n\n⚠️ Не удалось опубликовать в Telegraph. Сохраняю в файл..."
+                filename = f"analysis_{chat_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(full_content)
+                
+                await telegram_client.send_file(
+                    RESULTS_DESTINATION,
+                    filename,
+                    caption=f"📄 **Полный анализ чата '{chat_name}'**\n\n"
+                           f"Тем: {topics_count}\n"
+                           f"Сообщений проанализировано: {len(optimized_messages)}",
+                    reply_to=topic_id
+                )
+                os.remove(filename)
+            
+            # Отправляем статистику с ссылкой на статью
             await telegram_client.send_message(
                 RESULTS_DESTINATION, 
                 stats_message,
                 reply_to=topic_id
             )
-            
-            # Отправляем полный анализ как .md файл
-            await telegram_client.send_file(
-                RESULTS_DESTINATION,
-                filename,
-                caption=f"📄 **Полный анализ чата '{chat_name}'**\n\n"
-                       f"Тем: {topics_count}\n"
-                       f"Сообщений проанализировано: {len(optimized_messages)}",
-                reply_to=topic_id
-            )
-            
-            # Удаляем временный файл
-            os.remove(filename)
             
             print("✅ Анализ с AI успешно завершён")
         
