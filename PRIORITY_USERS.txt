@@ -3,9 +3,9 @@
 # Можно использовать любые разделители: пробел, запятая, перенос строки
 # Строки начинающиеся с # игнорируются (комментарии)
 
-izinur
-restyle77
-Sinprier
+Zinur
+Restyle Pon
+Lex
 ProMint
-syroamst
+Sergey (ICO Drops)
 

@@ -3,7 +3,7 @@
 # Строки начинающиеся с # игнорируются (комментарии)
 
 AntonHoldon
-gtslay
-E2ard
-vlad_calista
+Grigory
+Edward Black
+CALISTA
 
