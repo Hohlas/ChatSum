@@ -576,6 +576,10 @@ def build_tree_structure(messages_data):
     """
     # Создаем словарь для быстрого поиска сообщений по ID
     messages_by_id = {}
+    # Отслеживаем, какие сообщения являются ответами (не должны быть в root_messages)
+    is_reply = set()
+    
+    # Первый проход: создаем все объекты сообщений
     for msg in messages_data:
         msg_id = msg['message_id']
         messages_by_id[msg_id] = {
@@ -585,8 +589,7 @@ def build_tree_structure(messages_data):
             'replies': []
         }
     
-    # Строим дерево: добавляем ответы к родительским сообщениям
-    root_messages = []
+    # Второй проход: строим дерево и отмечаем ответы
     for msg in messages_data:
         msg_id = msg['message_id']
         reply_to = msg.get('reply_to')
@@ -596,9 +599,19 @@ def build_tree_structure(messages_data):
         if reply_to and reply_to in messages_by_id:
             # Это ответ на существующее сообщение - добавляем в replies родителя
             messages_by_id[reply_to]['replies'].append(current_msg)
-        else:
-            # Это корневое сообщение (или ответ на отсутствующее)
-            root_messages.append(current_msg)
+            # Отмечаем, что это сообщение является ответом
+            is_reply.add(msg_id)
+            # Отладочный вывод для диагностики
+            parent_replies_count = len(messages_by_id[reply_to]['replies'])
+            print(f"🔗 Сообщение {msg_id} добавлено в replies сообщения {reply_to} (всего replies: {parent_replies_count})")
+        # Если reply_to отсутствует или родитель не найден, сообщение будет корневым
+    
+    # Собираем корневые сообщения (те, которые не являются ответами)
+    root_messages = []
+    for msg in messages_data:
+        msg_id = msg['message_id']
+        if msg_id not in is_reply:
+            root_messages.append(messages_by_id[msg_id])
     
     # Удаляем пустые массивы replies для экономии токенов
     def clean_empty_replies(msg):
