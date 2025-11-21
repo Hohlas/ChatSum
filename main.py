@@ -1261,7 +1261,7 @@ async def process_chat_command(event, use_ai=True):
             
             # Добавляем информацию о боте в конец статьи
             full_content += f"\n\n---\n\n"
-            full_content += f"*Создано ботом [Telegram Chat Summary](https://github.com/Hohlas/ChatSum) | от [Hohla](https://t.me/hohlas)*\n"
+            full_content += f"*Создано ботом [Telegram Chat Summary](https://github.com/Hohlas/ChatSum) | Автор: [Hohla](https://t.me/hohlas)*\n"
             
             # Публикуем статью в Telegraph
             article_title = f"Анализ чата: {chat_name} ({period_start_time})"
