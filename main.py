@@ -1259,6 +1259,10 @@ async def process_chat_command(event, use_ai=True):
                 full_content += f"• Всего: {total_tokens:,}\n"
                 full_content += f"💰 Стоимость: ${total_cost:.4f}\n"
             
+            # Добавляем информацию о боте в конец статьи
+            full_content += f"\n\n---\n\n"
+            full_content += f"*Создано ботом [Telegram Chat Summary](https://github.com/Hohlas/ChatSum) | от [Hohla](https://t.me/hohlas)*\n"
+            
             # Публикуем статью в Telegraph
             article_title = f"Анализ чата: {chat_name} ({period_start_time})"
             article_url = publish_to_telegraph(article_title, full_content, author_name="Chat Filter Bot")
