@@ -475,8 +475,8 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None):
         # Используем UTC для сравнения с message.date (Telegram API возвращает UTC)
         time_limit = datetime.now(timezone.utc) - timedelta(days=days, hours=hours)
         
-    async for message in telegram_client.iter_messages(chat_id):
-        # Прерываем, если достигли временного предела
+        async for message in telegram_client.iter_messages(chat_id):
+            # Прерываем, если достигли временного предела
             # Приводим message.date к UTC, если он не имеет timezone
             msg_date = message.date
             if msg_date.tzinfo is None:
@@ -499,7 +499,7 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None):
                         sender_name += f" {sender.last_name}"
                 elif hasattr(sender, 'title'):
                     sender_name = sender.title
-            
+                
                 # Добавляем информацию об ответе на сообщение (если есть)
                 reply_to = None
                 if message.reply_to and hasattr(message.reply_to, 'reply_to_msg_id'):
