@@ -600,9 +600,9 @@ def build_tree_structure(messages_data):
         msg_id = msg['message_id']
         messages_by_id[msg_id] = {
             'id': msg_id,
-            'sender': msg['sender'],
-            'text': msg['text'],
-            'replies': []
+            's': msg['sender'],  # sender → s
+            't': msg['text'],    # text → t
+            'r': []               # replies → r
         }
     
     # Второй проход: строим дерево и отмечаем ответы
@@ -614,7 +614,7 @@ def build_tree_structure(messages_data):
         
         if reply_to and reply_to in messages_by_id:
             # Это ответ на существующее сообщение - добавляем в replies родителя
-            messages_by_id[reply_to]['replies'].append(current_msg)
+            messages_by_id[reply_to]['r'].append(current_msg)  # replies → r
             # Отмечаем, что это сообщение является ответом
             is_reply.add(msg_id)
         # Если reply_to отсутствует или родитель не найден, сообщение будет корневым
@@ -628,10 +628,10 @@ def build_tree_structure(messages_data):
     
     # Удаляем пустые массивы replies для экономии токенов
     def clean_empty_replies(msg):
-        if not msg['replies']:
-            del msg['replies']
+        if not msg['r']:  # replies → r
+            del msg['r']
         else:
-            for reply in msg['replies']:
+            for reply in msg['r']:  # replies → r
                 clean_empty_replies(reply)
     
     for msg in root_messages:
