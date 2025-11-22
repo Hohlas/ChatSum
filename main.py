@@ -812,13 +812,29 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
     if not messages_data:
         return "❌ Нет сообщений для анализа за указанный период (все отфильтровано)"
     
-    print(f"🤖 Отправка {len(messages_data)} сообщений в Perplexity для анализа...")
-    print(f"   Модель: {model}")
+    # Определяем финальную модель с учётом reasoning
+    if use_reasoning:
+        # Переключаемся на reasoning-версию модели
+        reasoning_models = {
+            'sonar': 'sonar-reasoning',
+            'sonar-pro': 'sonar-reasoning-pro'
+        }
+        actual_model = reasoning_models.get(model, 'sonar-reasoning')
+        print(f"🤖 Отправка {len(messages_data)} сообщений в Perplexity для анализа...")
+        print(f"   🧠 Используем reasoning модель: {actual_model}")
+    else:
+        actual_model = model
+        print(f"🤖 Отправка {len(messages_data)} сообщений в Perplexity для анализа...")
+        print(f"   ⚡ Используем стандартную модель: {actual_model}")
     
     # Определяем лимиты в зависимости от модели
     # Sonar/Sonar-Pro имеют контекст 127K токенов (на основе Llama 3.3 70B)
-    if 'sonar' in model.lower():
-        max_chars = 250000  # ~60K токенов для Sonar (оставляем запас)
+    # Sonar-reasoning модели имеют меньший контекст
+    if 'sonar' in actual_model.lower():
+        if 'reasoning' in actual_model.lower():
+            max_chars = 150000  # ~35K токенов для reasoning моделей (меньший контекст)
+        else:
+            max_chars = 250000  # ~60K токенов для стандартных Sonar (оставляем запас)
     else:
         max_chars = 200000  # Консервативный лимит для других моделей
     
@@ -832,7 +848,7 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
     # Проверяем размер и при необходимости разбиваем на части
     if len(messages_json) > max_chars:
         print(f"⚠️  Данных слишком много ({len(messages_json)} символов)")
-        print(f"   Максимум для модели {model}: {max_chars} символов")
+        print(f"   Максимум для модели {actual_model}: {max_chars} символов")
         
         # Вариант 1: Разбить на несколько запросов (рекомендуется)
         # Вариант 2: Взять только последние сообщения (самые актуальные)
@@ -879,7 +895,7 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
             user_content = user_content.encode('utf-8', errors='ignore').decode('utf-8')
         
         request_params = {
-            'model': model,
+            'model': actual_model,  # Используем actual_model вместо model
             'messages': [
                 {'role': 'system', 'content': system_content},
                 {'role': 'user', 'content': user_content}
@@ -887,14 +903,6 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
             'temperature': 0.3,
             'max_tokens': 4000
         }
-        
-        # Добавляем reasoning для поддерживаемых моделей
-        # Примечание: не все модели в Perplexity поддерживают reasoning
-        # Обычно это экспериментальная фича
-        if use_reasoning and 'sonar' in model.lower():
-            print("   🧠 Режим reasoning включен")
-            # Perplexity может не поддерживать этот параметр
-            # request_params['reasoning'] = True
         
         # Выводим информацию о размере запроса
         total_chars = len(system_content) + len(user_content)
