@@ -1411,6 +1411,32 @@ def create_html_report(title, content, author_name="Chat Filter Bot"):
                 font-size: 16px;
             }}
         }}
+        
+        /* Темная тема - автоматически применяется если в системе включен темный режим */
+        @media (prefers-color-scheme: dark) {{
+            body {{
+                color: #e4e4e4;
+                background-color: #1a1a1a;
+            }}
+            
+            .container {{
+                background-color: #2d2d2d;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+            }}
+            
+            a {{
+                color: #6ab7ff;
+            }}
+            
+            hr {{
+                border-top: 1px solid #444;
+            }}
+            
+            .footer {{
+                border-top: 1px solid #3a3a3a;
+                color: #999;
+            }}
+        }}
     </style>
 </head>
 <body>
