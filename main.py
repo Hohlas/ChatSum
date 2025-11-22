@@ -1361,7 +1361,7 @@ async def process_chat_command(event, use_ai=True):
             #     full_content += f"💰 Стоимость: ${total_cost:.4f}\n"
             
             # Добавляем информацию о боте в конец статьи
-            full_content += f"\n" # ---\n\n
+            full_content += f"\n---\n"
             full_content += f"Создано ботом [Telegram Chat Summary](https://github.com/Hohlas/ChatSum) | Автор: [Hohla](https://t.me/hohlas)\n\n"
             full_content += f"💰 0x94f69c258cD251bcB77DBb6156DA13E32dCb8Ef4\n"
             
