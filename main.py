@@ -470,7 +470,12 @@ def optimize_messages(messages_data, chat_id_str):
     excluded_count = 0
     noise_count = 0
     
+    # Собираем уникальные имена отправителей для диагностики
+    unique_senders = set()
+    
     for msg in messages_data:
+        unique_senders.add(msg['sender'])
+        
         # Фильтруем исключенных пользователей
         if msg['sender'] in EXCLUDED_USERS:
             excluded_count += 1
@@ -492,6 +497,21 @@ def optimize_messages(messages_data, chat_id_str):
     print(f"   • Удалено шума/флуда: {noise_count}")
     print(f"   • Итого для анализа: {len(optimized)} сообщений")
     print(f"   • Экономия: {len(messages_data) - len(optimized)} сообщений ({round((len(messages_data) - len(optimized)) / len(messages_data) * 100, 1)}%)")
+    
+    # Диагностика приоритетных пользователей
+    if PRIORITY_USERS:
+        print(f"\n🔍 Проверка приоритетных пользователей:")
+        for priority_user in PRIORITY_USERS:
+            if priority_user in unique_senders:
+                # Считаем сообщения от приоритетного пользователя
+                priority_msg_count = sum(1 for msg in optimized if msg['sender'] == priority_user)
+                print(f"   ✅ {priority_user}: найдено {priority_msg_count} сообщений")
+            else:
+                print(f"   ⚠️  {priority_user}: НЕ найден в сообщениях")
+                # Показываем похожие имена для помощи
+                similar = [s for s in unique_senders if priority_user.lower() in s.lower() or s.lower() in priority_user.lower()]
+                if similar:
+                    print(f"      Похожие имена: {', '.join(similar)}")
     
     return optimized
 
