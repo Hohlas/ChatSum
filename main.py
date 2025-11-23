@@ -512,12 +512,35 @@ def optimize_messages(messages_data, chat_id_str):
                 print(f"   ✅ {priority_user}: найдено {priority_msg_count} сообщений")
             else:
                 print(f"   ⚠️  {priority_user}: НЕ найден в сообщениях")
-                # Показываем похожие имена для помощи
-                similar = [s for s in unique_senders if priority_user.lower() in s.lower() or s.lower() in priority_user.lower()]
-                if similar:
-                    print(f"      Похожие имена: {', '.join(similar)}")
     
     return optimized
+
+
+def count_messages_with_urls(messages_data):
+    """
+    Подсчитывает сообщения содержащие URL
+    
+    Args:
+        messages_data: Список сообщений
+    
+    Returns:
+        Кортеж (количество сообщений с URL, список сообщений с URL)
+    """
+    url_pattern = re.compile(r'https?://[^\s]+')
+    count = 0
+    urls = []
+    
+    for msg in messages_data:
+        text = msg.get('text', '')
+        if url_pattern.search(text):
+            count += 1
+            urls.append({
+                'sender': msg.get('sender'),
+                'message_id': msg.get('message_id'),
+                'text': text[:100]  # Первые 100 символов
+            })
+    
+    return count, urls
 
 
 async def collect_messages(chat_id, hours=None, days=None, limit=None):
@@ -1567,6 +1590,16 @@ async def process_chat_command(event, use_ai=True):
         # Оптимизируем сообщения (фильтруем шум)
         optimized_messages = optimize_messages(messages_data, chat_id_str)
         
+        # Подсчитываем сообщения с URL
+        url_count, url_messages = count_messages_with_urls(optimized_messages)
+        if url_count > 0:
+            print(f"\n📎 Найдено сообщений с URL: {url_count}")
+            for msg in url_messages[:10]:  # Показываем первые 10
+                text_preview = msg['text']
+                print(f"   • {text_preview}...")
+            if len(url_messages) > 10:
+                print(f"   ... и еще {len(url_messages) - 10} сообщений с URL")
+        
         # Предупреждение о больших запросах (особенно для AI анализа)
         if use_ai and len(optimized_messages) > 200:
             await telegram_client.send_message(
@@ -1651,6 +1684,8 @@ async def process_chat_command(event, use_ai=True):
             # Формируем статистику в новом формате
             stats_message = f"📊 Анализ завершен\n\n"
             stats_message += f"• Обработано: {len(optimized_messages)} сообщений = {topics_count} Тем\n"
+            if url_count > 0:
+                stats_message += f"• URL в сообщениях: {url_count}\n"
             if period_text:
                 stats_message += f"• За период: {period_text}\n"
                 stats_message += f"• С {period_start_time} по {period_end_time}\n"
