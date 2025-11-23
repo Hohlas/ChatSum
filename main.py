@@ -335,49 +335,28 @@ CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT = load_model_config(MODEL_CONFIG_F
 # Инициализация клиентов
 telegram_client = TelegramClient('session_name', API_ID, API_HASH)
 
-# Диагностика API ключа
+# Валидация API ключа
 print(f"🔑 Проверка Perplexity API ключа:")
 print(f"   Длина: {len(PERPLEXITY_API_KEY)} символов")
 print(f"   Первые 10 символов: {PERPLEXITY_API_KEY[:10]}...")
 print(f"   Последние 10 символов: ...{PERPLEXITY_API_KEY[-10:]}")
 
-# Убеждаемся что API ключ содержит только ASCII символы
-has_non_ascii = False
+# Проверка, что ключ содержит только ASCII символы
 try:
     PERPLEXITY_API_KEY.encode('ascii')
-    print(f"   ✅ Ключ содержит только ASCII символы")
+    print(f"   ✅ API-ключ корректный (ASCII)")
 except UnicodeEncodeError:
-    has_non_ascii = True
-    print("   ⚠️  ВНИМАНИЕ: API ключ содержит не-ASCII символы!")
-    print(f"   Проблемные символы: {[c for c in PERPLEXITY_API_KEY if ord(c) > 127]}")
-    # Удаляем все не-ASCII символы
-    PERPLEXITY_API_KEY = PERPLEXITY_API_KEY.encode('ascii', errors='ignore').decode('ascii')
-    print(f"   После очистки: {len(PERPLEXITY_API_KEY)} символов")
+    print("   ❌ ОШИБКА: API-ключ содержит недопустимые символы!")
+    print("   Проверьте файл private.txt на наличие невидимых символов")
+    exit(1)
 
-# Создаем httpx клиент с явной обработкой заголовков
-class ASCIIHeadersClient(httpx.Client):
-    """Custom httpx client that ensures all headers are ASCII-safe"""
-    def build_request(self, *args, **kwargs):
-        request = super().build_request(*args, **kwargs)
-        # Конвертируем все заголовки в ASCII-безопасный формат
-        safe_headers = {}
-        for key, value in request.headers.items():
-            try:
-                # Пытаемся закодировать значение в ASCII
-                if isinstance(value, str):
-                    value.encode('ascii')
-                safe_headers[key] = value
-            except (UnicodeEncodeError, AttributeError):
-                # Если не получается - конвертируем в безопасную строку
-                safe_value = str(value).encode('ascii', errors='ignore').decode('ascii')
-                safe_headers[key] = safe_value
-                print(f"⚠️  Исправлен заголовок '{key}': '{value}' -> '{safe_value}'")
-        request.headers = httpx.Headers(safe_headers)
-        return request
-
-http_client = ASCIIHeadersClient(
-    timeout=180.0,  # Увеличен до 3 минут для больших запросов
-    limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
+# Создаём стандартный HTTP-клиент с настройками таймаута и лимитов соединений
+http_client = httpx.Client(
+    timeout=180.0,
+    limits=httpx.Limits(
+        max_keepalive_connections=5,
+        max_connections=10
+    )
 )
 
 perplexity_client = OpenAI(
