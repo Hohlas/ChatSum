@@ -1745,8 +1745,9 @@ async def process_chat_command(event, use_ai=True):
                 article_url = publish_to_telegraph(article_title, full_content, author_name="Chat Filter Bot")
                 
                 if article_url:
-                    stats_message += f"\n📰 [**Статья в Telegraph**]({article_url})"
-                    stats_message += f"\n\n_Обработано с помощью [ChatSumBot](https://github.com/Hohlas/ChatSum)_"
+                    stats_message += f"\n\n📰 [**Статья в Telegraph**]({article_url})"
+                    stats_message += f"\n<i>Обработано с помощью <a href='https://github.com/Hohlas/ChatSum'>ChatSumBot</a></i>"
+
                     # Удаляем временный файл анализа после успешной публикации
                     try:
                         if os.path.exists(analysis_filename):
