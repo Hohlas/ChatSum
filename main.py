@@ -1682,7 +1682,7 @@ async def process_chat_command(event, use_ai=True):
                 total_cost = input_cost + output_cost
             
             # Формируем статистику в новом формате
-            stats_message = f"📊 Анализ завершен\n\n"
+            stats_message = ""
             stats_message += f"• Обработано: {len(optimized_messages)} сообщений = {topics_count} Тем\n"
             if url_count > 0:
                 stats_message += f"• URL в сообщениях: {url_count}\n"
@@ -1713,7 +1713,7 @@ async def process_chat_command(event, use_ai=True):
             # Выбираем способ экспорта на основе конфигурации
             if USE_HTML_EXPORT:
                 # Создаем HTML отчет и отправляем файл
-                html_file = create_html_report(article_title, full_content, author_name="Chat Filter Bot")
+                html_file = create_html_report(article_title, full_content, author_name="Chat Sum Bot")
                 
                 if html_file:
                     # Отправляем HTML файл как документ
@@ -1742,11 +1742,13 @@ async def process_chat_command(event, use_ai=True):
                     )
             else:
                 # Используем Telegraph (старый способ)
-                article_url = publish_to_telegraph(article_title, full_content, author_name="Chat Filter Bot")
+                article_url = publish_to_telegraph(article_title, full_content, author_name="Chat Sum Bot")
                 
                 if article_url:
-                    stats_message += f"\n\n📰 [**Статья в Telegraph**]({article_url})"
-                    stats_message += f"\n<i>Обработано с помощью <a href='https://github.com/Hohlas/ChatSum'>ChatSumBot</a></i>"
+                    # Вставляем заголовок с саммари в начало сообщения
+                    header = f"📰 Саммари чата <a href=\"{article_url}\"><b>{chat_name}</b></a>\n\n"
+                    stats_message = header + stats_message
+                    stats_message += f"\n<i>Обработано с помощью <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
 
                     # Удаляем временный файл анализа после успешной публикации
                     try:
@@ -1776,6 +1778,7 @@ async def process_chat_command(event, use_ai=True):
                 await telegram_client.send_message(
                     RESULTS_DESTINATION, 
                     stats_message,
+                    parse_mode='html',
                     reply_to=topic_id
                 )
             
