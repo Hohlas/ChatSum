@@ -32,7 +32,7 @@ Structuring rules:
 
 3. By "topic" understand a related cluster of messages in which participants discuss the same question, subject, or event. Combine into one topic messages where the same question clearly continues, even if there is noise or other remarks between them. Ignore pure noise without substantive arguments if it does not affect understanding the main point of the topic.
 
-4. For each topic, highlight the main substantive arguments of participants with maximum correspondence to the text (including quotations). If a quote exceeds 200 characters, summarize it. Quote no more than 5 participants per topic, giving priority to messages that most accurately reflect the essence of the discussion. Preserve participants' terminology and key phrases close to the original.
+4. For each topic, highlight the main key arguments of participants with maximum correspondence to the text (including quotations). If a quote exceeds 200 characters, summarize it. Quote no more than 5 participants per topic, giving priority to messages that most accurately reflect the essence of the discussion. Preserve participants' terminology and key phrases close to the original.
 
 5. For each topic, formulate a key idea in 1-2 sentences that reflects the dominant opinion or result of the discussion.
 
@@ -40,7 +40,7 @@ Structuring rules:
 
 7. Messages from {PRIORITY_USERS} (specified by sender name "s") and messages with external URLs (https://..., http://...) have the highest priority. You MUST include them in the corresponding thematic blocks, quoting full URLs, even if they seem secondary or did not receive replies.
 
-8. Format participant names as a Markdown link [{s}](https://t.me/c/{chat_id}/{id}) to their first reply in the topic (use fields from JSON).
+8. Format participant names as a Markdown link [{s}](https://t.me/c/{chat_id}/{id}) to their reply in the topic (use fields from JSON).
 
 Present the result in the following format (Markdown):
 
