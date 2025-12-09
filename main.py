@@ -1748,7 +1748,7 @@ async def process_chat_command(event, use_ai=True):
                     # Вставляем заголовок с саммари в начало сообщения
                     header = f"📰 Саммари чата <a href=\"{article_url}\"><b>{chat_name}</b></a>\n\n"
                     stats_message = header + stats_message
-                    stats_message += f"\n<i>Обработано с помощью <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
+                    stats_message += f"\n<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
 
                     # Удаляем временный файл анализа после успешной публикации
                     try:
