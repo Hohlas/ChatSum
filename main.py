@@ -1705,76 +1705,76 @@ async def process_chat_command(event, use_ai=True):
             
             # Добавляем информацию о боте в конец статьи
             full_content += f"\n---\n"
-            full_content += f"[Chat Sum Bot](https://github.com/Hohlas/ChatSum) | [Hohla](https://t.me/hohlas)\n\n"
-            full_content += f"💰 0x94f69c258cD251bcB77DBb6156DA13E32dCb8Ef4\n"
+            ull_content += f"created by [Chat Sum Bot](https://github.com/Hohlas/ChatSum) \n"
+            # full_content += f"[Chat Sum Bot](https://github.com/Hohlas/ChatSum) | [Hohla](https://t.me/hohlas)\n\n"
+            # full_content += f"💰 0x94f69c258cD251bcB77DBb6156DA13E32dCb8Ef4\n"
             
             article_title = f"Анализ чата: {chat_name} ({period_start_time})"
             
-            # Выбираем способ экспорта на основе конфигурации
-            if USE_HTML_EXPORT:
-                # Создаем HTML отчет и отправляем файл
-                html_file = create_html_report(article_title, full_content, author_name="Chat Sum Bot")
-                
-                if html_file:
-                    # Отправляем HTML файл как документ
-                    await telegram_client.send_file(
-                        RESULTS_DESTINATION,
-                        html_file,
-                        caption=stats_message,
-                        reply_to=topic_id
-                    )
-                    print(f"✅ HTML отчет отправлен в Telegram")
+            # Всегда публикуем в Telegraph
+            article_url = publish_to_telegraph(article_title, full_content, author_name="Chat Sum Bot")
+            
+            if article_url:
+                # Вставляем заголовок с саммари в начало сообщения
+                header = f"📰 Саммари чата <a href=\"{article_url}\"><b>{chat_name}</b></a>\n\n"
+                stats_message = header + stats_message
+                stats_message += f"\n<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
+
+                # Если USE_HTML_EXPORT=true, дополнительно создаем и отправляем HTML файл
+                if USE_HTML_EXPORT:
+                    html_file = create_html_report(article_title, full_content, author_name="Chat Sum Bot")
                     
-                    # Удаляем временный файл анализа после успешной публикации
-                    try:
-                        if os.path.exists(analysis_filename):
-                            os.remove(analysis_filename)
-                            print(f"🗑️  Временный файл {analysis_filename} удален")
-                    except Exception as e:
-                        print(f"⚠️  Не удалось удалить файл {analysis_filename}: {e}")
+                    if html_file:
+                        # Отправляем HTML файл как документ
+                        await telegram_client.send_file(
+                            RESULTS_DESTINATION,
+                            html_file,
+                            caption=stats_message,
+                            reply_to=topic_id
+                        )
+                        print(f"✅ HTML отчет отправлен в Telegram")
+                    else:
+                        # Если не удалось создать HTML, отправляем просто статистику
+                        await telegram_client.send_message(
+                            RESULTS_DESTINATION, 
+                            stats_message + "\n⚠️ Не удалось создать HTML отчет",
+                            parse_mode='html',
+                            reply_to=topic_id
+                        )
                 else:
-                    # Если не удалось создать HTML, отправляем просто статистику
-                    stats_message += f"\n⚠️ Не удалось создать HTML отчет"
+                    # Отправляем только статистику с ссылкой на Telegraph
                     await telegram_client.send_message(
                         RESULTS_DESTINATION, 
                         stats_message,
+                        parse_mode='html',
                         reply_to=topic_id
                     )
-            else:
-                # Используем Telegraph (старый способ)
-                article_url = publish_to_telegraph(article_title, full_content, author_name="Chat Sum Bot")
-                
-                if article_url:
-                    # Вставляем заголовок с саммари в начало сообщения
-                    header = f"📰 Саммари чата <a href=\"{article_url}\"><b>{chat_name}</b></a>\n\n"
-                    stats_message = header + stats_message
-                    stats_message += f"\n<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
 
-                    # Удаляем временный файл анализа после успешной публикации
-                    try:
-                        if os.path.exists(analysis_filename):
-                            os.remove(analysis_filename)
-                            print(f"🗑️  Временный файл {analysis_filename} удален")
-                    except Exception as e:
-                        print(f"⚠️  Не удалось удалить файл {analysis_filename}: {e}")
-                else:
-                    # Если не удалось опубликовать в Telegraph, сохраняем в файл как запасной вариант
-                    stats_message += f"\n⚠️ Не удалось опубликовать в Telegraph. Сохраняю в файл..."
-                    filename = f"analysis_{chat_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-                    with open(filename, 'w', encoding='utf-8') as f:
-                        f.write(full_content)
-                    
-                    await telegram_client.send_file(
-                        RESULTS_DESTINATION,
-                        filename,
-                        caption=f"📄 **Полный анализ чата '{chat_name}'**\n\n"
-                               f"Тем: {topics_count}\n"
-                               f"Сообщений проанализировано: {len(optimized_messages)}",
-                        reply_to=topic_id
-                    )
-                    os.remove(filename)
+                # Удаляем временный файл анализа после успешной публикации
+                try:
+                    if os.path.exists(analysis_filename):
+                        os.remove(analysis_filename)
+                        print(f"🗑️  Временный файл {analysis_filename} удален")
+                except Exception as e:
+                    print(f"⚠️  Не удалось удалить файл {analysis_filename}: {e}")
+            else:
+                # Если не удалось опубликовать в Telegraph, сохраняем в файл как запасной вариант
+                stats_message += f"\n⚠️ Не удалось опубликовать в Telegraph. Сохраняю в файл..."
+                filename = f"analysis_{chat_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(full_content)
                 
-                # Отправляем статистику с ссылкой на статью
+                await telegram_client.send_file(
+                    RESULTS_DESTINATION,
+                    filename,
+                    caption=f"📄 **Полный анализ чата '{chat_name}'**\n\n"
+                           f"Тем: {topics_count}\n"
+                           f"Сообщений проанализировано: {len(optimized_messages)}",
+                    reply_to=topic_id
+                )
+                os.remove(filename)
+                
+                # Отправляем статистику
                 await telegram_client.send_message(
                     RESULTS_DESTINATION, 
                     stats_message,
