@@ -1718,14 +1718,14 @@ async def process_chat_command(event, use_ai=True):
             
             # Добавляем информацию о боте в конец статьи
             full_content += f"\n---\n"
-            full_content += f"created by [Chat Sum Bot](https://github.com/Hohlas/ChatSum) \n"
-            # full_content += f"[Chat Sum Bot](https://github.com/Hohlas/ChatSum) | [Hohla](https://t.me/hohlas)\n\n"
+            full_content += f"created by [ChatSumBot](https://github.com/Hohlas/ChatSum) \n"
+            # full_content += f"[ChatSumBot](https://github.com/Hohlas/ChatSum) | [Hohla](https://t.me/hohlas)\n\n"
             # full_content += f"💰 0x94f69c258cD251bcB77DBb6156DA13E32dCb8Ef4\n"
             
             article_title = f"Саммари чата: {chat_name} ({period_start_time})"
             
             # Всегда публикуем в Telegraph
-            article_url = publish_to_telegraph(article_title, full_content, author_name="Chat Sum Bot")
+            article_url = publish_to_telegraph(article_title, full_content, author_name="ChatSumBot")
             
             if article_url:
                 # Вставляем заголовок с саммари в начало сообщения
@@ -1735,7 +1735,7 @@ async def process_chat_command(event, use_ai=True):
 
                 # Если USE_HTML_EXPORT=true, дополнительно создаем и отправляем HTML файл
                 if USE_HTML_EXPORT:
-                    html_file = create_html_report(article_title, full_content, author_name="Chat Sum Bot")
+                    html_file = create_html_report(article_title, full_content, author_name="ChatSumBot")
                     
                     if html_file:
                         # Сначала отправляем текстовое сообщение со статистикой
