@@ -11,12 +11,12 @@ The attached data contains a list of Telegram chat messages in optimized JSON fo
   - t: string with message text (abbreviation for "text")
   - r: (optional) numeric ID of parent message (reply_to). If present, indicates this message is a reply to the message with this ID.
 
-Messages are organized in a flat structure. The "r" field contains the ID of the parent message (if this message is a reply), not a nested array. Using the r field, build a reply graph, linking each message to its parent and forming reply chains or trees. Identify “root” messages and treat them as potential starting points of local discussions.
-
-Analyze the JSON structure in its entirety, not limiting yourself to truncated (TRUNCATED) fragments. Use Python as an internal tool for parsing.
-Analyze the data sequentially in steps (from topic identification to formulating conclusions).
+IMPORTANT: Messages are organized in a flat structure. The "r" field contains the ID of the parent message (if this message is a reply), not a nested array.
 
 Messages represent discussions on various topics. They may be scattered, non-sequential, and intertwined. Messages contain a lot of slang and English insertions.
+
+Analyze the JSON structure in its entirety, not limiting yourself to truncated (TRUNCATED) fragments. Use the "r" field to identify reply relationships between messages. If necessary, you can use Python as an internal tool for parsing.
+Analyze the data sequentially in steps (from topic identification to formulating conclusions).
 
 Structuring rules:
 
@@ -24,21 +24,20 @@ Structuring rules:
 
 2. Identify all substantive topics (including local micro-discussions), grouping messages into semantic clusters. Do not split the discussion if messages clearly relate to the same question.
 
-3. By "topic" understand a related cluster of messages in which participants discuss the same question, subject, or event. Combine into one topic messages where the same question clearly continues, even if there is noise or other remarks between them.  Discard or de‑prioritize clusters that contain only noise (e.g., short reactions without meaningful content or messages without substantive arguments) or a single isolated message with no substantive context or messages that does not affect understanding the main point of the topic.
+3. By "topic" understand a related cluster of messages in which participants discuss the same question, subject, or event. Combine into one topic messages where the same question clearly continues, even if there is noise or other remarks between them. Ignore pure noise without substantive arguments if it does not affect understanding the main point of the topic.
 
-4. For each topic, highlight the main key arguments of participants with maximum correspondence to the text (including quotations). If a quote exceeds 200 characters, replace it with a concise paraphrase. Quote no more than 5 participants per topic, giving priority to messages that most accurately reflect the essence of the discussion. Preserve participants' terminology and key phrases close to the original.
+4. For each topic, highlight the main key arguments of participants with maximum correspondence to the text (including quotations). If a quote exceeds 200 characters, summarize it. Quote no more than 5 participants per topic, giving priority to messages that most accurately reflect the essence of the discussion. Preserve participants' terminology and key phrases close to the original.
 
-5. For each topic, formulate a key idea in 1-2 sentences that reflects the dominant opinion or result of the discussion. If the discussion is inconclusive or conflicting, explicitly reflect this in the key idea.
+5. For each topic, formulate a key idea in 1-2 sentences that reflects the dominant opinion or result of the discussion.
 
-6. Maintain a neutral, objective tone. Your role is to structure and summarize participants' views, not to add your own commentary or judgments. Only state what can be directly supported by the message content. Avoid making assumptions beyond what is explicitly present in the messages.
+6. When identifying authors and terms, consider all possible spelling or transliteration variants: Latin/Cyrillic, full/abbreviated names, different case (for example ProMint/проминт/promint, Aster/астер, Uniswap/унисвап/юники JUP/юпитер, Monad/монад, etc.).
 
-7. When identifying authors and terms, consider all possible spelling or transliteration variants: Latin/Cyrillic, full/abbreviated names, different case (for example ProMint/проминт/promint, Aster/астер, Uniswap/унисвап/юники JUP/юпитер, Monad/монад, etc.).
+7. Messages from {PRIORITY_USERS} (specified by sender name "s") and messages with external URLs (https://..., http://...) have the highest priority. You MUST include them in the corresponding thematic blocks, quoting full URLs, even if they seem secondary or did not receive replies.
 
-8. Messages from {PRIORITY_USERS} (specified by sender name "s") and messages with external URLs (https://..., http://...) have the highest priority. You MUST include them in the corresponding thematic blocks, quoting full URLs, even if they seem secondary or did not receive replies.
+8. Format participant names as a Markdown link [{s}](https://t.me/c/{chat_id}/{id}) to their reply in the topic (use fields from JSON).
 
-9. Format participant names as a Markdown link [{s}](https://t.me/c/{chat_id}/{id}) to their reply in the topic (use fields from JSON).
-
-10. Produce all summaries and topic titles in the chat’s native language. Do not translate to English.
+9. Output the summary in the chat's native language. 
+Do not translate to English.
 
 Present the result in the following format (Markdown):
 
