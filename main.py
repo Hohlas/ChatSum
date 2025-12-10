@@ -1507,7 +1507,7 @@ def create_html_report(title, content, author_name="Chat Filter Bot"):
         # Генерируем имя файла
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_title = re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '_')[:50]
-        filename = f"{reports_dir}/report_{safe_title}_{timestamp}.html"
+        filename = f"{reports_dir}/{safe_title}_{timestamp}.html"
         
         # Сохраняем файл
         with open(filename, 'w', encoding='utf-8') as f:
@@ -1722,7 +1722,7 @@ async def process_chat_command(event, use_ai=True):
             # full_content += f"[Chat Sum Bot](https://github.com/Hohlas/ChatSum) | [Hohla](https://t.me/hohlas)\n\n"
             # full_content += f"💰 0x94f69c258cD251bcB77DBb6156DA13E32dCb8Ef4\n"
             
-            article_title = f"Анализ чата: {chat_name} ({period_start_time})"
+            article_title = f"Саммари чата: {chat_name} ({period_start_time})"
             
             # Всегда публикуем в Telegraph
             article_url = publish_to_telegraph(article_title, full_content, author_name="Chat Sum Bot")
