@@ -1738,11 +1738,17 @@ async def process_chat_command(event, use_ai=True):
                     html_file = create_html_report(article_title, full_content, author_name="Chat Sum Bot")
                     
                     if html_file:
-                        # Отправляем HTML файл как документ
+                        # Сначала отправляем текстовое сообщение со статистикой
+                        await telegram_client.send_message(
+                            RESULTS_DESTINATION,
+                            stats_message,
+                            parse_mode='html',
+                            reply_to=topic_id
+                        )
+                        # Затем отправляем HTML файл отдельным сообщением
                         await telegram_client.send_file(
                             RESULTS_DESTINATION,
                             html_file,
-                            caption=stats_message,
                             reply_to=topic_id
                         )
                         print(f"✅ HTML отчет отправлен в Telegram")
