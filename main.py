@@ -715,64 +715,65 @@ def safe_str(value):
     return str(value)
 
 
-def build_tree_structure(messages_data):
-    """
-    Преобразует плоский список сообщений в древовидную структуру
-    
-    Args:
-        messages_data: Плоский список сообщений с reply_to
-    
-    Returns:
-        Список корневых сообщений с вложенными replies
-    """
-    # Создаем словарь для быстрого поиска сообщений по ID
-    messages_by_id = {}
-    # Отслеживаем, какие сообщения являются ответами (не должны быть в root_messages)
-    is_reply = set()
-    
-    # Первый проход: создаем все объекты сообщений
-    for msg in messages_data:
-        msg_id = msg['message_id']
-        messages_by_id[msg_id] = {
-            'id': msg_id,
-            's': msg['sender'],  # sender → s
-            't': msg['text'],    # text → t
-            'r': []               # replies → r
-        }
-    
-    # Второй проход: строим дерево и отмечаем ответы
-    for msg in messages_data:
-        msg_id = msg['message_id']
-        reply_to = msg.get('reply_to')
-        
-        current_msg = messages_by_id[msg_id]
-        
-        if reply_to and reply_to in messages_by_id:
-            # Это ответ на существующее сообщение - добавляем в replies родителя
-            messages_by_id[reply_to]['r'].append(current_msg)  # replies → r
-            # Отмечаем, что это сообщение является ответом
-            is_reply.add(msg_id)
-        # Если reply_to отсутствует или родитель не найден, сообщение будет корневым
-    
-    # Собираем корневые сообщения (те, которые не являются ответами)
-    root_messages = []
-    for msg in messages_data:
-        msg_id = msg['message_id']
-        if msg_id not in is_reply:
-            root_messages.append(messages_by_id[msg_id])
-    
-    # Удаляем пустые массивы replies для экономии токенов
-    def clean_empty_replies(msg):
-        if not msg['r']:  # replies → r
-            del msg['r']
-        else:
-            for reply in msg['r']:  # replies → r
-                clean_empty_replies(reply)
-    
-    for msg in root_messages:
-        clean_empty_replies(msg)
-    
-    return root_messages
+# Функция больше не используется - перешли на плоскую структуру JSON
+# def build_tree_structure(messages_data):
+#     """
+#     Преобразует плоский список сообщений в древовидную структуру
+#     
+#     Args:
+#         messages_data: Плоский список сообщений с reply_to
+#     
+#     Returns:
+#         Список корневых сообщений с вложенными replies
+#     """
+#     # Создаем словарь для быстрого поиска сообщений по ID
+#     messages_by_id = {}
+#     # Отслеживаем, какие сообщения являются ответами (не должны быть в root_messages)
+#     is_reply = set()
+#     
+#     # Первый проход: создаем все объекты сообщений
+#     for msg in messages_data:
+#         msg_id = msg['message_id']
+#         messages_by_id[msg_id] = {
+#             'id': msg_id,
+#             's': msg['sender'],  # sender → s
+#             't': msg['text'],    # text → t
+#             'r': []               # replies → r
+#         }
+#     
+#     # Второй проход: строим дерево и отмечаем ответы
+#     for msg in messages_data:
+#         msg_id = msg['message_id']
+#         reply_to = msg.get('reply_to')
+#         
+#         current_msg = messages_by_id[msg_id]
+#         
+#         if reply_to and reply_to in messages_by_id:
+#             # Это ответ на существующее сообщение - добавляем в replies родителя
+#             messages_by_id[reply_to]['r'].append(current_msg)  # replies → r
+#             # Отмечаем, что это сообщение является ответом
+#             is_reply.add(msg_id)
+#         # Если reply_to отсутствует или родитель не найден, сообщение будет корневым
+#     
+#     # Собираем корневые сообщения (те, которые не являются ответами)
+#     root_messages = []
+#     for msg in messages_data:
+#         msg_id = msg['message_id']
+#         if msg_id not in is_reply:
+#             root_messages.append(messages_by_id[msg_id])
+#     
+#     # Удаляем пустые массивы replies для экономии токенов
+#     def clean_empty_replies(msg):
+#         if not msg['r']:  # replies → r
+#             del msg['r']
+#         else:
+#             for reply in msg['r']:  # replies → r
+#                 clean_empty_replies(reply)
+#     
+#     for msg in root_messages:
+#         clean_empty_replies(msg)
+#     
+#     return root_messages
 
 
 def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, total_messages=None, filtered_messages=None, period_start_date=None):
@@ -798,8 +799,20 @@ def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, t
     else:
         period_start = messages_data[0].get('date', '') if messages_data else ''
     
-    # Строим древовидную структуру с вложенными replies
-    tree_messages = build_tree_structure(messages_data)
+    # Преобразуем плоский список сообщений с переименованием полей
+    # sender → s, text → t, message_id → id, reply_to → r
+    # Поле date исключаем из финального JSON
+    flat_messages = []
+    for msg in messages_data:
+        flat_msg = {
+            'id': msg['message_id'],
+            's': msg['sender'],
+            't': msg['text']
+        }
+        # Добавляем reply_to только если оно есть
+        if msg.get('reply_to'):
+            flat_msg['r'] = msg['reply_to']
+        flat_messages.append(flat_msg)
     
     # Формируем metadata
     metadata = {
@@ -818,7 +831,7 @@ def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, t
     
     return {
         'metadata': metadata,
-        'messages': tree_messages
+        'messages': flat_messages
     }
 
 

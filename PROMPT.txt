@@ -5,17 +5,17 @@ The attached data contains a list of Telegram chat messages in optimized JSON fo
 - metadata.period_start: timestamp of the first message in the sample, format "YYYY-MM-DD HH:MM:SS"
 - metadata.chat_name: Chat name, to be used in the header
 - export_date, total_messages, filtered_messages — service fields, can be used if needed
-- messages[]: array of root messages, where each contains:
+- messages[]: flat array of messages, where each contains:
   - id: numeric message ID
   - s: string with sender name (abbreviation for "sender")
   - t: string with message text (abbreviation for "text")
-  - r: (optional) recursive array of replies to this message with the same structure (id, s, t, r)
+  - r: (optional) numeric ID of parent message (reply_to). If present, indicates this message is a reply to the message with this ID.
 
-IMPORTANT: Messages are organized in a tree structure. Replies to messages are located in the "r" field of the parent message, with recursive nesting.
+IMPORTANT: Messages are organized in a flat structure. The "r" field contains the ID of the parent message (if this message is a reply), not a nested array.
 
 Messages represent discussions on various topics. They may be scattered, non-sequential, and intertwined. Messages contain a lot of slang and English insertions.
 
-Analyze the JSON structure in its entirety, not limiting yourself to truncated (TRUNCATED) fragments, and correctly account for recursive replies in the "r" field. If necessary, you can use Python as an internal tool for parsing.
+Analyze the JSON structure in its entirety, not limiting yourself to truncated (TRUNCATED) fragments. Use the "r" field to identify reply relationships between messages. If necessary, you can use Python as an internal tool for parsing.
 Analyze the data sequentially in steps (from topic identification to formulating conclusions).
 
 Structuring rules:
