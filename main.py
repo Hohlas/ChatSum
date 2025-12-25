@@ -1733,19 +1733,21 @@ async def process_chat_command(event, use_ai=True):
                 stats_message = header + stats_message
                 stats_message += f"\n<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
 
+                # отправляем сообщение с статистикой и ссылкой на Telegraph
+                await telegram_client.send_message(
+                    RESULTS_DESTINATION,
+                    stats_message,
+                    parse_mode='html',
+                    reply_to=topic_id
+                )
+
                 # Если USE_HTML_EXPORT=true, дополнительно создаем и отправляем HTML файл
                 if USE_HTML_EXPORT:
                     html_file = create_html_report(article_title, full_content, author_name="ChatSumBot")
                     
                     if html_file:
-                        # Сначала отправляем текстовое сообщение со статистикой
-                        await telegram_client.send_message(
-                            RESULTS_DESTINATION,
-                            stats_message,
-                            parse_mode='html',
-                            reply_to=topic_id
-                        )
-                        # Затем отправляем HTML файл отдельным сообщением
+                        
+                        #  отправляем HTML файл отдельным сообщением
                         await telegram_client.send_file(
                             RESULTS_DESTINATION,
                             html_file,
@@ -1760,14 +1762,7 @@ async def process_chat_command(event, use_ai=True):
                             parse_mode='html',
                             reply_to=topic_id
                         )
-                else:
-                    # Отправляем только статистику с ссылкой на Telegraph
-                    await telegram_client.send_message(
-                        RESULTS_DESTINATION, 
-                        stats_message,
-                        parse_mode='html',
-                        reply_to=topic_id
-                    )
+                
 
                 # Удаляем временный файл анализа после успешной публикации
                 try:
