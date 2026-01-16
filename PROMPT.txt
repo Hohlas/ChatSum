@@ -26,6 +26,7 @@ Step 2: Cluster by topic. Group messages discussing the same subject/question/ev
 - Reply relationships (field "r" — strongest signal)
 - Shared entities (repeated mentions of same named items or domain-specific terms)
 - Positional proximity (within 5-15 messages)
+- Each topic should have a clearly defined subject that can be summarized in 3-5 words.
 
 Minimum cluster: 2 messages from 2 participants.
 Do not fragment: combine messages addressing the same core question into one topic, even if interrupted by noise or different perspectives.
@@ -34,6 +35,9 @@ Include single-author threads if they contain substantial argumentation or exter
 Ignore noise: messages without substantive arguments (e.g., 'ok', '+', bot messages, off-topic spam).
 
 Note: If context of mentioned terms/events is unclear to you from the messages, use external sources for reference only. Mark as: *(reference: <explanation>)*.
+
+Step 2.5: Review and refine clusters.
+After initial clustering, check if any topic contains discussions of 3+ distinct sub-themes. If yes, split into separate topics. Verify that each topic title would be meaningfully different from others.
 
 Step 3: Formulate key idea. 
 For each topic, write 1-2 sentence summary reflecting dominant opinion, consensus, or main conclusion (note disagreements if no consensus).
