@@ -33,6 +33,8 @@ Group messages discussing the same subject/question/event/entity based on:
 - Shared entities (repeated mentions of same named items or domain-specific terms)
 - Positional proximity (within 5-15 messages)
 
+Each resulting topic should have a clearly defined subject that can be summarized in 3-5 words.
+
 Minimum cluster requirements (any one condition is sufficient):
 - 2+ messages from 2+ different participants, OR
 - 2+ messages from single author if they contain substantial argumentation (3+ sentences) or external links
@@ -40,10 +42,6 @@ Minimum cluster requirements (any one condition is sufficient):
 Do not fragment: combine messages addressing the same core question into one topic, even if interrupted by noise or different perspectives.
 
 Ignore noise: messages without substantive arguments (e.g., 'ok', '+', bot messages, off-topic spam).
-
-Step 2.5: Granularity review. 
-After initial clustering, check each topic: if a cluster contains discussions of 3+ distinct sub-themes, split it into separate topics. 
-Each resulting topic should have a clearly defined subject that can be summarized in 3-5 words.
 
 Step 3: Formulate key idea. 
 For each topic, write 1-2 sentence summary reflecting dominant opinion, consensus, or main conclusion (note disagreements if no consensus).
