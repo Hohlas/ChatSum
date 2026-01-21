@@ -1614,7 +1614,7 @@ async def process_chat_command(event, use_ai=True):
                 print(f"   ... и еще {len(url_messages) - 10} сообщений с URL")
         
         # Предупреждение о больших запросах (особенно для AI анализа)
-        if use_ai and len(optimized_messages) > 200:
+        if use_ai and len(optimized_messages) > 500:
             await telegram_client.send_message(
                 RESULTS_DESTINATION,
                 f"⚠️ **Внимание:** Большой объем сообщений ({len(optimized_messages)})\n"
