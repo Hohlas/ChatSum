@@ -37,9 +37,9 @@ Group messages discussing the same subject/question/event/entity based on:
 
 Each resulting topic should have a clearly defined subject that can be summarized in 3-5 words.
 
-Minimum cluster requirements (any one condition is sufficient):
-- 2+ messages from 2+ different participants, OR
-- 2+ messages from single author if they contain substantial argumentation (3+ sentences) or external links
+Minimum cluster requirements:
+- 2+ messages total, with at least 2 different participants, OR
+- 1+ messages from single author with substantial argumentation (3+ sentences each) or external links
 
 Maintain topic granularity: combine only messages discussing the EXACT same question/entity/event. Adjacent questions about related topics should form separate clusters.
 
