@@ -49,11 +49,13 @@ Step 3: Formulate key idea.
 For each topic, write 1-2 sentence summary reflecting dominant opinion, consensus, or main conclusion (note disagreements if no consensus).
 
 Step 4: Select citations and key arguments.
-MANDATORY LIMIT: Maximum 5 participants per topic.
-Prioritize messages that: 1) are from {PRIORITY_USERS} (key contributors by field "s"), 2) contain external URLs, 
-3) most accurately reflect the discussion essence.
-Preserve original terminology and key phrases.
-If a single quote exceeds 200 characters, summarize it while preserving key terms.
+- LIMIT: Include quotes from maximum 5 participants per topic.
+- Prioritize messages that: 
+  1) are from {PRIORITY_USERS} (key contributors by field "s") 
+  2) contain external URLs 
+  3) most accurately reflect the discussion essence.
+- Preserve original terminology and key phrases.
+- If a single quote exceeds 200 characters, summarize it.
 
 ## Output Format
 Output in the chat's native language. Do not translate to English.
