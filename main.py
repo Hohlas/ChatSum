@@ -947,7 +947,8 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
                 {'role': 'user', 'content': user_content}
             ],
             'temperature': 0.3,
-            'max_tokens': 9000
+            'max_tokens': 12000,
+            'disable_search': True
         }
         
         # Выводим информацию о размере запроса
