@@ -3,6 +3,7 @@ import asyncio
 import random
 import re
 import shutil
+import time
 from telethon import TelegramClient, events
 from openai import OpenAI, AuthenticationError, APIStatusError
 from dotenv import load_dotenv
@@ -149,6 +150,11 @@ NOISE_PATTERNS = [
     r'^[\.\!\?]+$',  # Только знаки препинания
     r'^[👍👎👌✅❌🔥💪🎉😂😅]+$',  # Только эмодзи
 ]
+
+# Конфигурация разбиения на чанки для больших объемов сообщений
+CHUNK_SIZE = 500  # Количество сообщений в одном чанке
+CHUNK_OVERLAP = 0.1  # Перехлест между чанками (10% = 50 сообщений при CHUNK_SIZE=500)
+CHUNK_DELAY_SECONDS = 7  # Задержка между запросами к API (для соблюдения RPM лимита)
 
 # Пути к конфигурационным файлам
 EXCLUDED_USERS_FILE = 'EXCLUDED_USERS.txt'
@@ -890,99 +896,292 @@ def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, t
     }
 
 
+def split_messages_into_chunks(messages_data, chunk_size=CHUNK_SIZE, overlap_ratio=CHUNK_OVERLAP):
+    """
+    Разбивает список сообщений на чанки с перехлестом.
+    
+    Args:
+        messages_data: Список сообщений
+        chunk_size: Размер одного чанка (количество сообщений)
+        overlap_ratio: Коэффициент перехлеста (0.1 = 10%)
+    
+    Returns:
+        Список кортежей: (chunk_messages, start_index, end_index)
+        где start_index и end_index - индексы в исходном списке (1-based для отображения)
+    
+    Пример для 1300 сообщений при chunk_size=500, overlap=50:
+        - Чанк 1: [0:500] → сообщения 1-500
+        - Чанк 2: [450:950] → сообщения 451-950
+        - Чанк 3: [900:1300] → сообщения 901-1300
+    """
+    total = len(messages_data)
+    
+    if total <= chunk_size:
+        # Нет необходимости разбивать
+        return [(messages_data, 1, total)]
+    
+    overlap = int(chunk_size * overlap_ratio)
+    step = chunk_size - overlap  # Шаг между началами чанков
+    
+    chunks = []
+    start = 0
+    
+    while start < total:
+        end = min(start + chunk_size, total)
+        chunk = messages_data[start:end]
+        
+        # Индексы для отображения (1-based)
+        display_start = start + 1
+        display_end = end
+        
+        chunks.append((chunk, display_start, display_end))
+        
+        # Если достигли конца - выходим
+        if end >= total:
+            break
+        
+        # Следующий чанк начинается с перехлестом
+        start += step
+    
+    return chunks
+
+
 async def create_summary(messages_data, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_reasoning=False, period_start_date=None):
     """
-    Создает выжимку из сообщений с помощью Google Gemini
+    Создает выжимку из сообщений с помощью Google Gemini.
+    При большом количестве сообщений (> CHUNK_SIZE) разбивает на чанки с перехлестом.
     
     Args:
         messages_data: Список словарей с сообщениями (включая reply_to)
         chat_id_str: ID чата для ссылок
         model: Название модели (например, значение из GEMINI_MODEL)
         use_reasoning: Использовать ли reasoning режим (для моделей с поддержкой)
+        period_start_date: Дата начала периода для метаданных
     
     Returns:
         Кортеж (текст выжимки, информация об использовании токенов)
     """
     if not messages_data:
-        return "❌ Нет сообщений для анализа за указанный период (все отфильтровано)"
+        return "❌ Нет сообщений для анализа за указанный период (все отфильтровано)", None
     
     # Используем модель Google Gemini из private.txt
     if not GEMINI_DEFAULT_MODEL:
-        return "❌ В private.txt не задана переменная GEMINI_MODEL"
+        return "❌ В private.txt не задана переменная GEMINI_MODEL", None
+    
     actual_model = GEMINI_DEFAULT_MODEL
-    print(f"🤖 Отправка {len(messages_data)} сообщений в Google Gemini для анализа...")
+    total_messages = len(messages_data)
+    
+    print(f"🤖 Отправка {total_messages} сообщений в Google Gemini для анализа...")
     if use_reasoning:
         print(f"   🧠 Reasoning режим не поддерживается, используем: {actual_model}")
     else:
         print(f"   ⚡ Используем стандартную модель: {actual_model}")
     
     # Определяем лимиты контекста в зависимости от модели (в токенах)
-    # Консервативные лимиты контекста для защиты от слишком больших запросов
     context_limits = {
         GEMINI_DEFAULT_MODEL: 128000
     }
     
     max_tokens = context_limits.get(actual_model, 128000)
-    # Конвертируем токены в символы для проверки
-    # Для кириллицы: ~2.5 символа на токен (более плотное кодирование чем английский)
-    # Оставляем запас 20% для системного промпта и метаданных
-    max_chars = int(max_tokens * 2.5 * 0.8)
+    max_chars = int(max_tokens * 2.5 * 0.8)  # Для кириллицы с запасом 20%
     
     print(f"   📊 Лимит контекста: {max_tokens:,} токенов ({max_chars:,} символов для кириллицы)")
     
-    # Формируем ОПТИМИЗИРОВАННЫЙ JSON для экономии токенов
-    # Используем общую функцию для единообразия с /copy
-    optimized_structure = build_optimized_json_structure(messages_data, chat_id_str, period_start_date=period_start_date)
+    # Подготовка промпта с приоритетными пользователями
+    prompt_with_priority = ANALYSIS_PROMPT
+    if PRIORITY_USERS:
+        priority_list = ', '.join(PRIORITY_USERS)
+        prompt_with_priority = prompt_with_priority.replace('{PRIORITY_USERS}', priority_list)
+    system_content = safe_str(prompt_with_priority)
     
-    # Используем ensure_ascii=False для сохранения кириллицы
+    # Проверяем, нужно ли разбивать на чанки
+    if total_messages > CHUNK_SIZE:
+        # ═══════════════════════════════════════════════════════════════
+        # РЕЖИМ ЧАНКОВ: разбиваем сообщения на части с перехлестом
+        # ═══════════════════════════════════════════════════════════════
+        chunks = split_messages_into_chunks(messages_data, CHUNK_SIZE, CHUNK_OVERLAP)
+        num_chunks = len(chunks)
+        overlap_count = int(CHUNK_SIZE * CHUNK_OVERLAP)
+        
+        print(f"📦 Разбиение на {num_chunks} чанков (по {CHUNK_SIZE} сообщений, перехлест {overlap_count})")
+        
+        chunk_summaries = []  # Список кортежей: (start_idx, end_idx, summary_text, is_error)
+        total_usage = {
+            'prompt_tokens': 0,
+            'completion_tokens': 0,
+            'total_tokens': 0
+        }
+        errors_count = 0
+        
+        for chunk_idx, (chunk_messages, start_idx, end_idx) in enumerate(chunks, 1):
+            chunk_size = len(chunk_messages)
+            print(f"\n📦 Обработка чанка {chunk_idx} из {num_chunks} ({chunk_size} сообщений: {start_idx}-{end_idx})")
+            
+            # Формируем JSON для текущего чанка
+            chunk_period_start = chunk_messages[0].get('date', '') if chunk_messages else period_start_date
+            optimized_structure = build_optimized_json_structure(
+                chunk_messages, chat_id_str, period_start_date=chunk_period_start
+            )
+            messages_json = json.dumps(optimized_structure, ensure_ascii=False, indent=2)
+            
+            # Проверяем размер чанка
+            if len(messages_json) > max_chars:
+                # Чанк слишком большой - берем последние сообщения
+                ratio = max_chars / len(messages_json)
+                limit = int(chunk_size * ratio * 0.95)
+                print(f"   ⚠️  Чанк слишком большой, ограничиваем до {limit} сообщений")
+                chunk_messages_limited = chunk_messages[-limit:]
+                chunk_period_start = chunk_messages_limited[0].get('date', '') if chunk_messages_limited else chunk_period_start
+                optimized_structure = build_optimized_json_structure(
+                    chunk_messages_limited, chat_id_str, period_start_date=chunk_period_start
+                )
+                messages_json = json.dumps(optimized_structure, ensure_ascii=False, indent=2)
+            
+            user_content = safe_str(f'Данные сообщений для анализа (JSON):\n\n{messages_json}')
+            
+            # Проверяем кодировку
+            try:
+                system_content.encode('utf-8')
+                user_content.encode('utf-8')
+            except UnicodeEncodeError as ue:
+                print(f"   ⚠️  Ошибка кодировки в контенте: {ue}")
+                user_content = user_content.encode('utf-8', errors='ignore').decode('utf-8')
+            
+            request_params = {
+                'model': actual_model,
+                'messages': [
+                    {'role': 'system', 'content': system_content},
+                    {'role': 'user', 'content': user_content}
+                ],
+                'temperature': 0.3,
+                'max_tokens': 10000
+            }
+            
+            total_chars = len(system_content) + len(user_content)
+            print(f"   📊 Размер запроса: {total_chars:,} символов")
+            
+            # Отправляем запрос с retry логикой
+            try:
+                max_retries = 2
+                retry_count = 0
+                response = None
+                
+                while retry_count <= max_retries:
+                    try:
+                        response = google_client.chat.completions.create(**request_params)
+                        break
+                    except Exception as retry_error:
+                        if 'timeout' in str(retry_error).lower() and retry_count < max_retries:
+                            retry_count += 1
+                            print(f"   ⚠️  Таймаут. Повторная попытка {retry_count}/{max_retries}...")
+                            continue
+                        else:
+                            raise
+                
+                chunk_summary = response.choices[0].message.content
+                print(f"   ✅ Чанк {chunk_idx} обработан успешно")
+                
+                # Собираем статистику токенов
+                if hasattr(response, 'usage'):
+                    usage = response.usage
+                    prompt_tokens = usage.prompt_tokens if hasattr(usage, 'prompt_tokens') else 0
+                    completion_tokens = usage.completion_tokens if hasattr(usage, 'completion_tokens') else 0
+                    chunk_total = usage.total_tokens if hasattr(usage, 'total_tokens') else 0
+                    
+                    total_usage['prompt_tokens'] += prompt_tokens
+                    total_usage['completion_tokens'] += completion_tokens
+                    total_usage['total_tokens'] += chunk_total
+                    
+                    print(f"   📊 Токенов в чанке: {chunk_total:,}")
+                
+                chunk_summaries.append((start_idx, end_idx, chunk_summary, False))
+                
+            except AuthenticationError as e:
+                error_msg = f"❌ Ошибка доступа к API: {type(e).__name__}"
+                print(f"   {error_msg}")
+                chunk_summaries.append((start_idx, end_idx, error_msg, True))
+                errors_count += 1
+                
+            except APIStatusError as e:
+                status_code = getattr(e, 'status_code', 'неизвестен')
+                error_msg = f"❌ Ошибка API (HTTP {status_code}): {e}"
+                print(f"   {error_msg}")
+                chunk_summaries.append((start_idx, end_idx, error_msg, True))
+                errors_count += 1
+                
+            except Exception as e:
+                error_msg = f"❌ Ошибка: {type(e).__name__}: {e}"
+                print(f"   {error_msg}")
+                chunk_summaries.append((start_idx, end_idx, error_msg, True))
+                errors_count += 1
+            
+            # Пауза между запросами (кроме последнего чанка)
+            if chunk_idx < num_chunks:
+                print(f"   ⏳ Пауза {CHUNK_DELAY_SECONDS} секунд перед следующим чанком...")
+                time.sleep(CHUNK_DELAY_SECONDS)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # Объединение саммари всех чанков
+        # ═══════════════════════════════════════════════════════════════
+        print(f"\n✅ Обработано {num_chunks} чанков, всего токенов: {total_usage['total_tokens']:,}")
+        if errors_count > 0:
+            print(f"   ⚠️  Ошибок при обработке: {errors_count}")
+        
+        # Формируем объединенный текст
+        combined_parts = []
+        combined_parts.append(f"📊 Обработано {total_messages} сообщений в {num_chunks} частях")
+        if errors_count > 0:
+            combined_parts.append(f"⚠️ Внимание: {errors_count} из {num_chunks} частей обработаны с ошибками")
+        combined_parts.append("")
+        
+        for part_idx, (start_idx, end_idx, summary_text, is_error) in enumerate(chunk_summaries, 1):
+            combined_parts.append("═══════════════════════════════════════")
+            if is_error:
+                combined_parts.append(f"ЧАСТЬ {part_idx} (сообщения {start_idx}-{end_idx}): ⚠️ ОШИБКА")
+            else:
+                combined_parts.append(f"ЧАСТЬ {part_idx} (сообщения {start_idx}-{end_idx}):")
+            combined_parts.append("═══════════════════════════════════════")
+            combined_parts.append(summary_text)
+            combined_parts.append("")
+        
+        combined_summary = "\n".join(combined_parts)
+        
+        return combined_summary, total_usage
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # ОБЫЧНЫЙ РЕЖИМ: все сообщения в одном запросе
+    # ═══════════════════════════════════════════════════════════════════
+    
+    # Формируем JSON
+    optimized_structure = build_optimized_json_structure(messages_data, chat_id_str, period_start_date=period_start_date)
     messages_json = json.dumps(optimized_structure, ensure_ascii=False, indent=2)
     
-    # Проверяем размер и при необходимости разбиваем на части
+    # Проверяем размер и при необходимости ограничиваем
     if len(messages_json) > max_chars:
         print(f"⚠️  Данных слишком много ({len(messages_json)} символов)")
         print(f"   Максимум для модели {actual_model}: {max_chars} символов")
         
-        # Вариант 1: Разбить на несколько запросов (рекомендуется)
-        # Вариант 2: Взять только последние сообщения (самые актуальные)
-        # Выбираем вариант 2 как более простой, но с предупреждением
-        
         ratio = max_chars / len(messages_json)
-        limit = int(len(messages_data) * ratio * 0.95)  # 0.95 для запаса
+        limit = int(total_messages * ratio * 0.95)
         
         print(f"   📌 Решение: Берем последние {limit} сообщений (самые актуальные)")
-        print(f"   ⚠️  ПОТЕРЯ ДАННЫХ: {len(messages_data) - limit} старых сообщений не попадут в анализ")
+        print(f"   ⚠️  ПОТЕРЯ ДАННЫХ: {total_messages - limit} старых сообщений не попадут в анализ")
         print(f"   💡 Рекомендация: уменьшите период анализа (например /analyze 12h вместо 24h)")
         
-        # Берем ПОСЛЕДНИЕ сообщения (самые актуальные), а не первые!
-        messages_data_limited = messages_data[-limit:]  # Изменено на последние!
-        
-        # Используем общую функцию для формирования структуры
-        # Используем period_start_date из ограниченной выборки (первое сообщение)
+        messages_data_limited = messages_data[-limit:]
         period_start_limited = messages_data_limited[0].get('date', '') if messages_data_limited else period_start_date
         optimized_structure = build_optimized_json_structure(messages_data_limited, chat_id_str, period_start_date=period_start_limited)
-        
         messages_json = json.dumps(optimized_structure, ensure_ascii=False, indent=2)
     
     try:
-        # Формируем параметры запроса
-        # Важно: убеждаемся что все строки в Unicode и правильно закодированы
-        # Подставляем список приоритетных пользователей в промпт
-        prompt_with_priority = ANALYSIS_PROMPT
-        if PRIORITY_USERS:
-            priority_list = ', '.join(PRIORITY_USERS)
-            # Заменяем плейсхолдер {PRIORITY_USERS} на список пользователей
-            prompt_with_priority = prompt_with_priority.replace('{PRIORITY_USERS}', priority_list)
-        
-        system_content = safe_str(prompt_with_priority)
         user_content = safe_str(f'Данные сообщений для анализа (JSON):\n\n{messages_json}')
         
-        # Проверяем что контент корректный Unicode
+        # Проверяем кодировку
         try:
             system_content.encode('utf-8')
             user_content.encode('utf-8')
         except UnicodeEncodeError as ue:
             print(f"⚠️  Ошибка кодировки в контенте: {ue}")
-            # Принудительно очищаем от проблемных символов
             system_content = system_content.encode('utf-8', errors='ignore').decode('utf-8')
             user_content = user_content.encode('utf-8', errors='ignore').decode('utf-8')
         
@@ -993,34 +1192,31 @@ async def create_summary(messages_data, chat_id_str, model=GEMINI_DEFAULT_MODEL,
                 {'role': 'user', 'content': user_content}
             ],
             'temperature': 0.3,
-            'max_tokens': 1000
+            'max_tokens': 10000
         }
         
-        # Выводим информацию о размере запроса
         total_chars = len(system_content) + len(user_content)
         print(f"   📊 Размер запроса: {total_chars:,} символов")
         
-        # Оцениваем примерное время обработки
-        estimated_time = max(30, total_chars // 500)  # ~500 символов/секунду
+        estimated_time = max(30, total_chars // 500)
         if estimated_time > 60:
             print(f"   ⏱️  Ожидаемое время обработки: ~{estimated_time} сек")
             print(f"   ⏳ Пожалуйста, подождите...")
         
-        # Отправляем запрос с повторными попытками при таймауте
+        # Отправляем запрос с retry логикой
         max_retries = 2
         retry_count = 0
         
         while retry_count <= max_retries:
             try:
                 response = google_client.chat.completions.create(**request_params)
-                break  # Успешно - выходим из цикла
+                break
             except Exception as retry_error:
                 if 'timeout' in str(retry_error).lower() and retry_count < max_retries:
                     retry_count += 1
                     print(f"   ⚠️  Таймаут. Повторная попытка {retry_count}/{max_retries}...")
                     continue
                 else:
-                    # Если это не таймаут или исчерпаны попытки - пробрасываем исключение
                     raise
         
         summary = response.choices[0].message.content
