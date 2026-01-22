@@ -927,7 +927,7 @@ async def create_summary(messages_data, chat_id_str, model='gemini-1.5-flash', u
             user_content = user_content.encode('utf-8', errors='ignore').decode('utf-8')
         
         request_params = {
-            'model': 'gemini-1.5-flash',
+            'model': 'gemini-2.0-flash',
             'messages': [
                 {'role': 'system', 'content': system_content},
                 {'role': 'user', 'content': user_content}
