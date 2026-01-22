@@ -2287,6 +2287,9 @@ async def process_chat_command(event, use_ai=True):
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/config'))
 async def handle_config_command(event):
     """Показывает текущую конфигурацию"""
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
+    print(f"\n📥 Команда: /config | Чат: {chat_name}")
     export_mode = "HTML файлы 📄" if USE_HTML_EXPORT else "Telegraph 🌐"
     config_text = f"""
 ⚙️ **Текущая конфигурация бота**
@@ -2334,8 +2337,6 @@ async def handle_config_command(event):
 """
     await event.delete()
     
-    chat = await event.get_chat()
-    chat_name = chat.title if hasattr(chat, 'title') else "Конфигурация"
     topic_id = await get_or_create_topic(chat_name)
     
     await telegram_client.send_message(RESULTS_DESTINATION, config_text, reply_to=topic_id)
@@ -2344,6 +2345,9 @@ async def handle_config_command(event):
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/show_excluded'))
 async def handle_show_excluded_command(event):
     """Показывает список исключенных пользователей"""
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
+    print(f"\n📥 Команда: /show_excluded | Чат: {chat_name}")
     text = f"📝 **Исключенные пользователи** ({len(EXCLUDED_USERS)}):\n\n"
     if EXCLUDED_USERS:
         for i, user in enumerate(EXCLUDED_USERS, 1):
@@ -2361,6 +2365,9 @@ async def handle_show_excluded_command(event):
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/show_priority'))
 async def handle_show_priority_command(event):
     """Показывает список приоритетных пользователей"""
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
+    print(f"\n📥 Команда: /show_priority | Чат: {chat_name}")
     text = f"⭐ **Приоритетные пользователи** ({len(PRIORITY_USERS)}):\n\n"
     if PRIORITY_USERS:
         for i, user in enumerate(PRIORITY_USERS, 1):
@@ -2369,8 +2376,6 @@ async def handle_show_priority_command(event):
         text += "Список пуст"
     
     await event.delete()
-    chat = await event.get_chat()
-    chat_name = chat.title if hasattr(chat, 'title') else "Конфигурация"
     topic_id = await get_or_create_topic(chat_name)
     await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
 
@@ -2378,6 +2383,9 @@ async def handle_show_priority_command(event):
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/show_prompt'))
 async def handle_show_prompt_command(event):
     """Показывает текущий промпт"""
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
+    print(f"\n📥 Команда: /show_prompt | Чат: {chat_name}")
     prompt_preview = ANALYSIS_PROMPT[:1000] + "..." if len(ANALYSIS_PROMPT) > 1000 else ANALYSIS_PROMPT
     text = f"📄 **Текущий промпт** ({len(ANALYSIS_PROMPT)} символов):\n\n{prompt_preview}\n\n"
     text += f"💡 Полный промпт в файле: {PROMPT_FILE}"
@@ -2393,7 +2401,10 @@ async def handle_show_prompt_command(event):
 async def handle_add_excluded_command(event):
     """Добавляет пользователя в список исключенных"""
     global EXCLUDED_USERS
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
     username = event.pattern_match.group(1).strip()
+    print(f"\n📥 Команда: /add_excluded {username} | Чат: {chat_name}")
     
     if username in EXCLUDED_USERS:
         text = f"⚠️ Пользователь **{username}** уже в списке исключенных"
@@ -2406,8 +2417,6 @@ async def handle_add_excluded_command(event):
             text = f"❌ Ошибка при сохранении в файл"
     
     await event.delete()
-    chat = await event.get_chat()
-    chat_name = chat.title if hasattr(chat, 'title') else "Конфигурация"
     topic_id = await get_or_create_topic(chat_name)
     await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
 
@@ -2416,7 +2425,10 @@ async def handle_add_excluded_command(event):
 async def handle_remove_excluded_command(event):
     """Удаляет пользователя из списка исключенных"""
     global EXCLUDED_USERS
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
     username = event.pattern_match.group(1).strip()
+    print(f"\n📥 Команда: /remove_excluded {username} | Чат: {chat_name}")
     
     if username not in EXCLUDED_USERS:
         text = f"⚠️ Пользователь **{username}** не найден в списке исключенных"
@@ -2429,8 +2441,6 @@ async def handle_remove_excluded_command(event):
             text = f"❌ Ошибка при сохранении в файл"
     
     await event.delete()
-    chat = await event.get_chat()
-    chat_name = chat.title if hasattr(chat, 'title') else "Конфигурация"
     topic_id = await get_or_create_topic(chat_name)
     await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
 
@@ -2439,7 +2449,10 @@ async def handle_remove_excluded_command(event):
 async def handle_add_priority_command(event):
     """Добавляет пользователя в список приоритетных"""
     global PRIORITY_USERS
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
     username = event.pattern_match.group(1).strip()
+    print(f"\n📥 Команда: /add_priority {username} | Чат: {chat_name}")
     
     if username in PRIORITY_USERS:
         text = f"⚠️ Пользователь **{username}** уже в списке приоритетных"
@@ -2452,8 +2465,6 @@ async def handle_add_priority_command(event):
             text = f"❌ Ошибка при сохранении в файл"
     
     await event.delete()
-    chat = await event.get_chat()
-    chat_name = chat.title if hasattr(chat, 'title') else "Конфигурация"
     topic_id = await get_or_create_topic(chat_name)
     await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
 
@@ -2462,7 +2473,10 @@ async def handle_add_priority_command(event):
 async def handle_remove_priority_command(event):
     """Удаляет пользователя из списка приоритетных"""
     global PRIORITY_USERS
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
     username = event.pattern_match.group(1).strip()
+    print(f"\n📥 Команда: /remove_priority {username} | Чат: {chat_name}")
     
     if username not in PRIORITY_USERS:
         text = f"⚠️ Пользователь **{username}** не найден в списке приоритетных"
@@ -2475,8 +2489,6 @@ async def handle_remove_priority_command(event):
             text = f"❌ Ошибка при сохранении в файл"
     
     await event.delete()
-    chat = await event.get_chat()
-    chat_name = chat.title if hasattr(chat, 'title') else "Конфигурация"
     topic_id = await get_or_create_topic(chat_name)
     await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
 
@@ -2484,6 +2496,9 @@ async def handle_remove_priority_command(event):
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/show_model'))
 async def handle_show_model_command(event):
     """Показывает текущую настройку модели"""
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
+    print(f"\n📥 Команда: /show_model | Чат: {chat_name}")
     export_mode = "HTML файлы 📄" if USE_HTML_EXPORT else "Telegraph 🌐"
     text = f"""
 🤖 **Текущая модель для анализа**
@@ -2502,8 +2517,6 @@ async def handle_show_model_command(event):
 """
     
     await event.delete()
-    chat = await event.get_chat()
-    chat_name = chat.title if hasattr(chat, 'title') else "Конфигурация"
     topic_id = await get_or_create_topic(chat_name)
     await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
 
@@ -2513,7 +2526,10 @@ async def handle_set_model_command(event):
     """Устанавливает модель для анализа"""
     global CURRENT_MODEL, GEMINI_DEFAULT_MODEL
     
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
     model = event.pattern_match.group(1).strip()
+    print(f"\n📥 Команда: /set_model {model} | Чат: {chat_name}")
     
     # Валидируем название модели
     if not model:
@@ -2532,8 +2548,6 @@ async def handle_set_model_command(event):
             text = "❌ Ошибка при сохранении модели в private.txt"
     
     await event.delete()
-    chat = await event.get_chat()
-    chat_name = chat.title if hasattr(chat, 'title') else "Конфигурация"
     topic_id = await get_or_create_topic(chat_name)
     await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
 
@@ -2542,6 +2556,10 @@ async def handle_set_model_command(event):
 async def handle_reload_config_command(event):
     """Перезагружает конфигурацию из файлов"""
     global EXCLUDED_USERS, PRIORITY_USERS, ANALYSIS_PROMPT, CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT, GEMINI_DEFAULT_MODEL
+    
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
+    print(f"\n📥 Команда: /reload_config | Чат: {chat_name}")
     
     load_dotenv('private.txt', override=True)
     GEMINI_DEFAULT_MODEL = os.getenv('GEMINI_MODEL', '').strip()
@@ -2564,8 +2582,6 @@ async def handle_reload_config_command(event):
 """
     
     await event.delete()
-    chat = await event.get_chat()
-    chat_name = chat.title if hasattr(chat, 'title') else "Конфигурация"
     topic_id = await get_or_create_topic(chat_name)
     await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
 
