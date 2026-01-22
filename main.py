@@ -4,7 +4,7 @@ import random
 import re
 import shutil
 from telethon import TelegramClient, events
-from openai import OpenAI
+from openai import OpenAI, AuthenticationError, APIStatusError
 from dotenv import load_dotenv
 import json
 from datetime import datetime, timedelta, timezone
@@ -999,6 +999,42 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
         
         return summary, usage_info
         
+    except AuthenticationError as e:
+        error_msg = "❌ Ошибка доступа к Perplexity API: ключ недействителен или закончились кредиты."
+        print(error_msg)
+        print(f"   Модель: {model}")
+        print(f"   Размер данных: {len(messages_json)} символов")
+        print(f"   Тип ошибки: {type(e).__name__}")
+        
+        # Подробный traceback для отладки
+        import traceback
+        print("   Подробная трассировка:")
+        traceback.print_exc()
+        
+        return error_msg, None
+    except APIStatusError as e:
+        status_code = getattr(e, 'status_code', None)
+        if status_code == 401:
+            error_msg = "❌ Ошибка доступа к Perplexity API: ключ недействителен или закончились кредиты."
+        elif status_code == 402:
+            error_msg = "❌ Ошибка оплаты Perplexity API: кредиты исчерпаны."
+        else:
+            code_text = status_code if status_code is not None else "неизвестен"
+            error_msg = f"❌ Ошибка Perplexity API (HTTP {code_text})."
+        
+        print(error_msg)
+        print(f"   Модель: {model}")
+        print(f"   Размер данных: {len(messages_json)} символов")
+        print(f"   Тип ошибки: {type(e).__name__}")
+        if status_code is not None:
+            print(f"   HTTP статус: {status_code}")
+        
+        # Подробный traceback для отладки
+        import traceback
+        print("   Подробная трассировка:")
+        traceback.print_exc()
+        
+        return error_msg, None
     except Exception as e:
         error_msg = f"❌ Ошибка при создании выжимки: {e}"
         print(error_msg)
