@@ -362,7 +362,7 @@ http_client = httpx.Client(
 
 google_client = OpenAI(
     api_key=GOOGLE_API_KEY,
-    base_url='https://generativelanguage.googleapis.com/v1beta/',
+    base_url='https://generativelanguage.googleapis.com/v1beta/openai',
     http_client=http_client,
     max_retries=2
 )
@@ -927,7 +927,7 @@ async def create_summary(messages_data, chat_id_str, model='gemini-1.5-flash', u
             user_content = user_content.encode('utf-8', errors='ignore').decode('utf-8')
         
         request_params = {
-            'model': 'models/gemini-1.5-flash',
+            'model': 'gemini-1.5-flash',
             'messages': [
                 {'role': 'system', 'content': system_content},
                 {'role': 'user', 'content': user_content}
