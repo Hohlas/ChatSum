@@ -48,12 +48,12 @@ def validate_config():
     api_id = os.getenv('TELEGRAM_API_ID', '')
     api_hash = os.getenv('TELEGRAM_API_HASH', '')
     phone = os.getenv('TELEGRAM_PHONE', '')
-    perplexity_key = os.getenv('PERPLEXITY_API_KEY', '').strip()
+    google_key = os.getenv('GOOGLE_API_KEY', '').strip()
     
     # Список заглушек, которые могут быть в шаблоне
     placeholders = [
-        'ваш_api_id', 'ваш_api_hash', 'ваш_perplexity_ключ',
-        'your_api_id', 'your_api_hash', 'your_perplexity_key',
+        'ваш_api_id', 'ваш_api_hash', 'ваш_google_ключ',
+        'your_api_id', 'your_api_hash', 'your_google_key',
         'ваш_telegram_api_id', 'ваш_telegram_api_hash'
     ]
     
@@ -78,9 +78,9 @@ def validate_config():
     elif not phone.startswith('+'):
         errors.append("TELEGRAM_PHONE должен начинаться с '+' (например, +79001234567)")
     
-    # Проверка PERPLEXITY_API_KEY
-    if not perplexity_key or perplexity_key in placeholders:
-        errors.append("PERPLEXITY_API_KEY не заполнен или содержит заглушку")
+    # Проверка GOOGLE_API_KEY
+    if not google_key or google_key in placeholders:
+        errors.append("GOOGLE_API_KEY не заполнен или содержит заглушку")
     
     return errors
 
@@ -110,7 +110,7 @@ if config_errors:
     print("   3. Перезапустите бота")
     print("\n💡 Где получить ключи:")
     print("   • Telegram API: https://my.telegram.org/auth")
-    print("   • Perplexity API: https://www.perplexity.ai/settings/api")
+    print("   • Google AI Studio: https://aistudio.google.com")
     exit(1)
 
 # Конфигурация Telegram
@@ -128,12 +128,12 @@ if RESULTS_DESTINATION != 'me':
         print("   Использую 'Избранное' вместо канала")
         RESULTS_DESTINATION = 'me'
 
-# Конфигурация Perplexity
+# Конфигурация Google Gemini
 # Очищаем API ключ от возможных невидимых символов и пробелов
-PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY', '').strip()
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '').strip()
 
-if not PERPLEXITY_API_KEY:
-    print("⚠️  ВНИМАНИЕ: PERPLEXITY_API_KEY не найден в private.txt!")
+if not GOOGLE_API_KEY:
+    print("⚠️  ВНИМАНИЕ: GOOGLE_API_KEY не найден в private.txt!")
 
 # Конфигурация фильтрации сообщений
 MIN_MESSAGE_LENGTH = 3  # Минимальная длина сообщения (символов)
@@ -259,7 +259,7 @@ def load_model_config(filename):
     Returns:
         Кортеж (model_name, use_reasoning, use_html_export)
     """
-    default_model = 'sonar-pro'  # Рекомендуемая модель для Perplexity API
+    default_model = 'gemini-1.5-flash'  # Рекомендуемая модель для Google Gemini
     default_reasoning = False
     default_html_export = True  # По умолчанию используем HTML
     
@@ -310,15 +310,12 @@ def save_model_config(filename, model, use_reasoning, use_html_export=True):
     """
     try:
         with open(filename, 'w', encoding='utf-8') as f:
-            f.write("# Конфигурация модели Perplexity API\n")
+            f.write("# Конфигурация модели Google Gemini (Google AI Studio)\n")
             f.write("# Автоматически обновлено ботом\n\n")
-            f.write("# ⚠️ ВАЖНО: Через Perplexity API доступны ТОЛЬКО модели Sonar!\n")
-            f.write("# Claude, GPT и другие модели доступны только в веб-интерфейсе Perplexity Pro\n\n")
-            f.write("# Доступные модели через API:\n")
-            f.write("# - sonar (базовая модель, на основе Llama 3.3 70B)\n")
-            f.write("# - sonar-pro (улучшенная версия с лучшим качеством) - РЕКОМЕНДУЕТСЯ\n\n")
+            f.write("# Модель указывается строкой (например, gemini-1.5-flash)\n")
+            f.write("# Полный список моделей смотрите в Google AI Studio\n\n")
             f.write(f"MODEL={model}\n\n")
-            f.write("# Использовать ли режим reasoning (экспериментально)\n")
+            f.write("# Использовать ли режим reasoning (может игнорироваться моделью)\n")
             f.write(f"USE_REASONING={'true' if use_reasoning else 'false'}\n\n")
             f.write("# Использовать HTML файлы вместо Telegraph\n")
             f.write("# true - создавать локальные HTML файлы и отправлять в Telegram\n")
@@ -340,14 +337,14 @@ CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT = load_model_config(MODEL_CONFIG_F
 telegram_client = TelegramClient('session_name', API_ID, API_HASH)
 
 # Валидация API ключа
-print(f"🔑 Проверка Perplexity API ключа:")
-print(f"   Длина: {len(PERPLEXITY_API_KEY)} символов")
-print(f"   Первые 10 символов: {PERPLEXITY_API_KEY[:10]}...")
-print(f"   Последние 10 символов: ...{PERPLEXITY_API_KEY[-10:]}")
+print(f"🔑 Проверка ключа Google AI Studio:")
+print(f"   Длина: {len(GOOGLE_API_KEY)} символов")
+print(f"   Первые 10 символов: {GOOGLE_API_KEY[:10]}...")
+print(f"   Последние 10 символов: ...{GOOGLE_API_KEY[-10:]}")
 
 # Проверка, что ключ содержит только ASCII символы
 try:
-    PERPLEXITY_API_KEY.encode('ascii')
+    GOOGLE_API_KEY.encode('ascii')
     print(f"   ✅ API-ключ корректный (ASCII)")
 except UnicodeEncodeError:
     print("   ❌ ОШИБКА: API-ключ содержит недопустимые символы!")
@@ -363,9 +360,9 @@ http_client = httpx.Client(
     )
 )
 
-perplexity_client = OpenAI(
-    api_key=PERPLEXITY_API_KEY,
-    base_url='https://api.perplexity.ai',
+google_client = OpenAI(
+    api_key=GOOGLE_API_KEY,
+    base_url='https://generativelanguage.googleapis.com/v1beta/openai/',
     http_client=http_client,
     max_retries=2
 )
@@ -835,14 +832,14 @@ def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, t
     }
 
 
-async def create_summary(messages_data, chat_id_str, model='sonar', use_reasoning=False, period_start_date=None):
+async def create_summary(messages_data, chat_id_str, model='gemini-1.5-flash', use_reasoning=False, period_start_date=None):
     """
-    Создает выжимку из сообщений с помощью Perplexity API
+    Создает выжимку из сообщений с помощью Google Gemini
     
     Args:
         messages_data: Список словарей с сообщениями (включая reply_to)
         chat_id_str: ID чата для ссылок
-        model: Модель для использования (sonar, claude-3.5-sonnet и т.д.)
+        model: Название модели (например, gemini-1.5-flash)
         use_reasoning: Использовать ли reasoning режим (для моделей с поддержкой)
     
     Returns:
@@ -851,29 +848,18 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
     if not messages_data:
         return "❌ Нет сообщений для анализа за указанный период (все отфильтровано)"
     
-    # Определяем финальную модель с учётом reasoning
+    # Используем фиксированную модель Google Gemini через OpenAI-совместимый интерфейс
+    actual_model = 'gemini-1.5-flash'
+    print(f"🤖 Отправка {len(messages_data)} сообщений в Google Gemini для анализа...")
     if use_reasoning:
-        # Переключаемся на reasoning-версию модели
-        reasoning_models = {
-            'sonar': 'sonar-reasoning',
-            'sonar-pro': 'sonar-reasoning-pro'
-        }
-        actual_model = reasoning_models.get(model, 'sonar-reasoning')
-        print(f"🤖 Отправка {len(messages_data)} сообщений в Perplexity для анализа...")
-        print(f"   🧠 Используем reasoning модель: {actual_model}")
+        print(f"   🧠 Reasoning режим не поддерживается, используем: {actual_model}")
     else:
-        actual_model = model
-        print(f"🤖 Отправка {len(messages_data)} сообщений в Perplexity для анализа...")
         print(f"   ⚡ Используем стандартную модель: {actual_model}")
     
     # Определяем лимиты контекста в зависимости от модели (в токенах)
-    # Источник: официальная документация Perplexity API
+    # Консервативные лимиты контекста для защиты от слишком больших запросов
     context_limits = {
-        'sonar': 128000,
-        'sonar-pro': 200000,           # Самый большой контекст!
-        'sonar-reasoning': 128000,
-        'sonar-reasoning-pro': 128000,
-        'sonar-deep-research': 128000
+        'gemini-1.5-flash': 128000
     }
     
     max_tokens = context_limits.get(actual_model, 128000)
@@ -941,16 +927,13 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
             user_content = user_content.encode('utf-8', errors='ignore').decode('utf-8')
         
         request_params = {
-            'model': actual_model,  # Используем actual_model вместо model
+            'model': 'gemini-1.5-flash',
             'messages': [
                 {'role': 'system', 'content': system_content},
                 {'role': 'user', 'content': user_content}
             ],
             'temperature': 0.3,
-            'max_tokens': 12000,
-            'extra_body': {
-                'disable_search': True
-            }
+            'max_tokens': 12000
         }
         
         # Выводим информацию о размере запроса
@@ -969,7 +952,7 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
         
         while retry_count <= max_retries:
             try:
-                response = perplexity_client.chat.completions.create(**request_params)
+                response = google_client.chat.completions.create(**request_params)
                 break  # Успешно - выходим из цикла
             except Exception as retry_error:
                 if 'timeout' in str(retry_error).lower() and retry_count < max_retries:
@@ -1000,9 +983,9 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
         return summary, usage_info
         
     except AuthenticationError as e:
-        error_msg = "❌ Ошибка доступа к Perplexity API: ключ недействителен или закончились кредиты."
+        error_msg = "❌ Ошибка доступа к Google AI Studio: ключ недействителен или доступ ограничен."
         print(error_msg)
-        print(f"   Модель: {model}")
+        print(f"   Модель: {actual_model}")
         print(f"   Размер данных: {len(messages_json)} символов")
         print(f"   Тип ошибки: {type(e).__name__}")
         
@@ -1015,15 +998,15 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
     except APIStatusError as e:
         status_code = getattr(e, 'status_code', None)
         if status_code == 401:
-            error_msg = "❌ Ошибка доступа к Perplexity API: ключ недействителен или закончились кредиты."
+            error_msg = "❌ Ошибка доступа к Google AI Studio: ключ недействителен или доступ ограничен."
         elif status_code == 402:
-            error_msg = "❌ Ошибка оплаты Perplexity API: кредиты исчерпаны."
+            error_msg = "❌ Ошибка оплаты или лимитов Google AI Studio."
         else:
             code_text = status_code if status_code is not None else "неизвестен"
-            error_msg = f"❌ Ошибка Perplexity API (HTTP {code_text})."
+            error_msg = f"❌ Ошибка Google AI Studio (HTTP {code_text})."
         
         print(error_msg)
-        print(f"   Модель: {model}")
+        print(f"   Модель: {actual_model}")
         print(f"   Размер данных: {len(messages_json)} символов")
         print(f"   Тип ошибки: {type(e).__name__}")
         if status_code is not None:
@@ -1038,7 +1021,7 @@ async def create_summary(messages_data, chat_id_str, model='sonar', use_reasonin
     except Exception as e:
         error_msg = f"❌ Ошибка при создании выжимки: {e}"
         print(error_msg)
-        print(f"   Модель: {model}")
+        print(f"   Модель: {actual_model}")
         print(f"   Размер данных: {len(messages_json)} символов")
         print(f"   Тип ошибки: {type(e).__name__}")
         
@@ -1726,12 +1709,8 @@ async def process_chat_command(event, use_ai=True):
                 completion_tokens = usage_info['completion_tokens']
                 total_tokens = usage_info['total_tokens']
                 
-                # Расчет стоимости для sonar-pro
-                # https://docs.perplexity.ai/guides/pricing
-                # sonar-pro: $3 per 1M input tokens, $15 per 1M output tokens
-                input_cost = (prompt_tokens / 1_000_000) * 3.0
-                output_cost = (completion_tokens / 1_000_000) * 15.0
-                total_cost = input_cost + output_cost
+                # Стоимость не рассчитываем без явных тарифов
+                total_cost = None
             
             # Формируем статистику в новом формате
             stats_message = ""
@@ -1742,7 +1721,7 @@ async def process_chat_command(event, use_ai=True):
                 stats_message += f"• За период: {period_text}\n"
                 stats_message += f"• С {period_start_time} по {period_end_time}\n"
             if usage_info and total_tokens:
-                stats_message += f"• Токенов: {total_tokens:,} = ${total_cost:.4f}\n"
+                stats_message += f"• Токенов: {total_tokens:,}\n"
             
             # Формируем полный контент для Telegraph (с статистикой в конце)
             full_content = summary
@@ -1884,7 +1863,7 @@ async def process_chat_command(event, use_ai=True):
             if period_text:
                 caption += f"• За период: {period_text}\n"
                 caption += f"• С {period_start_time} по {period_end_time}\n"
-            caption += f"\n💡 Готово для копирования в Perplexity!\n"
+            caption += f"\n💡 Готово для копирования в Google AI Studio!\n"
             caption += f"📊 Формат: JSON v2.0 (s/t/r)"
             
             # Отправляем файл
@@ -2124,37 +2103,13 @@ async def handle_show_model_command(event):
 **Reasoning:** {'Включен ✅' if USE_REASONING else 'Выключен ❌'}
 **Экспорт результатов:** {export_mode}
 
-⚠️ **ВАЖНО:** Через Perplexity API доступны ТОЛЬКО модели Sonar!
-Claude, GPT и другие модели доступны только в веб-интерфейсе Perplexity Pro.
-
-**💰 Доступные модели через API:**
-
-**Sonar (базовая):**
-• Основа: Llama 3.3 70B
-• Входящие: ~$0.20 / 1M токенов
-• Исходящие: ~$0.20 / 1M токенов
-• Контекст: 127K токенов
-• Скорость: Быстро ⚡
-• Качество: Хорошее ✅
-• Интеграция с поиском в реальном времени
-
-**Sonar Pro (улучшенная) ⭐ РЕКОМЕНДУЕТСЯ:**
-• Основа: Llama 3.3 70B (оптимизирована)
-• Входящие: ~$1.00 / 1M токенов
-• Исходящие: ~$1.00 / 1M токенов
-• Контекст: 127K токенов
-• Скорость: Быстро ⚡⚡
-• Качество: Отличное ⭐⭐⭐
-• Лучшая точность и глубина анализа
-
-**Управление:**
-`/set_model sonar` - базовая модель (дешевле)
-`/set_model sonar-pro` - улучшенная (рекомендуется) ⭐
+ℹ️ **Доступные модели Google Gemini** смотрите в Google AI Studio.
+Модель задается строкой через `/set_model`.
 
 💡 Текущая модель сохраняется в файле {MODEL_CONFIG_FILE}
 
 📚 Альтернатива:
-Если нужен Claude/GPT - используйте их напрямую через OpenAI API или Anthropic API, а не через Perplexity.
+Если нужен Claude/GPT - используйте их напрямую через OpenAI API или Anthropic API.
 """
     
     await event.delete()
@@ -2172,19 +2127,8 @@ async def handle_set_model_command(event):
     model = event.pattern_match.group(1).strip()
     
     # Валидируем название модели
-    # ⚠️ Только модели Sonar доступны через Perplexity API!
-    valid_models = [
-        'sonar',           # Базовая модель
-        'sonar-pro',       # Улучшенная версия (рекомендуется)
-    ]
-    
-    if model not in valid_models:
-        text = f"⚠️ Неизвестная или недоступная модель: **{model}**\n\n"
-        text += "⚠️ **Важно:** Через Perplexity API доступны ТОЛЬКО модели Sonar!\n\n"
-        text += "Доступные модели:\n"
-        for m in valid_models:
-            text += f"• `{m}`\n"
-        text += "\n💡 Claude, GPT и другие модели доступны только в веб-интерфейсе Perplexity Pro"
+    if not model:
+        text = "⚠️ Не указано название модели.\n\nПример: `/set_model gemini-1.5-flash`"
     else:
         old_model = CURRENT_MODEL
         CURRENT_MODEL = model
@@ -2276,7 +2220,7 @@ async def handle_help_command(event):
 Примеры:
   • `/copy 3h` - экспорт за 3 часа
   • `/copy 50` - экспорт 50 сообщений
-  • Результат: JSON файл + текст для Perplexity
+  • Результат: JSON файл + текст для Google AI Studio
 
 `/help` - показать эту справку
 
@@ -2296,18 +2240,16 @@ async def handle_help_command(event):
 
 `/reload_config` - перезагрузить из файлов
 
-**🤖 Доступные модели AI (только Sonar через API!):**
-• `sonar` - базовая модель, дешевая
-• `sonar-pro` - улучшенная версия ⭐ (рекомендуется)
-
-⚠️ Claude, GPT доступны только в веб-интерфейсе Perplexity Pro
+**🤖 Модели AI (Google Gemini через API):**
+• Модель задается в `MODEL_CONFIG.txt` или через `/set_model`
+• Список моделей доступен в Google AI Studio
 
 **Как это работает:**
 
 **`/sum` (с AI анализом):**
 1. Собирает сообщения (по времени или количеству)
 2. Фильтрует шум и исключенных пользователей
-3. Отправляет в Perplexity AI (модель Sonar Pro)
+3. Отправляет в Google Gemini (модель из конфигурации)
 4. Получает структурированную выжимку по темам
 5. Отправляет результат в ваш канал
 
@@ -2315,7 +2257,7 @@ async def handle_help_command(event):
 1. Собирает и фильтрует сообщения
 2. Создает JSON файл с метаданными
 3. Отправляет вам для ручного анализа
-4. Удобно для копирования в Perplexity вручную
+4. Удобно для копирования в Google AI Studio вручную
 
 **🔍 Что анализируется:**
 • Основные темы обсуждений (включая микро-дискуссии)
