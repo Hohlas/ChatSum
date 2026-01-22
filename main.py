@@ -317,12 +317,14 @@ def load_model_config(filename):
     Returns:
         Кортеж (model_name, use_reasoning, use_html_export)
     """
-    default_model = GEMINI_DEFAULT_MODEL  # Рекомендуемая модель для Google Gemini
+    default_model = GEMINI_DEFAULT_MODEL  # Модель из private.txt (GEMINI_MODEL)
     default_reasoning = False
     default_html_export = True  # По умолчанию используем HTML
     
     if not os.path.exists(filename):
-        print(f"⚠️  Файл {filename} не найден, используется модель по умолчанию: {default_model}")
+        # Не выводим предупреждение, если модель уже задана в private.txt
+        if not GEMINI_DEFAULT_MODEL:
+            print(f"⚠️  Файл {filename} не найден и GEMINI_MODEL не задан в private.txt")
         return default_model, default_reasoning, default_html_export
     
     try:
@@ -1855,6 +1857,13 @@ async def process_chat_command(event, use_ai=True):
         message_text = event.raw_text
         parts = message_text.split()
         
+        # Логируем получение команды
+        chat = await event.get_chat()
+        chat_name_log = chat.title if hasattr(chat, 'title') else "Private"
+        command_name = "/sum" if use_ai else "/copy"
+        params = " ".join(parts[1:]) if len(parts) > 1 else "(по умолчанию 24h)"
+        print(f"\n📥 Команда: {command_name} {params} | Чат: {chat_name_log}")
+        
         hours = None
         days = None
         limit = None
@@ -2356,8 +2365,6 @@ async def handle_show_excluded_command(event):
         text += "Список пуст"
     
     await event.delete()
-    chat = await event.get_chat()
-    chat_name = chat.title if hasattr(chat, 'title') else "Конфигурация"
     topic_id = await get_or_create_topic(chat_name)
     await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
 
@@ -2391,8 +2398,6 @@ async def handle_show_prompt_command(event):
     text += f"💡 Полный промпт в файле: {PROMPT_FILE}"
     
     await event.delete()
-    chat = await event.get_chat()
-    chat_name = chat.title if hasattr(chat, 'title') else "Конфигурация"
     topic_id = await get_or_create_topic(chat_name)
     await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
 
@@ -2613,6 +2618,9 @@ async def handle_copy_command(event):
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/help'))
 async def handle_help_command(event):
     """Обработчик команды /help - показывает справку по командам"""
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
+    print(f"\n📥 Команда: /help | Чат: {chat_name}")
     help_text = """
 📖 **Справка по командам бота**
 
@@ -2694,10 +2702,6 @@ async def handle_help_command(event):
 **Примечание:** Бот реагирует только на ваши собственные команды (исходящие сообщения).
 """
     await event.delete()
-    
-    # Получаем название чата для создания/использования темы
-    chat = await event.get_chat()
-    chat_name = chat.title if hasattr(chat, 'title') else "Справка"
     topic_id = await get_or_create_topic(chat_name)
     
     await telegram_client.send_message(RESULTS_DESTINATION, help_text, reply_to=topic_id)
