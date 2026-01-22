@@ -255,6 +255,52 @@ def save_prompt_to_file(filename, prompt):
         return False
 
 
+def update_env_value(filename, key, value):
+    """
+    Обновляет или добавляет переменную окружения в файле .env (private.txt)
+    
+    Args:
+        filename: Путь к файлу
+        key: Имя переменной
+        value: Значение переменной
+    """
+    if not os.path.exists(filename):
+        print(f"⚠️  Файл {filename} не найден")
+        return False
+    
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            lines = f.read().splitlines()
+        
+        updated = False
+        new_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('#') or '=' not in stripped:
+                new_lines.append(line)
+                continue
+            
+            current_key = stripped.split('=', 1)[0].strip()
+            if current_key == key:
+                new_lines.append(f"{key}={value}")
+                updated = True
+            else:
+                new_lines.append(line)
+        
+        if not updated:
+            if new_lines and new_lines[-1] != '':
+                new_lines.append('')
+            new_lines.append(f"{key}={value}")
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(new_lines) + '\n')
+        
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при обновлении {filename}: {e}")
+        return False
+
+
 def load_model_config(filename):
     """
     Загружает конфигурацию модели из файла
@@ -298,6 +344,10 @@ def load_model_config(filename):
                 elif key == 'USE_HTML_EXPORT':
                     use_html_export = value.lower() in ('true', 'yes', '1', 'on')
         
+        # Если модель задана в private.txt, она имеет приоритет
+        if GEMINI_DEFAULT_MODEL:
+            model = GEMINI_DEFAULT_MODEL
+        
         return model, use_reasoning, use_html_export
     except Exception as e:
         print(f"❌ Ошибка при чтении {filename}: {e}")
@@ -338,6 +388,8 @@ EXCLUDED_USERS = load_users_from_file(EXCLUDED_USERS_FILE)
 PRIORITY_USERS = load_users_from_file(PRIORITY_USERS_FILE)
 ANALYSIS_PROMPT = load_prompt_from_file(PROMPT_FILE)
 CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT = load_model_config(MODEL_CONFIG_FILE)
+if GEMINI_DEFAULT_MODEL:
+    CURRENT_MODEL = GEMINI_DEFAULT_MODEL
 
 # Инициализация клиентов
 telegram_client = TelegramClient('session_name', API_ID, API_HASH)
@@ -854,8 +906,10 @@ async def create_summary(messages_data, chat_id_str, model=GEMINI_DEFAULT_MODEL,
     if not messages_data:
         return "❌ Нет сообщений для анализа за указанный период (все отфильтровано)"
     
-    # Используем модель Google Gemini через OpenAI-совместимый интерфейс
-    actual_model = model or GEMINI_DEFAULT_MODEL
+    # Используем модель Google Gemini из private.txt
+    if not GEMINI_DEFAULT_MODEL:
+        return "❌ В private.txt не задана переменная GEMINI_MODEL"
+    actual_model = GEMINI_DEFAULT_MODEL
     print(f"🤖 Отправка {len(messages_data)} сообщений в Google Gemini для анализа...")
     if use_reasoning:
         print(f"   🧠 Reasoning режим не поддерживается, используем: {actual_model}")
@@ -1663,7 +1717,7 @@ async def process_chat_command(event, use_ai=True):
         # Ветвление: с AI или без
         if use_ai:
             # Режим /sum - анализ с AI
-            summary, usage_info = await create_summary(optimized_messages, chat_id_str, model=CURRENT_MODEL, use_reasoning=USE_REASONING, period_start_date=period_start_date)
+            summary, usage_info = await create_summary(optimized_messages, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_reasoning=USE_REASONING, period_start_date=period_start_date)
             
             # Проверяем, что summary не является сообщением об ошибке
             if summary.startswith('❌'):
@@ -2128,7 +2182,7 @@ async def handle_show_model_command(event):
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/set_model\s+(.+)'))
 async def handle_set_model_command(event):
     """Устанавливает модель для анализа"""
-    global CURRENT_MODEL
+    global CURRENT_MODEL, GEMINI_DEFAULT_MODEL
     
     model = event.pattern_match.group(1).strip()
     
@@ -2136,16 +2190,17 @@ async def handle_set_model_command(event):
     if not model:
         text = f"⚠️ Не указано название модели.\n\nПример: `/set_model {GEMINI_DEFAULT_MODEL}`"
     else:
-        old_model = CURRENT_MODEL
-        CURRENT_MODEL = model
+        old_model = GEMINI_DEFAULT_MODEL or CURRENT_MODEL
         
-        if save_model_config(MODEL_CONFIG_FILE, CURRENT_MODEL, USE_REASONING):
-            text = f"✅ Модель изменена: **{old_model}** → **{CURRENT_MODEL}**\n\n"
+        if update_env_value('private.txt', 'GEMINI_MODEL', model):
+            GEMINI_DEFAULT_MODEL = model
+            CURRENT_MODEL = model
+            text = f"✅ Модель изменена: **{old_model}** → **{model}**\n\n"
             text += "Изменения вступят в силу для следующего анализа.\n"
-            text += f"Используйте `/show_model` для просмотра деталей."
+            text += "Модель сохранена в `private.txt` (GEMINI_MODEL).\n"
+            text += "Используйте `/show_model` для просмотра деталей."
         else:
-            CURRENT_MODEL = old_model  # Откатываем
-            text = f"❌ Ошибка при сохранении конфигурации модели"
+            text = "❌ Ошибка при сохранении модели в private.txt"
     
     await event.delete()
     chat = await event.get_chat()
@@ -2157,12 +2212,16 @@ async def handle_set_model_command(event):
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/reload_config'))
 async def handle_reload_config_command(event):
     """Перезагружает конфигурацию из файлов"""
-    global EXCLUDED_USERS, PRIORITY_USERS, ANALYSIS_PROMPT, CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT
+    global EXCLUDED_USERS, PRIORITY_USERS, ANALYSIS_PROMPT, CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT, GEMINI_DEFAULT_MODEL
     
+    load_dotenv('private.txt', override=True)
+    GEMINI_DEFAULT_MODEL = os.getenv('GEMINI_MODEL', '').strip()
     EXCLUDED_USERS = load_users_from_file(EXCLUDED_USERS_FILE)
     PRIORITY_USERS = load_users_from_file(PRIORITY_USERS_FILE)
     ANALYSIS_PROMPT = load_prompt_from_file(PROMPT_FILE)
     CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT = load_model_config(MODEL_CONFIG_FILE)
+    if GEMINI_DEFAULT_MODEL:
+        CURRENT_MODEL = GEMINI_DEFAULT_MODEL
     
     text = f"""
 ✅ **Конфигурация перезагружена из файлов**
