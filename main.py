@@ -362,7 +362,7 @@ http_client = httpx.Client(
 
 google_client = OpenAI(
     api_key=GOOGLE_API_KEY,
-    base_url='https://generativelanguage.googleapis.com/v1beta/openai',
+    base_url='https://generativelanguage.googleapis.com/v1beta/openai/',
     http_client=http_client,
     max_retries=2
 )
@@ -933,7 +933,7 @@ async def create_summary(messages_data, chat_id_str, model='gemini-1.5-flash', u
                 {'role': 'user', 'content': user_content}
             ],
             'temperature': 0.3,
-            'max_tokens': 12000
+            'max_tokens': 20000
         }
         
         # Выводим информацию о размере запроса
