@@ -49,11 +49,12 @@ def validate_config():
     api_hash = os.getenv('TELEGRAM_API_HASH', '')
     phone = os.getenv('TELEGRAM_PHONE', '')
     google_key = os.getenv('GOOGLE_API_KEY', '').strip()
+    gemini_model = os.getenv('GEMINI_MODEL', '').strip()
     
     # Список заглушек, которые могут быть в шаблоне
     placeholders = [
-        'ваш_api_id', 'ваш_api_hash', 'ваш_google_ключ',
-        'your_api_id', 'your_api_hash', 'your_google_key',
+        'ваш_api_id', 'ваш_api_hash', 'ваш_google_ключ', 'ваша_gemini_модель',
+        'your_api_id', 'your_api_hash', 'your_google_key', 'your_gemini_model',
         'ваш_telegram_api_id', 'ваш_telegram_api_hash'
     ]
     
@@ -81,6 +82,10 @@ def validate_config():
     # Проверка GOOGLE_API_KEY
     if not google_key or google_key in placeholders:
         errors.append("GOOGLE_API_KEY не заполнен или содержит заглушку")
+    
+    # Проверка GEMINI_MODEL
+    if not gemini_model or gemini_model in placeholders:
+        errors.append("GEMINI_MODEL не заполнен или содержит заглушку")
     
     return errors
 
@@ -131,6 +136,7 @@ if RESULTS_DESTINATION != 'me':
 # Конфигурация Google Gemini
 # Очищаем API ключ от возможных невидимых символов и пробелов
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '').strip()
+GEMINI_DEFAULT_MODEL = os.getenv('GEMINI_MODEL', '').strip()
 
 if not GOOGLE_API_KEY:
     print("⚠️  ВНИМАНИЕ: GOOGLE_API_KEY не найден в private.txt!")
@@ -259,7 +265,7 @@ def load_model_config(filename):
     Returns:
         Кортеж (model_name, use_reasoning, use_html_export)
     """
-    default_model = 'gemini-1.5-flash'  # Рекомендуемая модель для Google Gemini
+    default_model = GEMINI_DEFAULT_MODEL  # Рекомендуемая модель для Google Gemini
     default_reasoning = False
     default_html_export = True  # По умолчанию используем HTML
     
@@ -312,7 +318,7 @@ def save_model_config(filename, model, use_reasoning, use_html_export=True):
         with open(filename, 'w', encoding='utf-8') as f:
             f.write("# Конфигурация модели Google Gemini (Google AI Studio)\n")
             f.write("# Автоматически обновлено ботом\n\n")
-            f.write("# Модель указывается строкой (например, gemini-1.5-flash)\n")
+            f.write(f"# Модель указывается строкой (например, {GEMINI_DEFAULT_MODEL})\n")
             f.write("# Полный список моделей смотрите в Google AI Studio\n\n")
             f.write(f"MODEL={model}\n\n")
             f.write("# Использовать ли режим reasoning (может игнорироваться моделью)\n")
@@ -832,14 +838,14 @@ def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, t
     }
 
 
-async def create_summary(messages_data, chat_id_str, model='gemini-1.5-flash', use_reasoning=False, period_start_date=None):
+async def create_summary(messages_data, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_reasoning=False, period_start_date=None):
     """
     Создает выжимку из сообщений с помощью Google Gemini
     
     Args:
         messages_data: Список словарей с сообщениями (включая reply_to)
         chat_id_str: ID чата для ссылок
-        model: Название модели (например, gemini-1.5-flash)
+        model: Название модели (например, значение из GEMINI_MODEL)
         use_reasoning: Использовать ли reasoning режим (для моделей с поддержкой)
     
     Returns:
@@ -848,8 +854,8 @@ async def create_summary(messages_data, chat_id_str, model='gemini-1.5-flash', u
     if not messages_data:
         return "❌ Нет сообщений для анализа за указанный период (все отфильтровано)"
     
-    # Используем фиксированную модель Google Gemini через OpenAI-совместимый интерфейс
-    actual_model = 'gemini-1.5-flash'
+    # Используем модель Google Gemini через OpenAI-совместимый интерфейс
+    actual_model = model or GEMINI_DEFAULT_MODEL
     print(f"🤖 Отправка {len(messages_data)} сообщений в Google Gemini для анализа...")
     if use_reasoning:
         print(f"   🧠 Reasoning режим не поддерживается, используем: {actual_model}")
@@ -859,7 +865,7 @@ async def create_summary(messages_data, chat_id_str, model='gemini-1.5-flash', u
     # Определяем лимиты контекста в зависимости от модели (в токенах)
     # Консервативные лимиты контекста для защиты от слишком больших запросов
     context_limits = {
-        'gemini-1.5-flash': 128000
+        GEMINI_DEFAULT_MODEL: 128000
     }
     
     max_tokens = context_limits.get(actual_model, 128000)
@@ -927,7 +933,7 @@ async def create_summary(messages_data, chat_id_str, model='gemini-1.5-flash', u
             user_content = user_content.encode('utf-8', errors='ignore').decode('utf-8')
         
         request_params = {
-            'model': 'gemini-2.0-flash',
+            'model': actual_model,
             'messages': [
                 {'role': 'system', 'content': system_content},
                 {'role': 'user', 'content': user_content}
@@ -2128,7 +2134,7 @@ async def handle_set_model_command(event):
     
     # Валидируем название модели
     if not model:
-        text = "⚠️ Не указано название модели.\n\nПример: `/set_model gemini-1.5-flash`"
+        text = f"⚠️ Не указано название модели.\n\nПример: `/set_model {GEMINI_DEFAULT_MODEL}`"
     else:
         old_model = CURRENT_MODEL
         CURRENT_MODEL = model

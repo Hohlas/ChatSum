@@ -3,8 +3,13 @@ TELEGRAM_API_ID=ваш_api_id
 TELEGRAM_API_HASH=ваш_api_hash
 TELEGRAM_PHONE=+79001234567
 
+# Google Gemini
+GEMINI_MODEL=gemini-1.5-flash
+
 # Perplexity API
 PERPLEXITY_API_KEY=ваш_perplexity_ключ
+
+GOOGLE_API_KEY=ваш_GOOGLE_ключ
 
 # ID канала для публикации результатов (опционально, можно оставить пустым)
 # Если не указан, результаты будут отправляться в "Избранное"
