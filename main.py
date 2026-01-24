@@ -1942,7 +1942,7 @@ async def process_chat_command(event, use_ai=True):
                 RESULTS_DESTINATION,
                 f"⚠️ **Внимание:** Большой объем сообщений ({len(optimized_messages)})\n"
                 f"Обработка будет выполняться в несколько этапов.\n"
-                f"💡 Совет: Для больших объемов лучше использовать `/copy`, а затем анализировать вручную.",
+                f"💡 Для больших объемов можно использовать `/copy`, и анализировать вручную.",
                 reply_to=topic_id
             )
         
@@ -2068,11 +2068,11 @@ async def process_chat_command(event, use_ai=True):
                 # Формируем сообщение со ссылками на все части
                 if any(url for _, url, _, _ in article_urls):
                     header = f"📰 Саммари чата <b>{chat_name}</b>\n"
-                    header += f"📊 Обработано в {len(summary_parts)} частях:\n\n"
+                    # header += f"📊 Обработано в {len(summary_parts)} частях:\n\n"
                     
                     for part_title, part_url, start_idx, end_idx in article_urls:
                         if part_url:
-                            header += f"• <a href=\"{part_url}\">{part_title}</a>\n"
+                            header += f"• <a href=\"{part_url}\">{part_title}</a>\n\n"
                         else:
                             header += f"• {part_title} (⚠️ ошибка публикации)\n"
                     
