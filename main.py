@@ -990,13 +990,13 @@ def split_summary_into_parts(summary_text):
     return parts
 
 
-async def create_summary(messages_data, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_reasoning=False, period_start_date=None):
+async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_reasoning=False, period_start_date=None):
     """
     Создает выжимку из сообщений с помощью Google Gemini.
-    При большом количестве сообщений (> CHUNK_SIZE) разбивает на чанки с перехлестом.
+    Использует предварительно разбитые на чанки сообщения.
     
     Args:
-        messages_data: Список словарей с сообщениями (включая reply_to)
+        chunks: Список кортежей (chunk_messages, start_index, end_index)
         chat_id_str: ID чата для ссылок
         model: Название модели (например, значение из GEMINI_MODEL)
         use_reasoning: Использовать ли reasoning режим (для моделей с поддержкой)
@@ -1005,7 +1005,7 @@ async def create_summary(messages_data, chat_id_str, model=GEMINI_DEFAULT_MODEL,
     Returns:
         Кортеж (текст выжимки, информация об использовании токенов)
     """
-    if not messages_data:
+    if not chunks:
         return "❌ Нет сообщений для анализа за указанный период (все отфильтровано)", None
     
     # Используем модель Google Gemini из private.txt
@@ -1013,7 +1013,8 @@ async def create_summary(messages_data, chat_id_str, model=GEMINI_DEFAULT_MODEL,
         return "❌ В private.txt не задана переменная GEMINI_MODEL", None
     
     actual_model = GEMINI_DEFAULT_MODEL
-    total_messages = len(messages_data)
+    total_messages = sum(len(c[0]) for c in chunks)
+    num_chunks = len(chunks)
     
     print(f"🤖 Отправка {total_messages} сообщений в Google Gemini для анализа...")
     if use_reasoning:
@@ -1039,12 +1040,10 @@ async def create_summary(messages_data, chat_id_str, model=GEMINI_DEFAULT_MODEL,
     system_content = safe_str(prompt_with_priority)
     
     # Проверяем, нужно ли разбивать на чанки
-    if total_messages > CHUNK_SIZE:
+    if num_chunks > 1:
         # ═══════════════════════════════════════════════════════════════
-        # РЕЖИМ ЧАНКОВ: разбиваем сообщения на части с перехлестом
+        # РЕЖИМ ЧАНКОВ: работаем с переданными чанками
         # ═══════════════════════════════════════════════════════════════
-        chunks = split_messages_into_chunks(messages_data, CHUNK_SIZE, CHUNK_OVERLAP)
-        num_chunks = len(chunks)
         overlap_count = int(CHUNK_SIZE * CHUNK_OVERLAP)
         
         print(f"📦 Разбиение на {num_chunks} чанков (по {CHUNK_SIZE} сообщений, перехлест {overlap_count})")
@@ -1196,8 +1195,10 @@ async def create_summary(messages_data, chat_id_str, model=GEMINI_DEFAULT_MODEL,
     # ОБЫЧНЫЙ РЕЖИМ: все сообщения в одном запросе
     # ═══════════════════════════════════════════════════════════════════
     
+    chunk_messages, start_idx, end_idx = chunks[0]
+    
     # Формируем JSON
-    optimized_structure = build_optimized_json_structure(messages_data, chat_id_str, period_start_date=period_start_date)
+    optimized_structure = build_optimized_json_structure(chunk_messages, chat_id_str, period_start_date=period_start_date)
     messages_json = json.dumps(optimized_structure, ensure_ascii=False, indent=2)
     
     # Проверяем размер и при необходимости ограничиваем
@@ -1212,9 +1213,9 @@ async def create_summary(messages_data, chat_id_str, model=GEMINI_DEFAULT_MODEL,
         print(f"   ⚠️  ПОТЕРЯ ДАННЫХ: {total_messages - limit} старых сообщений не попадут в анализ")
         print(f"   💡 Рекомендация: уменьшите период анализа (например /analyze 12h вместо 24h)")
         
-        messages_data_limited = messages_data[-limit:]
-        period_start_limited = messages_data_limited[0].get('date', '') if messages_data_limited else period_start_date
-        optimized_structure = build_optimized_json_structure(messages_data_limited, chat_id_str, period_start_date=period_start_limited)
+        chunk_messages_limited = chunk_messages[-limit:]
+        period_start_limited = chunk_messages_limited[0].get('date', '') if chunk_messages_limited else period_start_date
+        optimized_structure = build_optimized_json_structure(chunk_messages_limited, chat_id_str, period_start_date=period_start_limited)
         messages_json = json.dumps(optimized_structure, ensure_ascii=False, indent=2)
     
     try:
@@ -1982,12 +1983,29 @@ async def process_chat_command(event, use_ai=True):
         if url_count > 0:
             print(f"\n📎 Найдено сообщений с URL: {url_count}")
         
+        # Разбиваем сообщения на чанки заранее (используется и для предупреждения, и для анализа)
+        chunks = split_messages_into_chunks(optimized_messages)
+        num_chunks = len(chunks)
+
         # Предупреждение о больших запросах (особенно для AI анализа)
-        if use_ai and len(optimized_messages) > 500:
+        if use_ai and num_chunks > 1:
+            # Расчет примерного времени ожидания
+            # Паузы: (n-1) между чанками в create_summary и (n-1) между публикациями в Telegraph
+            wait_time_seconds = (num_chunks - 1) * (CHUNK_DELAY_SECONDS + 4)
+            
+            wait_info = ""
+            if wait_time_seconds > 0:
+                minutes = wait_time_seconds // 60
+                seconds = wait_time_seconds % 60
+                if minutes > 0:
+                    wait_info = f"\n⏳ Примерное время ожидания пауз: **{minutes} мин {seconds} сек**"
+                else:
+                    wait_info = f"\n⏳ Примерное время ожидания пауз: **{seconds} сек**"
+
             await telegram_client.send_message(
                 RESULTS_DESTINATION,
                 f"⚠️ **Внимание:** Большой объем сообщений ({len(optimized_messages)})\n"
-                f"Обработка будет выполняться в несколько этапов.\n"
+                f"Обработка будет выполняться в {num_chunks} этапов.{wait_info}\n"
                 f"💡 Для больших объемов можно использовать `/copy`, и анализировать вручную.",
                 reply_to=topic_id
             )
@@ -2004,7 +2022,7 @@ async def process_chat_command(event, use_ai=True):
         # Ветвление: с AI или без
         if use_ai:
             # Режим /sum - анализ с AI
-            summary, usage_info = await create_summary(optimized_messages, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_reasoning=USE_REASONING, period_start_date=period_start_date)
+            summary, usage_info = await create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_reasoning=USE_REASONING, period_start_date=period_start_date)
             
             # Проверяем, что summary не является сообщением об ошибке
             if summary.startswith('❌'):
