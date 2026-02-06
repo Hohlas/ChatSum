@@ -5,7 +5,7 @@ import re
 import shutil
 import time
 from telethon import TelegramClient, events
-from openai import OpenAI, AuthenticationError, APIStatusError
+from openai import AsyncOpenAI, AuthenticationError, APIStatusError
 from dotenv import load_dotenv
 import json
 from datetime import datetime, timedelta, timezone
@@ -418,8 +418,8 @@ except UnicodeEncodeError:
     print("   Проверьте файл private.txt на наличие невидимых символов")
     exit(1)
 
-# Создаём стандартный HTTP-клиент с настройками таймаута и лимитов соединений
-http_client = httpx.Client(
+# Создаём асинхронный HTTP-клиент с настройками таймаута и лимитов соединений
+http_client = httpx.AsyncClient(
     timeout=180.0,
     limits=httpx.Limits(
         max_keepalive_connections=5,
@@ -427,7 +427,7 @@ http_client = httpx.Client(
     )
 )
 
-google_client = OpenAI(
+google_client = AsyncOpenAI(
     api_key=GOOGLE_API_KEY,
     base_url='https://generativelanguage.googleapis.com/v1beta/openai/',
     http_client=http_client,
@@ -1111,7 +1111,7 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
                 
                 while retry_count <= max_retries:
                     try:
-                        response = google_client.chat.completions.create(**request_params)
+                        response = await google_client.chat.completions.create(**request_params)
                         break
                     except Exception as retry_error:
                         if 'timeout' in str(retry_error).lower() and retry_count < max_retries:
@@ -1161,7 +1161,7 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
             # Пауза между запросами (кроме последнего чанка)
             if chunk_idx < num_chunks:
                 print(f"   ⏳ Пауза {CHUNK_DELAY_SECONDS} секунд перед следующим чанком...")
-                time.sleep(CHUNK_DELAY_SECONDS)
+                await asyncio.sleep(CHUNK_DELAY_SECONDS)
         
         # ═══════════════════════════════════════════════════════════════
         # Объединение саммари всех чанков
@@ -1422,7 +1422,7 @@ def calculate_period_info(messages_data, optimized_messages, period_start_date, 
     return period_info, period_start_time, period_end_time, period_start_dt, period_end_dt
 
 
-def create_telegraph_account(author_name="ChatSumBot"):
+async def create_telegraph_account(author_name="ChatSumBot"):
     """
     Создает аккаунт Telegraph для переиспользования при множественных публикациях.
     Это позволяет избежать превышения лимитов API при создании нескольких статей.
@@ -1435,7 +1435,7 @@ def create_telegraph_account(author_name="ChatSumBot"):
     """
     try:
         telegraph = Telegraph()
-        account = telegraph.create_account(short_name=author_name)
+        account = await asyncio.to_thread(telegraph.create_account, short_name=author_name)
         telegraph_client = Telegraph(access_token=account['access_token'])
         print(f"✅ Telegraph аккаунт создан: {author_name}")
         return telegraph_client
@@ -1446,7 +1446,7 @@ def create_telegraph_account(author_name="ChatSumBot"):
         return None
 
 
-def publish_to_telegraph(title, content, author_name="Chat Filter Bot", telegraph_client=None, max_retries=3):
+async def publish_to_telegraph(title, content, author_name="Chat Filter Bot", telegraph_client=None, max_retries=3):
     """
     Публикует статью в Telegraph с обработкой ограничений частоты запросов (flood control).
     
@@ -1468,7 +1468,7 @@ def publish_to_telegraph(title, content, author_name="Chat Filter Bot", telegrap
             # Если клиент не передан, создаем новый аккаунт (старое поведение)
             if telegraph_client is None:
                 telegraph = Telegraph()
-                account = telegraph.create_account(short_name=author_name)
+                account = await asyncio.to_thread(telegraph.create_account, short_name=author_name)
                 telegraph = Telegraph(access_token=account['access_token'])
             else:
                 telegraph = telegraph_client
@@ -1575,7 +1575,8 @@ def publish_to_telegraph(title, content, author_name="Chat Filter Bot", telegrap
             html_content = ''.join(html_paragraphs)
             
             # Публикуем статью
-            response = telegraph.create_page(
+            response = await asyncio.to_thread(
+                telegraph.create_page,
                 title=title,
                 html_content=html_content,
                 author_name=author_name
@@ -1598,7 +1599,7 @@ def publish_to_telegraph(title, content, author_name="Chat Filter Bot", telegrap
             # Экспоненциальная задержка: 3s, 6s, 9s...
             wait_time = base_delay * retry_count
             print(f"⚠️  Flood control. Попытка {retry_count}/{max_retries}. Ожидание {wait_time} сек...")
-            time.sleep(wait_time)
+            await asyncio.sleep(wait_time)
             
         except Exception as e:
             print(f"❌ Ошибка при публикации в Telegraph: {e}")
@@ -2115,7 +2116,7 @@ async def process_chat_command(event, use_ai=True):
                 print(f"📝 Публикация {len(summary_parts)} частей в Telegraph...")
                 
                 # Создаем один аккаунт Telegraph для всех публикаций (избегаем flood control)
-                telegraph_client = create_telegraph_account("ChatSumBot")
+                telegraph_client = await create_telegraph_account("ChatSumBot")
                 
                 article_urls = []
                 for part_idx, (part_title, part_content, start_idx, end_idx) in enumerate(summary_parts, 1):
@@ -2123,7 +2124,7 @@ async def process_chat_command(event, use_ai=True):
                     part_with_footer = part_content + bot_footer
                     part_article_title = f"Саммари чата: {chat_name} - {part_title}"
                     
-                    part_url = publish_to_telegraph(
+                    part_url = await publish_to_telegraph(
                         part_article_title, 
                         part_with_footer, 
                         author_name="ChatSumBot",
@@ -2140,7 +2141,7 @@ async def process_chat_command(event, use_ai=True):
                     # Пауза между публикациями (кроме последней части)
                     if part_idx < len(summary_parts):
                         print(f"   ⏳ Пауза 4 секунды перед следующей публикацией...")
-                        time.sleep(4)
+                        await asyncio.sleep(4)
                 
                 # Формируем сообщение со ссылками на все части
                 if any(url for _, url, _, _ in article_urls):
@@ -2219,7 +2220,7 @@ async def process_chat_command(event, use_ai=True):
                 # ═══════════════════════════════════════════════════════════════
                 # ОБЫЧНЫЙ РЕЖИМ: одна публикация в Telegraph
                 # ═══════════════════════════════════════════════════════════════
-                article_url = publish_to_telegraph(article_title, full_content, author_name="ChatSumBot")
+                article_url = await publish_to_telegraph(article_title, full_content, author_name="ChatSumBot")
                 
                 if article_url:
                     # Вставляем заголовок с саммари в начало сообщения
