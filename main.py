@@ -11,6 +11,7 @@ import json
 from datetime import datetime, timedelta, timezone
 import httpx
 from telegraph import Telegraph
+from telegraph.exceptions import RetryAfterError
 
 
 def ensure_private_file():
@@ -154,7 +155,7 @@ NOISE_PATTERNS = [
 # Конфигурация разбиения на чанки для больших объемов сообщений
 CHUNK_SIZE = 500  # Количество сообщений в одном чанке
 CHUNK_OVERLAP = 0.1  # Перехлест между чанками (10% = 50 сообщений при CHUNK_SIZE=500)
-CHUNK_DELAY_SECONDS = 11   # Задержка между запросами к API (для соблюдения RPM лимита)
+CHUNK_DELAY_SECONDS = 10   # Задержка между запросами к API (для соблюдения RPM лимита)
 
 # Пути к конфигурационным файлам
 EXCLUDED_USERS_FILE = 'EXCLUDED_USERS.txt'
@@ -1420,147 +1421,192 @@ def calculate_period_info(messages_data, optimized_messages, period_start_date, 
     return period_info, period_start_time, period_end_time, period_start_dt, period_end_dt
 
 
-def publish_to_telegraph(title, content, author_name="Chat Filter Bot"):
+def create_telegraph_account(author_name="ChatSumBot"):
     """
-    Публикует статью в Telegraph
+    Создает аккаунт Telegraph для переиспользования при множественных публикациях.
+    Это позволяет избежать превышения лимитов API при создании нескольких статей.
+    
+    Args:
+        author_name: Имя автора для аккаунта
+    
+    Returns:
+        Экземпляр Telegraph с access_token или None при ошибке
+    """
+    try:
+        telegraph = Telegraph()
+        account = telegraph.create_account(short_name=author_name)
+        telegraph_client = Telegraph(access_token=account['access_token'])
+        print(f"✅ Telegraph аккаунт создан: {author_name}")
+        return telegraph_client
+    except Exception as e:
+        print(f"❌ Ошибка создания аккаунта Telegraph: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def publish_to_telegraph(title, content, author_name="Chat Filter Bot", telegraph_client=None, max_retries=3):
+    """
+    Публикует статью в Telegraph с обработкой ограничений частоты запросов (flood control).
     
     Args:
         title: Заголовок статьи
         content: Содержимое статьи (Markdown текст)
         author_name: Имя автора (опционально)
+        telegraph_client: Существующий клиент Telegraph (для переиспользования аккаунта)
+        max_retries: Максимальное количество попыток при flood control (по умолчанию 3)
     
     Returns:
         URL опубликованной статьи или None при ошибке
     """
-    try:
-        # Создаем экземпляр Telegraph (анонимный аккаунт)
-        telegraph = Telegraph()
-        
-        # Создаем аккаунт (анонимный, можно использовать один для всех публикаций)
-        account = telegraph.create_account(short_name=author_name)
-        telegraph = Telegraph(access_token=account['access_token'])
-        
-        # Конвертируем Markdown в HTML для Telegraph
-        # Telegraph поддерживает только определённые теги: a, aside, b, blockquote, br, code, em, figcaption, figure, h3, h4, hr, i, iframe, img, li, ol, p, pre, s, strong, u, ul, video
-        
-        # Разбиваем на строки для построчной обработки
-        lines = content.split('\n')
-        html_paragraphs = []
-        in_list = False
-        current_paragraph = []
-        
-        for line in lines:
-            line_stripped = line.strip()
+    retry_count = 0
+    base_delay = 3  # Базовая задержка из сообщения об ошибке Telegraph
+    
+    while retry_count <= max_retries:
+        try:
+            # Если клиент не передан, создаем новый аккаунт (старое поведение)
+            if telegraph_client is None:
+                telegraph = Telegraph()
+                account = telegraph.create_account(short_name=author_name)
+                telegraph = Telegraph(access_token=account['access_token'])
+            else:
+                telegraph = telegraph_client
             
-            # Пустая строка - завершаем текущий параграф
-            if not line_stripped:
-                if current_paragraph:
-                    # Объединяем накопленные строки параграфа с переносами
-                    para_text = '<br>'.join(current_paragraph)
-                    # Конвертируем Markdown элементы
-                    para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                    para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                    para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-                    html_paragraphs.append(f'<p>{para_text}</p>')
-                    current_paragraph = []
+            # Конвертируем Markdown в HTML для Telegraph
+            # Telegraph поддерживает только определённые теги: a, aside, b, blockquote, br, code, em, figcaption, figure, h3, h4, hr, i, iframe, img, li, ol, p, pre, s, strong, u, ul, video
+            
+            # Разбиваем на строки для построчной обработки
+            lines = content.split('\n')
+            html_paragraphs = []
+            in_list = False
+            current_paragraph = []
+            
+            for line in lines:
+                line_stripped = line.strip()
+                
+                # Пустая строка - завершаем текущий параграф
+                if not line_stripped:
+                    if current_paragraph:
+                        # Объединяем накопленные строки параграфа с переносами
+                        para_text = '<br>'.join(current_paragraph)
+                        # Конвертируем Markdown элементы
+                        para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
+                        para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
+                        para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
+                        html_paragraphs.append(f'<p>{para_text}</p>')
+                        current_paragraph = []
+                    if in_list:
+                        html_paragraphs.append('</ul>')
+                        in_list = False
+                    continue
+                
+                # Разделитель тем
+                if line_stripped == '---':
+                    if current_paragraph:
+                        para_text = '<br>'.join(current_paragraph)
+                        para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
+                        para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
+                        para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
+                        html_paragraphs.append(f'<p>{para_text}</p>')
+                        current_paragraph = []
+                    if in_list:
+                        html_paragraphs.append('</ul>')
+                        in_list = False
+                    html_paragraphs.append('<hr>')
+                    continue
+                
+                # Заголовок темы (начинается с 💡)
+                if line_stripped.startswith('💡'):
+                    if current_paragraph:
+                        para_text = '<br>'.join(current_paragraph)
+                        para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
+                        para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
+                        para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
+                        html_paragraphs.append(f'<p>{para_text}</p>')
+                        current_paragraph = []
+                    if in_list:
+                        html_paragraphs.append('</ul>')
+                        in_list = False
+                    # Конвертируем Markdown в заголовке
+                    text = line_stripped
+                    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)  # **text** -> <b>text</b>
+                    text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', text)    # *text* -> <i>text</i>
+                    html_paragraphs.append(f'<h3>{text}</h3>')
+                    continue
+                
+                # Список
+                if line_stripped.startswith('- ') or line_stripped.startswith('* '):
+                    if current_paragraph:
+                        para_text = '<br>'.join(current_paragraph)
+                        para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
+                        para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
+                        para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
+                        html_paragraphs.append(f'<p>{para_text}</p>')
+                        current_paragraph = []
+                    if not in_list:
+                        html_paragraphs.append('<ul>')
+                        in_list = True
+                    item_text = line_stripped.lstrip('- *').strip()
+                    # Конвертируем Markdown элементы в списке
+                    item_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', item_text)
+                    item_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', item_text)
+                    item_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', item_text)
+                    html_paragraphs.append(f'<li>{item_text}</li>')
+                    continue
+                
+                # Обычная строка - добавляем к текущему параграфу
                 if in_list:
                     html_paragraphs.append('</ul>')
                     in_list = False
-                continue
+                current_paragraph.append(line_stripped)
             
-            # Разделитель тем
-            if line_stripped == '---':
-                if current_paragraph:
-                    para_text = '<br>'.join(current_paragraph)
-                    para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                    para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                    para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-                    html_paragraphs.append(f'<p>{para_text}</p>')
-                    current_paragraph = []
-                if in_list:
-                    html_paragraphs.append('</ul>')
-                    in_list = False
-                html_paragraphs.append('<hr>')
-                continue
+            # Завершаем последний параграф
+            if current_paragraph:
+                para_text = '<br>'.join(current_paragraph)
+                para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
+                para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
+                para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
+                html_paragraphs.append(f'<p>{para_text}</p>')
             
-            # Заголовок темы (начинается с 💡)
-            if line_stripped.startswith('💡'):
-                if current_paragraph:
-                    para_text = '<br>'.join(current_paragraph)
-                    para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                    para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                    para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-                    html_paragraphs.append(f'<p>{para_text}</p>')
-                    current_paragraph = []
-                if in_list:
-                    html_paragraphs.append('</ul>')
-                    in_list = False
-                # Конвертируем Markdown в заголовке
-                text = line_stripped
-                text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)  # **text** -> <b>text</b>
-                text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', text)    # *text* -> <i>text</i>
-                html_paragraphs.append(f'<h3>{text}</h3>')
-                continue
-            
-            # Список
-            if line_stripped.startswith('- ') or line_stripped.startswith('* '):
-                if current_paragraph:
-                    para_text = '<br>'.join(current_paragraph)
-                    para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                    para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                    para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-                    html_paragraphs.append(f'<p>{para_text}</p>')
-                    current_paragraph = []
-                if not in_list:
-                    html_paragraphs.append('<ul>')
-                    in_list = True
-                item_text = line_stripped.lstrip('- *').strip()
-                # Конвертируем Markdown элементы в списке
-                item_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', item_text)
-                item_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', item_text)
-                item_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', item_text)
-                html_paragraphs.append(f'<li>{item_text}</li>')
-                continue
-            
-            # Обычная строка - добавляем к текущему параграфу
             if in_list:
                 html_paragraphs.append('</ul>')
-                in_list = False
-            current_paragraph.append(line_stripped)
         
-        # Завершаем последний параграф
-        if current_paragraph:
-            para_text = '<br>'.join(current_paragraph)
-            para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-            para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-            para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-            html_paragraphs.append(f'<p>{para_text}</p>')
-        
-        if in_list:
-            html_paragraphs.append('</ul>')
-        
-        html_content = ''.join(html_paragraphs)
-        
-        # Публикуем статью
-        response = telegraph.create_page(
-            title=title,
-            html_content=html_content,
-            author_name=author_name
-        )
-        
-        if response and 'url' in response:
-            article_url = response['url']
-            print(f"✅ Статья опубликована в Telegraph: {article_url}")
-            return article_url
-        else:
-            print(f"❌ Ошибка при публикации в Telegraph: {response}")
-            return None
+            html_content = ''.join(html_paragraphs)
             
-    except Exception as e:
-        print(f"❌ Ошибка при публикации в Telegraph: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+            # Публикуем статью
+            response = telegraph.create_page(
+                title=title,
+                html_content=html_content,
+                author_name=author_name
+            )
+            
+            if response and 'url' in response:
+                article_url = response['url']
+                print(f"✅ Статья опубликована в Telegraph: {article_url}")
+                return article_url
+            else:
+                print(f"❌ Ошибка при публикации в Telegraph: {response}")
+                return None
+        
+        except RetryAfterError as e:
+            retry_count += 1
+            if retry_count > max_retries:
+                print(f"❌ Превышено количество попыток ({max_retries}) при публикации в Telegraph")
+                return None
+            
+            # Экспоненциальная задержка: 3s, 6s, 9s...
+            wait_time = base_delay * retry_count
+            print(f"⚠️  Flood control. Попытка {retry_count}/{max_retries}. Ожидание {wait_time} сек...")
+            time.sleep(wait_time)
+            
+        except Exception as e:
+            print(f"❌ Ошибка при публикации в Telegraph: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    # Если все попытки исчерпаны
+    return None
 
 
 def create_html_report(title, content, author_name="Chat Filter Bot"):
@@ -2050,13 +2096,21 @@ async def process_chat_command(event, use_ai=True):
                 # ═══════════════════════════════════════════════════════════════
                 print(f"📝 Публикация {len(summary_parts)} частей в Telegraph...")
                 
+                # Создаем один аккаунт Telegraph для всех публикаций (избегаем flood control)
+                telegraph_client = create_telegraph_account("ChatSumBot")
+                
                 article_urls = []
                 for part_idx, (part_title, part_content, start_idx, end_idx) in enumerate(summary_parts, 1):
                     # Добавляем футер к каждой части
                     part_with_footer = part_content + bot_footer
                     part_article_title = f"Саммари чата: {chat_name} - {part_title}"
                     
-                    part_url = publish_to_telegraph(part_article_title, part_with_footer, author_name="ChatSumBot")
+                    part_url = publish_to_telegraph(
+                        part_article_title, 
+                        part_with_footer, 
+                        author_name="ChatSumBot",
+                        telegraph_client=telegraph_client
+                    )
                     
                     if part_url:
                         article_urls.append((part_title, part_url, start_idx, end_idx))
@@ -2064,6 +2118,11 @@ async def process_chat_command(event, use_ai=True):
                     else:
                         print(f"   ❌ Не удалось опубликовать часть {part_idx}")
                         article_urls.append((part_title, None, start_idx, end_idx))
+                    
+                    # Пауза между публикациями (кроме последней части)
+                    if part_idx < len(summary_parts):
+                        print(f"   ⏳ Пауза 4 секунды перед следующей публикацией...")
+                        time.sleep(4)
                 
                 # Формируем сообщение со ссылками на все части
                 if any(url for _, url, _, _ in article_urls):
