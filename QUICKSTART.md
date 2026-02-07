@@ -15,12 +15,10 @@
 4. Создайте приложение
 5. Скопируйте `api_id` и `api_hash`
 
-#### Perplexity API (3 минуты)
-1. Откройте https://www.perplexity.ai/settings/api
-2. Зарегистрируйтесь (если ещё не зарегистрированы)
-3. Добавьте платёжную информацию
-4. Пополните баланс ($5-10 хватит надолго)
-5. Создайте и скопируйте API ключ
+#### Google Gemini API (2 минуты)
+1. Откройте [Google AI Studio](https://aistudio.google.com)
+2. Получите API ключ (бесплатно для большинства моделей)
+3. Скопируйте ключ и сохраните его
 
 ---
 
@@ -79,8 +77,9 @@ TELEGRAM_API_ID=12345678
 TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890
 TELEGRAM_PHONE=+79001234567
 
-# Perplexity API
-PERPLEXITY_API_KEY=pplx-1234567890abcdef
+# Google Gemini API
+GOOGLE_API_KEY=ваш_google_ключ
+GEMINI_MODEL=gemini-1.5-flash
 
 # ID канала для публикации результатов (опционально)
 TELEGRAM_GROUP_ID=-1001234567890
@@ -195,7 +194,7 @@ TELEGRAM_GROUP_ID=-1001234567890
 ### Ошибка API ключа
 
 **Решение:**
-1. Проверьте ключ на https://www.perplexity.ai/settings/api
+1. Проверьте ключ в [Google AI Studio](https://aistudio.google.com)
 2. Убедитесь, что скопировали полностью
 3. Проверьте баланс аккаунта
 4. Попробуйте создать новый ключ

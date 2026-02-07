@@ -1,6 +1,6 @@
 # 🤖 Telegram Chat Summary Bot
 
-Telegram userbot для автоматического анализа сообщений чата с помощью Perplexity AI. Бот собирает сообщения за указанный период, фильтрует шум и создает структурированные выжимки с выделением основных тем и аргументов участников. Результат сохраняется в красивом HTML файле и отправляется в вашу группу.
+Telegram userbot для автоматического анализа сообщений чата с помощью Google Gemini AI. Бот собирает сообщения за указанный период, фильтрует шум и создает структурированные выжимки с выделением основных тем и аргументов участников. Результат сохраняется в красивом HTML файле и отправляется в вашу группу.
 
 **Достаточно отправить в чат сообщение**
 ```
@@ -30,10 +30,10 @@ Telegram userbot для автоматического анализа сообщ
 4. Получите `api_id` и `api_hash`
 5. Создайте группу для публикации выжимки. Узнайте ID с помощью бота @username_to_id_bot)
 
-**Perplexity API:**
-1. Зайдите на https://www.perplexity.ai/settings/api
-2. Зарегистрируйте платёжную информацию и пополните баланс
-3. Сгенерируйте API ключ
+**Google Gemini API:**
+1. Перейдите в [Google AI Studio](https://aistudio.google.com)
+2. Получите API ключ (Free of charge для многих моделей)
+3. Выберите модель (например, `gemini-1.5-flash` или `gemini-1.5-pro`)
 
 ### 2. Установка
 
@@ -53,7 +53,8 @@ pip install -r requirements.txt
 TELEGRAM_API_ID=ваш_api_id
 TELEGRAM_API_HASH=ваш_api_hash
 TELEGRAM_PHONE=+79001234567
-PERPLEXITY_API_KEY=ваш_perplexity_ключ
+GOOGLE_API_KEY=ваш_google_ключ
+GEMINI_MODEL=gemini-1.5-flash
 TELEGRAM_GROUP_ID=-1001234567890 # ID канала для публикации результатов (опционально)
 ```
 
@@ -71,7 +72,7 @@ python3 main.py
 
 ### `/sum` — Получение выжимки с AI
 
-Анализирует сообщения чата с помощью Perplexity AI и создает красивый HTML отчет с автоматической темной темой.
+Анализирует сообщения чата с помощью Google Gemini AI и создает красивый HTML отчет с автоматической темной темой.
 
 ```
 /sum              # Последние 24 часа (по умолчанию)
@@ -116,7 +117,7 @@ python3 main.py
 /add_priority User   # Добавить в приоритетные
 /remove_priority User # Удалить из приоритетных
 
-/set_model sonar-pro # Изменить модель AI
+/set_model gemini-1.5-flash # Изменить модель AI
 /reload_config       # Перезагрузить конфигурацию из файлов
 ```
 
@@ -143,20 +144,20 @@ Expert2
 ```
 
 ### `PROMPT.txt`
-Промпт для Perplexity AI, определяющий формат анализа. Можно редактировать для изменения структуры выжимки.
+Промпт для Google Gemini AI, определяющий формат анализа. Можно редактировать для изменения структуры выжимки.
 
 ### `MODEL_CONFIG.txt`
 Настройки модели AI и формата экспорта:
 
 ```
-MODEL=sonar-pro
+MODEL=gemini-1.5-flash
 USE_REASONING=false
 USE_HTML_EXPORT=true
 ```
 
 **Параметры:**
-- **MODEL**: `sonar`, `sonar-pro` (рекомендуется)
-- **USE_REASONING**: экспериментальный режим reasoning
+- **MODEL**: `gemini-1.5-flash` (рекомендуется), `gemini-1.5-pro`
+- **USE_REASONING**: экспериментальный режим reasoning (поддерживается некоторыми моделями)
 - **USE_HTML_EXPORT**: 
   - `true` — создавать HTML файлы (по умолчанию)
   - `false` — публиковать в Telegraph
@@ -274,7 +275,7 @@ screen -r telegram-chat-analyzer
   - HTML файлы полностью автономны и не содержат трекеров
 - **Сессия:** Файл `*.session` содержит данные авторизации, также не в git
 - **HTML отчеты:** Сохраняются в папке `html_reports/` (добавлена в `.gitignore`)
-- **Лимиты API:** Следите за использованием Perplexity API
+- **Лимиты API:** Следите за использованием Google Gemini API (RPM/TPM лимиты)
 - **Таймауты:** Для больших объемов (>200 сообщений) может потребоваться время
 - **Временные файлы:** Файлы `analysis_*.json` автоматически удаляются после успешной публикации
 
@@ -289,8 +290,8 @@ screen -r telegram-chat-analyzer
 - Удалите файл `session_name.session` и перезапустите бота
 - Проверьте правильность `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_PHONE`
 
-**Ошибка Perplexity API:**
-- Проверьте баланс на https://www.perplexity.ai/settings/api
+**Ошибка Gemini API:**
+- Проверьте лимиты в [Google AI Studio](https://aistudio.google.com)
 - Убедитесь, что API ключ скопирован полностью (без пробелов)
 
 **Таймауты при анализе:**

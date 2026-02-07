@@ -285,7 +285,7 @@ async def handle_help_command(event):
 Все сообщения группируются по источнику!
 
 **Примечание:** 
-Это тестовая версия БЕЗ Perplexity API.
+Это тестовая версия БЕЗ Gemini API.
 Просто проверяем загрузку сообщений.
 """
     await event.delete()
@@ -302,7 +302,7 @@ async def main():
     """Основная функция запуска"""
     print("🧪 ТЕСТОВЫЙ РЕЖИМ: Запуск бота для проверки загрузки сообщений")
     print("=" * 60)
-    print("⚠️  Perplexity API НЕ используется (экономим токены)")
+    print("⚠️  Gemini API НЕ используется (экономим токены)")
     print("=" * 60)
     
     await telegram_client.start(phone=PHONE)
