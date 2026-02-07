@@ -1254,7 +1254,7 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
         
         while retry_count <= max_retries:
             try:
-                response = google_client.chat.completions.create(**request_params)
+                response = await google_client.chat.completions.create(**request_params)
                 break
             except Exception as retry_error:
                 if 'timeout' in str(retry_error).lower() and retry_count < max_retries:
