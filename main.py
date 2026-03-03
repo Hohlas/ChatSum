@@ -1159,10 +1159,31 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
     print(f"   📊 Лимит контекста: {max_tokens:,} токенов ({max_chars:,} символов для кириллицы)")
     
     # Подготовка промпта с приоритетными пользователями
+    # Извлекаем уникальные имена отправителей из всех чанков
+    actual_senders = set()
+    for chunk_messages, _, _ in chunks:
+        for msg in chunk_messages:
+            actual_senders.add(msg.get('sender', ''))
+    
+    # Фильтруем PRIORITY_USERS - оставляем только тех, кто есть в сообщениях
+    relevant_priority_users = [user for user in PRIORITY_USERS if user in actual_senders]
+    
     prompt_with_priority = ANALYSIS_PROMPT
-    if PRIORITY_USERS:
-        priority_list = ', '.join(PRIORITY_USERS)
+    if relevant_priority_users:
+        priority_list = ', '.join(relevant_priority_users)
         prompt_with_priority = prompt_with_priority.replace('{PRIORITY_USERS}', priority_list)
+        skipped = len(PRIORITY_USERS) - len(relevant_priority_users)
+        if skipped > 0:
+            print(f"   👥 Приоритетные пользователи: {priority_list} (скрыто {skipped} отсутствующих в чате)")
+        else:
+            print(f"   👥 Приоритетные пользователи: {priority_list}")
+    else:
+        if PRIORITY_USERS:
+            prompt_with_priority = prompt_with_priority.replace('{PRIORITY_USERS}', 'приоритетных пользователей (нет в текущем чате)')
+            print(f"   👥 Приоритетные пользователи: нет в текущем чате (из {len(PRIORITY_USERS)} заданных)")
+        else:
+            prompt_with_priority = prompt_with_priority.replace('{PRIORITY_USERS}', 'приоритетных пользователей (не заданы)')
+            print(f"   👥 Приоритетные пользователи: не заданы")
     system_content = safe_str(prompt_with_priority)
     
     # Проверяем, нужно ли разбивать на чанки
