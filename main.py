@@ -160,7 +160,8 @@ CHUNK_DELAY_SECONDS = 10   # Задержка между запросами к A
 # Конфигурация разбиения на чанки (по символам)
 # Лимит контекста: 128,000 токенов
 # Целевое использование: ≤35% (~45,000 токенов ≈ 90,000 символов для кириллицы)
-CHUNK_MAX_CHARS = 90000     # Максимум символов в чанке (~35% контекста)
+# CHUNK_MAX_CHARS=70000 чтобы с запасом учесть system_content (~20k) и отступы JSON
+CHUNK_MAX_CHARS = 70000     # Максимум символов JSON-сообщений (итоговый запрос ~90k)
 CHUNK_OVERLAP_CHARS = int(CHUNK_MAX_CHARS * 0.05)  # Минимум перехлёста (5%)
 
 # Пути к конфигурационным файлам
@@ -1188,7 +1189,7 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
             optimized_structure = build_optimized_json_structure(
                 chunk_messages, chat_id_str, period_start_date=chunk_period_start
             )
-            messages_json = json.dumps(optimized_structure, ensure_ascii=False, indent=2)
+            messages_json = json.dumps(optimized_structure, ensure_ascii=False)
             
             # Примечание: Размер чанка уже проверен в split_messages_by_chars()
             # Эта проверка здесь на всякий случай
@@ -1341,7 +1342,7 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
     
     # Формируем JSON
     optimized_structure = build_optimized_json_structure(chunk_messages, chat_id_str, period_start_date=period_start_date)
-    messages_json = json.dumps(optimized_structure, ensure_ascii=False, indent=2)
+    messages_json = json.dumps(optimized_structure, ensure_ascii=False)
     
     # Проверяем размер и при необходимости ограничиваем
     if len(messages_json) > max_chars:
@@ -1358,7 +1359,7 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
         chunk_messages_limited = chunk_messages[-limit:]
         period_start_limited = chunk_messages_limited[0].get('date', '') if chunk_messages_limited else period_start_date
         optimized_structure = build_optimized_json_structure(chunk_messages_limited, chat_id_str, period_start_date=period_start_limited)
-        messages_json = json.dumps(optimized_structure, ensure_ascii=False, indent=2)
+        messages_json = json.dumps(optimized_structure, ensure_ascii=False)
     
     try:
         user_content = safe_str(f'Данные сообщений для анализа (JSON):\n\n{messages_json}')
@@ -2452,8 +2453,8 @@ async def process_chat_command(event, use_ai=True):
                 messages_data, optimized_messages, period_start_date, label="экспорта"
             )
             
-            # Создаем JSON строку
-            json_export = json.dumps(export_data, ensure_ascii=False, indent=2)
+            # Создаем JSON строку (компактный формат для внешнего анализа)
+            json_export = json.dumps(export_data, ensure_ascii=False)
             
             # Сохраняем в файл
             filename = f"export_{chat_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
