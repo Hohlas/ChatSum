@@ -995,6 +995,78 @@ def is_valid_summary(text):
     return True
 
 
+def clean_summary_response(text):
+    """
+    Очищает ответ от markdown code blocks и конвертирует JSON в читаемый текст.
+    Используется как финальная защита, когда AI всё равно возвращает JSON.
+    
+    Args:
+        text: Текст ответа от API (возможно с markdown code blocks и JSON)
+    
+    Returns:
+        Очищенный текстовый саммари
+    """
+    if not text:
+        return text
+    
+    text_stripped = text.strip()
+    
+    # Извлекаем содержимое из markdown code block
+    if text_stripped.startswith('```'):
+        lines = text_stripped.split('\n')
+        # Убираем первую строку (```json или ```)
+        if len(lines) > 1:
+            content_lines = []
+            for i, line in enumerate(lines[1:], 1):
+                # Нашли закрывающий ```
+                if line.strip() == '```':
+                    content_lines = lines[1:i]
+                    break
+            if content_lines:
+                text_stripped = '\n'.join(content_lines).strip()
+    
+    # Пробуем распарсить как JSON и сконвертировать в текст
+    if text_stripped.startswith('{'):
+        try:
+            data = json.loads(text_stripped)
+            # Конвертируем JSON структуру в читаемый текст
+            parts = []
+            
+            # Если есть topic и summary на верхнем уровне
+            if isinstance(data, dict):
+                if 'topic' in data and 'summary' in data:
+                    parts.append(f"💡 {data['topic']}")
+                    parts.append("")
+                    parts.append(data['summary'])
+                    if 'messages' in data and isinstance(data['messages'], list):
+                        parts.append("")
+                        parts.append("**Сообщения:**")
+                        for msg in data['messages']:
+                            if isinstance(msg, dict):
+                                author = msg.get('author', 'Unknown')
+                                text = msg.get('text', '')
+                                parts.append(f"- **{author}**: {text[:200]}{'...' if len(text) > 200 else ''}")
+                else:
+                    # Другая структура JSON - просто форматируем ключ-значение
+                    for key, value in data.items():
+                        if isinstance(value, str):
+                            parts.append(f"**{key}**: {value}")
+                        elif isinstance(value, list) and len(value) > 0:
+                            parts.append(f"**{key}**:")
+                            for item in value[:5]:  # Ограничиваем 5 элементами
+                                if isinstance(item, dict):
+                                    item_text = ', '.join(f"{k}: {v}" for k, v in list(item.items())[:2])
+                                    parts.append(f"  - {item_text}")
+                        else:
+                            parts.append(f"**{key}**: {str(value)[:100]}")
+            
+            return '\n'.join(parts) if parts else text_stripped
+        except json.JSONDecodeError:
+            pass  # Не валидный JSON, возвращаем как есть
+    
+    return text_stripped
+
+
 def split_summary_into_parts(summary_text):
     """
     Разбирает объединённый саммари на отдельные части для публикации в Telegraph.
@@ -1193,18 +1265,26 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                     # Retry с усиленным промптом
                     retry_valid_count = 0
                     max_valid_retries = 2
+                    validation_passed = False
                     while retry_valid_count <= max_valid_retries:
                         try:
                             response = await google_client.chat.completions.create(**request_params)
                             chunk_summary = response.choices[0].message.content
                             if is_valid_summary(chunk_summary):
                                 print(f"   ✅ Валидация пройдена после retry {retry_valid_count}")
+                                validation_passed = True
                                 break
                             retry_valid_count += 1
                             print(f"   ⚠️  Повторная попытка валидации {retry_valid_count}/{max_valid_retries}...")
                         except Exception as retry_valid_error:
                             print(f"   ⚠️  Ошибка при retry: {retry_valid_error}")
                             break
+                    
+                    # Если валидация так и не прошла - применяем очистку
+                    if not validation_passed:
+                        print(f"   ⚠️  Все retry исчерпаны, применяем очистку ответа...")
+                        chunk_summary = clean_summary_response(chunk_summary)
+                        print(f"   ✅ Ответ очищен и сконвертирован в текст")
                 
                 print(f"   ✅ Чанк {chunk_idx} обработан успешно")
                 
@@ -1348,6 +1428,13 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                     raise
         
         summary = response.choices[0].message.content
+        
+        # Проверяем, что ответ содержит саммари, а не JSON
+        if not is_valid_summary(summary):
+            print("   ⚠️  Ответ содержит JSON вместо текста, применяем очистку...")
+            summary = clean_summary_response(summary)
+            print("   ✅ Ответ очищен и сконвертирован в текст")
+        
         print("✅ Выжимка успешно создана")
         
         # Собираем статистику использования токенов
