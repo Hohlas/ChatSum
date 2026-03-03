@@ -1507,6 +1507,42 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         return error_msg, None
 
 
+# Разрешенные теги Telegraph (whitelist)
+TELEGRAPH_ALLOWED_TAGS = {
+    'a', 'aside', 'b', 'blockquote', 'br', 'code', 'em', 'figure', 'figcaption',
+    'h3', 'h4', 'hr', 'i', 'iframe', 'img', 'li', 'ol', 'p', 'pre', 's',
+    'strong', 'u', 'ul', 'video'
+}
+
+
+def sanitize_html_for_telegraph(html_content):
+    """
+    Удаляет HTML-теги, не разрешенные Telegraph API.
+    
+    Args:
+        html_content: HTML строка
+    
+    Returns:
+        HTML строка только с разрешенными тегами
+    """
+    if not html_content:
+        return html_content
+    
+    # Паттерн для поиска HTML тегов
+    tag_pattern = re.compile(r'<(/?)(\w+)[^>]*>')
+    
+    def replace_tag(match):
+        closing = match.group(1)  # '/' или ''
+        tag = match.group(2).lower()  # имя тега
+        
+        if tag in TELEGRAPH_ALLOWED_TAGS:
+            return match.group(0)  # Оставляем тег как есть
+        else:
+            return ''  # Удаляем неразрешенный тег
+    
+    return tag_pattern.sub(replace_tag, html_content)
+
+
 def convert_markdown_to_html(content):
     """
     Конвертирует Markdown текст в HTML.
@@ -1609,7 +1645,12 @@ def convert_markdown_to_html(content):
     if in_list:
         html_paragraphs.append('</ul>')
     
-    return ''.join(html_paragraphs)
+    html_content = ''.join(html_paragraphs)
+    
+    # Санитизация: удаляем теги, не разрешенные Telegraph
+    html_content = sanitize_html_for_telegraph(html_content)
+    
+    return html_content
 
 
 def save_analysis(messages_data, summary):
