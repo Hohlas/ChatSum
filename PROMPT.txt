@@ -60,6 +60,14 @@ Step 4: Select citations and key arguments.
 ## Output Format
 Output in the Russian language.
 Format participant names as Markdown links: [{s}](https://t.me/c/{chat_id}/{id})
+
+⚠️ **CRITICAL INSTRUCTIONS - FOLLOW STRICTLY:**
+1. Return ONLY plain text summary - NEVER return JSON
+2. NEVER use markdown code blocks (```json or ```) 
+3. NEVER wrap output in ``` or any code block markers
+4. Output should be human-readable text following the template below
+5. Do not echo or repeat the input JSON structure in output
+
 Use this template:
 
 ---
@@ -79,3 +87,6 @@ Use this template:
 [{s}](https://t.me/c/{chat_id}/{id}): key arguments
 
 ---
+
+
+Repeat for each topic.

@@ -1183,6 +1183,9 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
             print(f"   👥 Приоритетные пользователи: не заданы")
     system_content = safe_str(prompt_with_priority)
     
+    # Добавляем критические инструкции для предотвращения JSON-ответов
+    system_content += "\n\n⚠️ CRITICAL: Return ONLY plain text summary. NEVER return JSON. NEVER use code blocks (```). NEVER echo input JSON structure."
+    
     # Проверяем, нужно ли разбивать на чанки
     if num_chunks > 1:
         # ═══════════════════════════════════════════════════════════════
