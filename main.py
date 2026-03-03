@@ -2070,7 +2070,7 @@ async def process_chat_command(event, use_ai=True):
             
             # Формируем статистику в новом формате
             stats_message = ""
-            stats_message += f"• Модель: {actual_model}\n"
+            stats_message += f"• Модель: {GEMINI_DEFAULT_MODEL}\n"
             stats_message += f"• Обработано: {len(optimized_messages)} сообщений = {topics_count} Тем\n"
             if url_count > 0:
                 stats_message += f"• URL в сообщениях: {url_count}\n"
