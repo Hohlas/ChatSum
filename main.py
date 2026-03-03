@@ -153,9 +153,15 @@ NOISE_PATTERNS = [
 ]
 
 # Конфигурация разбиения на чанки для больших объемов сообщений
-CHUNK_SIZE = 500  # Количество сообщений в одном чанке
+CHUNK_SIZE = 500  # Количество сообщений в одном чанке (устарело, используется CHUNK_MAX_CHARS)
 CHUNK_OVERLAP = 0.1  # Перехлест между чанками (10% = 50 сообщений при CHUNK_SIZE=500)
 CHUNK_DELAY_SECONDS = 10   # Задержка между запросами к API (для соблюдения RPM лимита)
+
+# Конфигурация разбиения на чанки (по символам)
+# Лимит контекста: 128,000 токенов
+# Целевое использование: ≤35% (~45,000 токенов ≈ 90,000 символов для кириллицы)
+CHUNK_MAX_CHARS = 90000     # Максимум символов в чанке (~35% контекста)
+CHUNK_OVERLAP_CHARS = int(CHUNK_MAX_CHARS * 0.05)  # Минимум перехлёста (5%)
 
 # Пути к конфигурационным файлам
 EXCLUDED_USERS_FILE = 'EXCLUDED_USERS.txt'
@@ -916,6 +922,8 @@ def split_messages_into_chunks(messages_data, chunk_size=CHUNK_SIZE, overlap_rat
         - Чанк 1: [0:500] → сообщения 1-500
         - Чанк 2: [450:950] → сообщения 451-950
         - Чанк 3: [900:1300] → сообщения 901-1300
+    
+    Примечание: Эта функция устарела. Используйте split_messages_by_chars() для разбиения по символам.
     """
     total = len(messages_data)
     
@@ -947,6 +955,123 @@ def split_messages_into_chunks(messages_data, chunk_size=CHUNK_SIZE, overlap_rat
         start += step
     
     return chunks
+
+
+def estimate_message_json_size(message):
+    """
+    Оценивает размер сообщения в JSON представлении.
+    
+    Args:
+        message: Словарь с полями message_id, sender, text, reply_to
+    
+    Returns:
+        Примерный размер в символах JSON-строки
+    """
+    # Базовая структура: {"id":X,"s":"...","t":"...","r":X}
+    # +10% на экранирование кавычек и спецсимволов
+    base_size = 25  # {"id":,"s":"","t":""}
+    id_size = len(str(message.get('message_id', 0)))
+    sender_size = int(len(message.get('sender', '')) * 1.1)  # +10% на Unicode
+    text_size = int(len(message.get('text', '')) * 1.1)      # +10% на экранирование
+    reply_size = 15 if message.get('reply_to') else 0       # ,"r":X
+    
+    return base_size + id_size + sender_size + text_size + reply_size
+
+
+def split_messages_by_chars(messages_data, max_chars=CHUNK_MAX_CHARS, overlap_chars=CHUNK_OVERLAP_CHARS):
+    """
+    Разбивает список сообщений на чанки по количеству символов с перехлестом.
+    
+    Args:
+        messages_data: Список сообщений
+        max_chars: Максимальное количество символов в одном чанке
+        overlap_chars: Минимальное количество символов для перехлеста
+    
+    Returns:
+        Список кортежей: (chunk_messages, start_index, end_index)
+        где start_index и end_index - индексы в исходном списке (1-based для отображения)
+    
+    Пример:
+        - Чанк 1: [0:500] → сообщения 1-500 (≈85k символов)
+        - Чанк 2: [450:950] → сообщения 451-950 (перехлёст 50 сообщений)
+    """
+    chunks = []
+    current_chunk = []
+    current_size = 0
+    chunk_start_index = 0
+    
+    for idx, msg in enumerate(messages_data):
+        msg_size = estimate_message_json_size(msg)
+        
+        # Если сообщение превышает лимит одного чанка - обрезаем текст
+        if msg_size > max_chars:
+            # Обрезаем текст сообщения до максимально допустимого размера
+            msg = msg.copy()
+            max_text_size = max_chars - 50  # оставляем место для остальных полей
+            if len(msg.get('text', '')) > max_text_size:
+                msg['text'] = msg['text'][:max_text_size] + '... [обрезано]'
+            msg_size = estimate_message_json_size(msg)
+        
+        # Проверяем, влезет ли в текущий чанк
+        if current_size + msg_size > max_chars and current_chunk:
+            # Сохраняем текущий чанк
+            chunks.append((current_chunk, chunk_start_index + 1, idx))
+            
+            # Рассчитываем перехлёст
+            overlap_messages = []
+            overlap_size = 0
+            
+            # Идём с конца текущего чанка назад
+            for prev_msg in reversed(current_chunk):
+                prev_size = estimate_message_json_size(prev_msg)
+                
+                overlap_messages.insert(0, prev_msg)
+                overlap_size += prev_size
+                if overlap_size >= overlap_chars:
+                    break
+            
+            # Начинаем новый чанк с перехлёста
+            current_chunk = overlap_messages + [msg]
+            current_size = overlap_size + msg_size
+            chunk_start_index = idx - len(overlap_messages)
+        else:
+            current_chunk.append(msg)
+            current_size += msg_size
+    
+    # Добавляем последний чанк
+    if current_chunk:
+        chunks.append((current_chunk, chunk_start_index + 1, len(messages_data)))
+    
+    return chunks
+
+
+def is_valid_summary(text):
+    """
+    Проверяет, что ответ содержит саммари, а не сырой JSON.
+    
+    Args:
+        text: Текст ответа от API
+    
+    Returns:
+        True если ответ валидный (содержит текстовое саммари), False если это JSON
+    """
+    if not text:
+        return False
+    
+    # Если текст начинается с { или содержит "metadata": — это JSON
+    text_stripped = text.strip()
+    if text_stripped.startswith('{') and '"metadata"' in text_stripped:
+        return False
+    if text_stripped.startswith('```json'):
+        return False
+    if text_stripped.startswith('```'):
+        # Убираем ```json или ``` и проверяем снова
+        lines = text_stripped.split('\n')
+        if len(lines) > 1:
+            content = '\n'.join(lines[1:])
+            if content.strip().startswith('{'):
+                return False
+    return True
 
 
 def split_summary_into_parts(summary_text):
@@ -1044,9 +1169,7 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
         # ═══════════════════════════════════════════════════════════════
         # РЕЖИМ ЧАНКОВ: работаем с переданными чанками
         # ═══════════════════════════════════════════════════════════════
-        overlap_count = int(CHUNK_SIZE * CHUNK_OVERLAP)
-        
-        print(f"📦 Разбиение на {num_chunks} чанков (по {CHUNK_SIZE} сообщений, перехлест {overlap_count})")
+        print(f"📦 Разбиение на {num_chunks} чанков (по символам, max={CHUNK_MAX_CHARS}, перехлест={CHUNK_OVERLAP_CHARS})")
         
         chunk_summaries = []  # Список кортежей: (start_idx, end_idx, summary_text, is_error)
         total_usage = {
@@ -1067,18 +1190,10 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
             )
             messages_json = json.dumps(optimized_structure, ensure_ascii=False, indent=2)
             
-            # Проверяем размер чанка
+            # Примечание: Размер чанка уже проверен в split_messages_by_chars()
+            # Эта проверка здесь на всякий случай
             if len(messages_json) > max_chars:
-                # Чанк слишком большой - берем последние сообщения
-                ratio = max_chars / len(messages_json)
-                limit = int(chunk_size * ratio * 0.95)
-                print(f"   ⚠️  Чанк слишком большой, ограничиваем до {limit} сообщений")
-                chunk_messages_limited = chunk_messages[-limit:]
-                chunk_period_start = chunk_messages_limited[0].get('date', '') if chunk_messages_limited else chunk_period_start
-                optimized_structure = build_optimized_json_structure(
-                    chunk_messages_limited, chat_id_str, period_start_date=chunk_period_start
-                )
-                messages_json = json.dumps(optimized_structure, ensure_ascii=False, indent=2)
+                print(f"   ⚠️  Чанк слишком большой ({len(messages_json)} символов), используем ограничение")
             
             user_content = safe_str(f'Данные сообщений для анализа (JSON):\n\n{messages_json}')
             
@@ -1122,6 +1237,33 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
                             raise
                 
                 chunk_summary = response.choices[0].message.content
+                
+                # Проверяем, что ответ содержит саммари, а не JSON
+                if not is_valid_summary(chunk_summary):
+                    print(f"   ⚠️  Ответ содержит JSON вместо текста, повторяем с усиленным промптом...")
+                    # Добавляем усиленную инструкцию в промпт
+                    enhanced_system = system_content + "\n\nВАЖНО: Верни ТОЛЬКО текстовое саммари в виде обычного текста. НЕ возвращай JSON, НЕ используй кодовые блоки ```json. Пиши непосредственно текст."
+                    request_params['messages'] = [
+                        {'role': 'system', 'content': enhanced_system},
+                        {'role': 'user', 'content': user_content}
+                    ]
+                    
+                    # Retry с усиленным промптом
+                    retry_valid_count = 0
+                    max_valid_retries = 2
+                    while retry_valid_count <= max_valid_retries:
+                        try:
+                            response = await google_client.chat.completions.create(**request_params)
+                            chunk_summary = response.choices[0].message.content
+                            if is_valid_summary(chunk_summary):
+                                print(f"   ✅ Валидация пройдена после retry {retry_valid_count}")
+                                break
+                            retry_valid_count += 1
+                            print(f"   ⚠️  Повторная попытка валидации {retry_valid_count}/{max_valid_retries}...")
+                        except Exception as retry_valid_error:
+                            print(f"   ⚠️  Ошибка при retry: {retry_valid_error}")
+                            break
+                
                 print(f"   ✅ Чанк {chunk_idx} обработан успешно")
                 
                 # Собираем статистику токенов
@@ -1985,7 +2127,8 @@ async def process_chat_command(event, use_ai=True):
             print(f"\n📎 Найдено сообщений с URL: {url_count}")
         
         # Разбиваем сообщения на чанки заранее (используется и для предупреждения, и для анализа)
-        chunks = split_messages_into_chunks(optimized_messages)
+        # Используем разбиение по символам вместо количества сообщений
+        chunks = split_messages_by_chars(optimized_messages)
         num_chunks = len(chunks)
 
         # Предупреждение о больших запросах (особенно для AI анализа)
