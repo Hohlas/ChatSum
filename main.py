@@ -152,17 +152,13 @@ NOISE_PATTERNS = [
     r'^[👍👎👌✅❌🔥💪🎉😂😅]+$',  # Только эмодзи
 ]
 
-# Конфигурация разбиения на чанки для больших объемов сообщений
-CHUNK_SIZE = 500  # Количество сообщений в одном чанке (устарело, используется CHUNK_MAX_CHARS)
-CHUNK_OVERLAP = 0.1  # Перехлест между чанками (10% = 50 сообщений при CHUNK_SIZE=500)
-CHUNK_DELAY_SECONDS = 10   # Задержка между запросами к API (для соблюдения RPM лимита)
-
 # Конфигурация разбиения на чанки (по символам)
 # Лимит контекста: 128,000 токенов
 # Целевое использование: ≤35% (~45,000 токенов ≈ 90,000 символов для кириллицы)
 # CHUNK_MAX_CHARS=70000 чтобы с запасом учесть system_content (~20k) и отступы JSON
 CHUNK_MAX_CHARS = 70000     # Максимум символов JSON-сообщений (итоговый запрос ~90k)
 CHUNK_OVERLAP_CHARS = int(CHUNK_MAX_CHARS * 0.05)  # Минимум перехлёста (5%)
+CHUNK_DELAY_SECONDS = 10   # Задержка между запросами к API (для соблюдения RPM лимита)
 
 # Пути к конфигурационным файлам
 EXCLUDED_USERS_FILE = 'EXCLUDED_USERS.txt'
@@ -786,67 +782,6 @@ def safe_str(value):
     return str(value)
 
 
-# Функция больше не используется - перешли на плоскую структуру JSON
-# def build_tree_structure(messages_data):
-#     """
-#     Преобразует плоский список сообщений в древовидную структуру
-#     
-#     Args:
-#         messages_data: Плоский список сообщений с reply_to
-#     
-#     Returns:
-#         Список корневых сообщений с вложенными replies
-#     """
-#     # Создаем словарь для быстрого поиска сообщений по ID
-#     messages_by_id = {}
-#     # Отслеживаем, какие сообщения являются ответами (не должны быть в root_messages)
-#     is_reply = set()
-#     
-#     # Первый проход: создаем все объекты сообщений
-#     for msg in messages_data:
-#         msg_id = msg['message_id']
-#         messages_by_id[msg_id] = {
-#             'id': msg_id,
-#             's': msg['sender'],  # sender → s
-#             't': msg['text'],    # text → t
-#             'r': []               # replies → r
-#         }
-#     
-#     # Второй проход: строим дерево и отмечаем ответы
-#     for msg in messages_data:
-#         msg_id = msg['message_id']
-#         reply_to = msg.get('reply_to')
-#         
-#         current_msg = messages_by_id[msg_id]
-#         
-#         if reply_to and reply_to in messages_by_id:
-#             # Это ответ на существующее сообщение - добавляем в replies родителя
-#             messages_by_id[reply_to]['r'].append(current_msg)  # replies → r
-#             # Отмечаем, что это сообщение является ответом
-#             is_reply.add(msg_id)
-#         # Если reply_to отсутствует или родитель не найден, сообщение будет корневым
-#     
-#     # Собираем корневые сообщения (те, которые не являются ответами)
-#     root_messages = []
-#     for msg in messages_data:
-#         msg_id = msg['message_id']
-#         if msg_id not in is_reply:
-#             root_messages.append(messages_by_id[msg_id])
-#     
-#     # Удаляем пустые массивы replies для экономии токенов
-#     def clean_empty_replies(msg):
-#         if not msg['r']:  # replies → r
-#             del msg['r']
-#         else:
-#             for reply in msg['r']:  # replies → r
-#                 clean_empty_replies(reply)
-#     
-#     for msg in root_messages:
-#         clean_empty_replies(msg)
-#     
-#     return root_messages
-
-
 def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, total_messages=None, filtered_messages=None, period_start_date=None):
     """
     Формирует оптимизированную JSON структуру для экспорта/анализа
@@ -904,58 +839,6 @@ def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, t
         'metadata': metadata,
         'messages': flat_messages
     }
-
-
-def split_messages_into_chunks(messages_data, chunk_size=CHUNK_SIZE, overlap_ratio=CHUNK_OVERLAP):
-    """
-    Разбивает список сообщений на чанки с перехлестом.
-    
-    Args:
-        messages_data: Список сообщений
-        chunk_size: Размер одного чанка (количество сообщений)
-        overlap_ratio: Коэффициент перехлеста (0.1 = 10%)
-    
-    Returns:
-        Список кортежей: (chunk_messages, start_index, end_index)
-        где start_index и end_index - индексы в исходном списке (1-based для отображения)
-    
-    Пример для 1300 сообщений при chunk_size=500, overlap=50:
-        - Чанк 1: [0:500] → сообщения 1-500
-        - Чанк 2: [450:950] → сообщения 451-950
-        - Чанк 3: [900:1300] → сообщения 901-1300
-    
-    Примечание: Эта функция устарела. Используйте split_messages_by_chars() для разбиения по символам.
-    """
-    total = len(messages_data)
-    
-    if total <= chunk_size:
-        # Нет необходимости разбивать
-        return [(messages_data, 1, total)]
-    
-    overlap = int(chunk_size * overlap_ratio)
-    step = chunk_size - overlap  # Шаг между началами чанков
-    
-    chunks = []
-    start = 0
-    
-    while start < total:
-        end = min(start + chunk_size, total)
-        chunk = messages_data[start:end]
-        
-        # Индексы для отображения (1-based)
-        display_start = start + 1
-        display_end = end
-        
-        chunks.append((chunk, display_start, display_end))
-        
-        # Если достигли конца - выходим
-        if end >= total:
-            break
-        
-        # Следующий чанк начинается с перехлестом
-        start += step
-    
-    return chunks
 
 
 def estimate_message_json_size(message):
@@ -1498,6 +1381,111 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
         return error_msg, None
 
 
+def convert_markdown_to_html(content):
+    """
+    Конвертирует Markdown текст в HTML.
+    Общая функция для publish_to_telegraph и create_html_report.
+    
+    Args:
+        content: Markdown текст
+    
+    Returns:
+        HTML текст
+    """
+    lines = content.split('\n')
+    html_paragraphs = []
+    in_list = False
+    current_paragraph = []
+    
+    for line in lines:
+        line_stripped = line.strip()
+        
+        # Пустая строка - завершаем текущий параграф
+        if not line_stripped:
+            if current_paragraph:
+                para_text = '<br>'.join(current_paragraph)
+                para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
+                para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
+                para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
+                html_paragraphs.append(f'<p>{para_text}</p>')
+                current_paragraph = []
+            if in_list:
+                html_paragraphs.append('</ul>')
+                in_list = False
+            continue
+        
+        # Разделитель тем
+        if line_stripped == '---':
+            if current_paragraph:
+                para_text = '<br>'.join(current_paragraph)
+                para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
+                para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
+                para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
+                html_paragraphs.append(f'<p>{para_text}</p>')
+                current_paragraph = []
+            if in_list:
+                html_paragraphs.append('</ul>')
+                in_list = False
+            html_paragraphs.append('<hr>')
+            continue
+        
+        # Заголовок темы (начинается с 💡)
+        if line_stripped.startswith('💡'):
+            if current_paragraph:
+                para_text = '<br>'.join(current_paragraph)
+                para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
+                para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
+                para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
+                html_paragraphs.append(f'<p>{para_text}</p>')
+                current_paragraph = []
+            if in_list:
+                html_paragraphs.append('</ul>')
+                in_list = False
+            text = line_stripped
+            text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+            text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', text)
+            html_paragraphs.append(f'<h3>{text}</h3>')
+            continue
+        
+        # Пункт списка (может быть - или • или *)
+        if line_stripped.startswith('- ') or line_stripped.startswith('* ') or line_stripped.startswith('• '):
+            if current_paragraph:
+                para_text = '<br>'.join(current_paragraph)
+                para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
+                para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
+                para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
+                html_paragraphs.append(f'<p>{para_text}</p>')
+                current_paragraph = []
+            if not in_list:
+                html_paragraphs.append('<ul>')
+                in_list = True
+            text = line_stripped.lstrip('- *•').strip()
+            text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+            text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', text)
+            text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', text)
+            html_paragraphs.append(f'<li>{text}</li>')
+            continue
+        
+        # Обычная строка - добавляем к текущему параграфу
+        if in_list:
+            html_paragraphs.append('</ul>')
+            in_list = False
+        current_paragraph.append(line_stripped)
+    
+    # Завершаем последний параграф
+    if current_paragraph:
+        para_text = '<br>'.join(current_paragraph)
+        para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
+        para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
+        para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
+        html_paragraphs.append(f'<p>{para_text}</p>')
+    
+    if in_list:
+        html_paragraphs.append('</ul>')
+    
+    return ''.join(html_paragraphs)
+
+
 def save_analysis(messages_data, summary):
     """Сохраняет результаты анализа в JSON файл
     
@@ -1637,106 +1625,8 @@ async def publish_to_telegraph(title, content, author_name="Chat Filter Bot", te
             else:
                 telegraph = telegraph_client
             
-            # Конвертируем Markdown в HTML для Telegraph
-            # Telegraph поддерживает только определённые теги: a, aside, b, blockquote, br, code, em, figcaption, figure, h3, h4, hr, i, iframe, img, li, ol, p, pre, s, strong, u, ul, video
-            
-            # Разбиваем на строки для построчной обработки
-            lines = content.split('\n')
-            html_paragraphs = []
-            in_list = False
-            current_paragraph = []
-            
-            for line in lines:
-                line_stripped = line.strip()
-                
-                # Пустая строка - завершаем текущий параграф
-                if not line_stripped:
-                    if current_paragraph:
-                        # Объединяем накопленные строки параграфа с переносами
-                        para_text = '<br>'.join(current_paragraph)
-                        # Конвертируем Markdown элементы
-                        para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                        para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                        para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-                        html_paragraphs.append(f'<p>{para_text}</p>')
-                        current_paragraph = []
-                    if in_list:
-                        html_paragraphs.append('</ul>')
-                        in_list = False
-                    continue
-                
-                # Разделитель тем
-                if line_stripped == '---':
-                    if current_paragraph:
-                        para_text = '<br>'.join(current_paragraph)
-                        para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                        para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                        para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-                        html_paragraphs.append(f'<p>{para_text}</p>')
-                        current_paragraph = []
-                    if in_list:
-                        html_paragraphs.append('</ul>')
-                        in_list = False
-                    html_paragraphs.append('<hr>')
-                    continue
-                
-                # Заголовок темы (начинается с 💡)
-                if line_stripped.startswith('💡'):
-                    if current_paragraph:
-                        para_text = '<br>'.join(current_paragraph)
-                        para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                        para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                        para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-                        html_paragraphs.append(f'<p>{para_text}</p>')
-                        current_paragraph = []
-                    if in_list:
-                        html_paragraphs.append('</ul>')
-                        in_list = False
-                    # Конвертируем Markdown в заголовке
-                    text = line_stripped
-                    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)  # **text** -> <b>text</b>
-                    text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', text)    # *text* -> <i>text</i>
-                    html_paragraphs.append(f'<h3>{text}</h3>')
-                    continue
-                
-                # Список
-                if line_stripped.startswith('- ') or line_stripped.startswith('* '):
-                    if current_paragraph:
-                        para_text = '<br>'.join(current_paragraph)
-                        para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                        para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                        para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-                        html_paragraphs.append(f'<p>{para_text}</p>')
-                        current_paragraph = []
-                    if not in_list:
-                        html_paragraphs.append('<ul>')
-                        in_list = True
-                    item_text = line_stripped.lstrip('- *').strip()
-                    # Конвертируем Markdown элементы в списке
-                    item_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', item_text)
-                    item_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', item_text)
-                    item_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', item_text)
-                    html_paragraphs.append(f'<li>{item_text}</li>')
-                    continue
-                
-                # Обычная строка - добавляем к текущему параграфу
-                if in_list:
-                    html_paragraphs.append('</ul>')
-                    in_list = False
-                current_paragraph.append(line_stripped)
-            
-            # Завершаем последний параграф
-            if current_paragraph:
-                para_text = '<br>'.join(current_paragraph)
-                para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-                html_paragraphs.append(f'<p>{para_text}</p>')
-            
-            if in_list:
-                html_paragraphs.append('</ul>')
-        
-            html_content = ''.join(html_paragraphs)
+            # Конвертируем Markdown в HTML (используем общую функцию)
+            html_content = convert_markdown_to_html(content)
             
             # Публикуем статью
             response = await asyncio.to_thread(
@@ -1794,73 +1684,8 @@ def create_html_report(title, content, author_name="Chat Filter Bot"):
             os.makedirs(reports_dir)
             print(f"📁 Создана папка {reports_dir}/")
         
-        # Конвертируем Markdown в HTML (используем ту же логику что и для Telegraph)
-        lines = content.split('\n')
-        html_paragraphs = []
-        in_list = False
-        current_paragraph = []
-        
-        for line in lines:
-            line_stripped = line.strip()
-            
-            # Пустая строка - завершаем текущий параграф
-            if not line_stripped:
-                if current_paragraph:
-                    para_text = '<br>'.join(current_paragraph)
-                    para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                    para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                    para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-                    html_paragraphs.append(f'<p>{para_text}</p>')
-                    current_paragraph = []
-                if in_list:
-                    html_paragraphs.append('</ul>')
-                    in_list = False
-                continue
-            
-            # Разделитель тем
-            if line_stripped == '---':
-                if current_paragraph:
-                    para_text = '<br>'.join(current_paragraph)
-                    para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                    para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                    para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-                    html_paragraphs.append(f'<p>{para_text}</p>')
-                    current_paragraph = []
-                if in_list:
-                    html_paragraphs.append('</ul>')
-                    in_list = False
-                html_paragraphs.append('<hr>')
-                continue
-            
-            # Заголовок темы (начинается с 💡)
-            if line_stripped.startswith('💡'):
-                if current_paragraph:
-                    para_text = '<br>'.join(current_paragraph)
-                    para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                    para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                    para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-                    html_paragraphs.append(f'<p>{para_text}</p>')
-                    current_paragraph = []
-                if in_list:
-                    html_paragraphs.append('</ul>')
-                    in_list = False
-                text = line_stripped
-                text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
-                text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', text)
-                html_paragraphs.append(f'<h3>{text}</h3>')
-                continue
-            
-            # Пункт списка
-            if line_stripped.startswith('• '):
-                if current_paragraph:
-                    para_text = '<br>'.join(current_paragraph)
-                    para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                    para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                    para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-                    html_paragraphs.append(f'<p>{para_text}</p>')
-                    current_paragraph = []
-                if not in_list:
-                    html_paragraphs.append('<ul>')
+        # Конвертируем Markdown в HTML (используем общую функцию)
+        html_body = convert_markdown_to_html(content)
                     in_list = True
                 text = line_stripped[2:]
                 text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
@@ -2081,25 +1906,25 @@ async def process_chat_command(event, use_ai=True):
         limit = None
         
         # Обрабатываем параметры
+        # Поддерживаем форматы: /sum 3h, /sum 2d, /sum 100, /sum 1d 6h
         if len(parts) > 1:
-            param = parts[1].lower()
-            
-            # Проверяем, что это - время или количество
-            if 'h' in param:
-                hours = int(param.replace('h', ''))
-            elif 'd' in param:
-                days = int(param.replace('d', ''))
-            elif param.isdigit():
-                # Это количество сообщений
-                limit = int(param)
-            
-            # Если есть второй параметр (например, 3d 6h)
-            if len(parts) > 2:
-                param2 = parts[2].lower()
-                if 'h' in param2:
-                    hours = int(param2.replace('h', ''))
-                elif 'd' in param2:
-                    days = int(param2.replace('d', ''))
+            # Обрабатываем все параметры (может быть несколько, напр. "1d 6h")
+            for param in parts[1:]:
+                param_clean = param.lower().strip()
+                
+                if param_clean.endswith('h'):
+                    # Параметр часов
+                    hours_val = int(param_clean.replace('h', ''))
+                    if hours_val > 0:
+                        hours = hours_val
+                elif param_clean.endswith('d'):
+                    # Параметр дней
+                    days_val = int(param_clean.replace('d', ''))
+                    if days_val > 0:
+                        days = days_val
+                elif param_clean.isdigit():
+                    # Это количество сообщений
+                    limit = int(param_clean)
         
         # Если ничего не указано, по умолчанию 24 часа
         if hours is None and days is None and limit is None:
