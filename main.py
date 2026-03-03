@@ -13,6 +13,11 @@ import httpx
 from telegraph import Telegraph
 from telegraph.exceptions import RetryAfterError
 
+# Скомпилированные регулярные выражения для конвертации Markdown в HTML
+MD_BOLD_RE = re.compile(r'\*\*(.*?)\*\*')
+MD_ITALIC_RE = re.compile(r'\*([^\*]+)\*')
+MD_LINK_RE = re.compile(r'\[([^\]]+)\]\(([^\)]+)\)')
+
 
 def ensure_private_file():
     """
@@ -1044,13 +1049,19 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
         print(f"   ⚡ Используем стандартную модель: {actual_model}")
     
     # Определяем лимиты контекста в зависимости от модели (в токенах)
-    context_limits = {
-        GEMINI_DEFAULT_MODEL: 128000
+    CONTEXT_LIMITS = {
+        'gemini-1.5-flash': 128000,
+        'gemini-1.5-flash-latest': 128000,
+        'gemini-1.5-pro': 2000000,
+        'gemini-1.5-pro-latest': 2000000,
+        'gemini-2.0-flash': 1048576,
+        'gemini-2.0-flash-lite': 1048576,
     }
-    
-    max_tokens = context_limits.get(actual_model, 128000)
+
+    max_tokens = CONTEXT_LIMITS.get(actual_model, 128000)
     max_chars = int(max_tokens * 2.5 * 0.8)  # Для кириллицы с запасом 20%
-    
+
+    print(f"   🤖 Модель: {actual_model}")
     print(f"   📊 Лимит контекста: {max_tokens:,} токенов ({max_chars:,} символов для кириллицы)")
     
     # Подготовка промпта с приоритетными пользователями
@@ -1416,9 +1427,9 @@ def convert_markdown_to_html(content):
         if not line_stripped:
             if current_paragraph:
                 para_text = '<br>'.join(current_paragraph)
-                para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
+                para_text = MD_BOLD_RE.sub(r'<b>\1</b>', para_text)
+                para_text = MD_ITALIC_RE.sub(r'<i>\1</i>', para_text)
+                para_text = MD_LINK_RE.sub(r'<a href="\2">\1</a>', para_text)
                 html_paragraphs.append(f'<p>{para_text}</p>')
                 current_paragraph = []
             if in_list:
@@ -1430,9 +1441,9 @@ def convert_markdown_to_html(content):
         if line_stripped == '---':
             if current_paragraph:
                 para_text = '<br>'.join(current_paragraph)
-                para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
+                para_text = MD_BOLD_RE.sub(r'<b>\1</b>', para_text)
+                para_text = MD_ITALIC_RE.sub(r'<i>\1</i>', para_text)
+                para_text = MD_LINK_RE.sub(r'<a href="\2">\1</a>', para_text)
                 html_paragraphs.append(f'<p>{para_text}</p>')
                 current_paragraph = []
             if in_list:
@@ -1445,17 +1456,17 @@ def convert_markdown_to_html(content):
         if line_stripped.startswith('💡'):
             if current_paragraph:
                 para_text = '<br>'.join(current_paragraph)
-                para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
+                para_text = MD_BOLD_RE.sub(r'<b>\1</b>', para_text)
+                para_text = MD_ITALIC_RE.sub(r'<i>\1</i>', para_text)
+                para_text = MD_LINK_RE.sub(r'<a href="\2">\1</a>', para_text)
                 html_paragraphs.append(f'<p>{para_text}</p>')
                 current_paragraph = []
             if in_list:
                 html_paragraphs.append('</ul>')
                 in_list = False
             text = line_stripped
-            text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
-            text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', text)
+            text = MD_BOLD_RE.sub(r'<b>\1</b>', text)
+            text = MD_ITALIC_RE.sub(r'<i>\1</i>', text)
             html_paragraphs.append(f'<h3>{text}</h3>')
             continue
         
@@ -1463,9 +1474,9 @@ def convert_markdown_to_html(content):
         if line_stripped.startswith('- ') or line_stripped.startswith('* ') or line_stripped.startswith('• '):
             if current_paragraph:
                 para_text = '<br>'.join(current_paragraph)
-                para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-                para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-                para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
+                para_text = MD_BOLD_RE.sub(r'<b>\1</b>', para_text)
+                para_text = MD_ITALIC_RE.sub(r'<i>\1</i>', para_text)
+                para_text = MD_LINK_RE.sub(r'<a href="\2">\1</a>', para_text)
                 html_paragraphs.append(f'<p>{para_text}</p>')
                 current_paragraph = []
             if not in_list:
@@ -1698,29 +1709,6 @@ def create_html_report(title, content, author_name="Chat Filter Bot"):
         
         # Конвертируем Markdown в HTML (используем общую функцию)
         html_body = convert_markdown_to_html(content)
-                    in_list = True
-                text = line_stripped[2:]
-                text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
-                text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', text)
-                text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', text)
-                html_paragraphs.append(f'<li>{text}</li>')
-                continue
-            
-            # Обычный текст - добавляем в текущий параграф
-            current_paragraph.append(line_stripped)
-        
-        # Завершаем оставшийся параграф
-        if current_paragraph:
-            para_text = '<br>'.join(current_paragraph)
-            para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-            para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
-            para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
-            html_paragraphs.append(f'<p>{para_text}</p>')
-        
-        if in_list:
-            html_paragraphs.append('</ul>')
-        
-        html_body = ''.join(html_paragraphs)
         
         # Создаем полноценный HTML документ со стилями в стиле Telegraph
         html_template = f'''<!DOCTYPE html>
@@ -2082,6 +2070,7 @@ async def process_chat_command(event, use_ai=True):
             
             # Формируем статистику в новом формате
             stats_message = ""
+            stats_message += f"• Модель: {actual_model}\n"
             stats_message += f"• Обработано: {len(optimized_messages)} сообщений = {topics_count} Тем\n"
             if url_count > 0:
                 stats_message += f"• URL в сообщениях: {url_count}\n"
