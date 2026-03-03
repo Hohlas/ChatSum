@@ -489,7 +489,12 @@ async def get_or_create_topic(chat_name):
             ))
             
             # Получаем ID созданной темы из ответа
-            topic_id = result.updates[0].id if hasattr(result, 'updates') and result.updates else None
+            topic_id = None
+            if hasattr(result, 'updates') and result.updates:
+                if hasattr(result.updates[0], 'id'):
+                    topic_id = result.updates[0].id
+                else:
+                    print(f"⚠️ Неожиданная струкция updates: {type(result.updates[0])}")
             print(f"✅ Создана новая тема: {chat_name} (ID: {topic_id})")
             return topic_id
         except Exception as e:
@@ -522,6 +527,31 @@ def is_noise_message(text):
             return True
     
     return False
+
+
+def get_sender_name(sender) -> str:
+    """
+    Извлекает имя отправителя из объекта sender.
+    
+    Args:
+        sender: Объект отправителя от Telegram API
+    
+    Returns:
+        Имя отправителя в виде строки
+    """
+    if sender is None:
+        return "Unknown"
+    
+    if hasattr(sender, 'first_name'):
+        name = sender.first_name or ""
+        if hasattr(sender, 'last_name') and sender.last_name:
+            name += f" {sender.last_name}"
+        return name.strip() or "Unknown"
+    
+    if hasattr(sender, 'title'):
+        return sender.title or "Unknown"
+    
+    return "Unknown"
 
 
 def optimize_messages(messages_data, chat_id_str):
@@ -642,14 +672,7 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None):
                 break
             if message.text:
                 sender = await message.get_sender()
-                sender_name = "Unknown"
-                
-                if hasattr(sender, 'first_name'):
-                    sender_name = sender.first_name
-                    if hasattr(sender, 'last_name') and sender.last_name:
-                        sender_name += f" {sender.last_name}"
-                elif hasattr(sender, 'title'):
-                    sender_name = sender.title
+                sender_name = get_sender_name(sender)
                 
                 # Добавляем информацию об ответе на сообщение (если есть)
                 reply_to = None
@@ -693,14 +716,7 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None):
             
             if message.text:
                 sender = await message.get_sender()
-                sender_name = "Unknown"
-                
-                if hasattr(sender, 'first_name'):
-                    sender_name = sender.first_name
-                    if hasattr(sender, 'last_name') and sender.last_name:
-                        sender_name += f" {sender.last_name}"
-                elif hasattr(sender, 'title'):
-                    sender_name = sender.title
+                sender_name = get_sender_name(sender)
                 
                 # Добавляем информацию об ответе на сообщение (если есть)
                 reply_to = None
@@ -740,14 +756,7 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None):
             for msg in missing_messages:
                 if msg and msg.text and not isinstance(msg, list):
                     sender = await msg.get_sender()
-                    sender_name = "Unknown"
-                    
-                    if hasattr(sender, 'first_name'):
-                        sender_name = sender.first_name
-                        if hasattr(sender, 'last_name') and sender.last_name:
-                            sender_name += f" {sender.last_name}"
-                    elif hasattr(sender, 'title'):
-                        sender_name = sender.title
+                    sender_name = get_sender_name(sender)
                     
                     # Проверяем есть ли у догруженного сообщения свой reply_to
                     reply_to = None
@@ -909,10 +918,13 @@ def split_messages_by_chars(messages_data, max_chars=CHUNK_MAX_CHARS, overlap_ch
             for prev_msg in reversed(current_chunk):
                 prev_size = estimate_message_json_size(prev_msg)
                 
-                overlap_messages.insert(0, prev_msg)
+                overlap_messages.append(prev_msg)
                 overlap_size += prev_size
                 if overlap_size >= overlap_chars:
                     break
+            
+            # Разворачиваем список (быстрее чем insert(0) в цикле)
+            overlap_messages.reverse()
             
             # Начинаем новый чанк с перехлёста
             current_chunk = overlap_messages + [msg]
@@ -2039,7 +2051,7 @@ async def process_chat_command(event, use_ai=True):
             )
             
             # Вычисляем длительность для вывода
-            period_hours = None
+            # Используем результат calculate_period_info
             period_text = ""
             if period_start_dt and period_end_dt:
                 delta = period_end_dt - period_start_dt
@@ -2308,7 +2320,7 @@ async def process_chat_command(event, use_ai=True):
                 f.write(json_export)
             
             # Вычисляем длительность для caption
-            period_hours = None
+            # Используем результат calculate_period_info
             period_text = ""
             if period_start_dt and period_end_dt:
                 delta = period_end_dt - period_start_dt
