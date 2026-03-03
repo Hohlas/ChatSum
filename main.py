@@ -4,6 +4,7 @@ import random
 import re
 import shutil
 import time
+from collections import Counter
 from telethon import TelegramClient, events
 from openai import AsyncOpenAI, AuthenticationError, APIStatusError
 from dotenv import load_dotenv
@@ -17,6 +18,9 @@ from telegraph.exceptions import RetryAfterError
 MD_BOLD_RE = re.compile(r'\*\*(.*?)\*\*')
 MD_ITALIC_RE = re.compile(r'\*([^\*]+)\*')
 MD_LINK_RE = re.compile(r'\[([^\]]+)\]\(([^\)]+)\)')
+
+# Блокировка для синхронизации доступа к глобальным конфигурационным переменным
+config_lock = asyncio.Lock()
 
 
 def ensure_private_file():
@@ -580,10 +584,11 @@ def optimize_messages(messages_data, chat_id_str):
     unique_senders = set()
     
     for msg in messages_data:
-        unique_senders.add(msg['sender'])
+        sender = msg.get('sender')
+        unique_senders.add(sender)
         
         # Фильтруем исключенных пользователей
-        if msg['sender'] in EXCLUDED_USERS:
+        if sender and sender in EXCLUDED_USERS:
             excluded_count += 1
             continue
         
@@ -607,11 +612,12 @@ def optimize_messages(messages_data, chat_id_str):
     # Диагностика приоритетных пользователей
     if PRIORITY_USERS:
         print(f"\n🔍 Проверка приоритетных пользователей:")
+        # Оптимизация: используем Counter для O(n) вместо O(n*m)
+        sender_counts = Counter(msg['sender'] for msg in optimized)
         for priority_user in PRIORITY_USERS:
             if priority_user in unique_senders:
-                # Считаем сообщения от приоритетного пользователя
-                priority_msg_count = sum(1 for msg in optimized if msg['sender'] == priority_user)
-                print(f"   ✅ {priority_user}: найдено {priority_msg_count} сообщений")
+                count = sender_counts.get(priority_user, 0)
+                print(f"   ✅ {priority_user}: найдено {count} сообщений")
             else:
                 print(f"   ⚠️  {priority_user}: НЕ найден в сообщениях")
     
@@ -741,8 +747,13 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None):
     # Сортируем по времени (от старых к новым)
     messages_data.reverse()
     
+    # Проверяем, есть ли сообщения перед доступом к messages_data[0]
+    if not messages_data:
+        print("⚠️ Нет текстовых сообщений за указанный период")
+        return [], chat_id_str, ''
+    
     # Сохраняем дату первого сообщения исходного периода (ДО догрузки родительских)
-    period_start_date = messages_data[0].get('date', '') if messages_data else ''
+    period_start_date = messages_data[0].get('date', '')
     initial_messages_count = len(messages_data)
     
     print(f"✅ Загружено {len(messages_data)} сообщений")
@@ -959,19 +970,28 @@ def is_valid_summary(text):
     if not text:
         return False
     
-    # Если текст начинается с { или содержит "metadata": — это JSON
     text_stripped = text.strip()
-    if text_stripped.startswith('{') and '"metadata"' in text_stripped:
-        return False
-    if text_stripped.startswith('```json'):
-        return False
-    if text_stripped.startswith('```'):
-        # Убираем ```json или ``` и проверяем снова
+    
+    # Пытаемся распарсить как JSON
+    if text_stripped.startswith('{'):
+        try:
+            json.loads(text_stripped)
+            return False  # Это валидный JSON - значит саммари нет
+        except json.JSONDecodeError:
+            pass  # Не валидный JSON, значит это текст
+    
+    # Проверка на markdown code block с JSON
+    if text_stripped.startswith('```json') or text_stripped.startswith('```'):
         lines = text_stripped.split('\n')
         if len(lines) > 1:
-            content = '\n'.join(lines[1:])
-            if content.strip().startswith('{'):
-                return False
+            content = '\n'.join(lines[1:]).strip()
+            if content.startswith('{'):
+                try:
+                    json.loads(content)
+                    return False
+                except json.JSONDecodeError:
+                    pass
+    
     return True
 
 
@@ -1016,7 +1036,7 @@ def split_summary_into_parts(summary_text):
     return parts
 
 
-async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_reasoning=False, period_start_date=None):
+async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, period_start_date=None):
     """
     Создает выжимку из сообщений с помощью Google Gemini.
     Использует предварительно разбитые на чанки сообщения.
@@ -1024,7 +1044,7 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
     Args:
         chunks: Список кортежей (chunk_messages, start_index, end_index)
         chat_id_str: ID чата для ссылок
-        model: Название модели (например, значение из GEMINI_MODEL)
+        model: Название модели (например, значение из GEMINI_MODEL). Если None, используется GEMINI_DEFAULT_MODEL
         use_reasoning: Использовать ли reasoning режим (для моделей с поддержкой)
         period_start_date: Дата начала периода для метаданных
     
@@ -1034,11 +1054,10 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
     if not chunks:
         return "❌ Нет сообщений для анализа за указанный период (все отфильтровано)", None
     
-    # Используем модель Google Gemini из private.txt
-    if not GEMINI_DEFAULT_MODEL:
+    # Используем переданную модель или модель по умолчанию
+    actual_model = model or GEMINI_DEFAULT_MODEL
+    if not actual_model:
         return "❌ В private.txt не задана переменная GEMINI_MODEL", None
-    
-    actual_model = GEMINI_DEFAULT_MODEL
     total_messages = sum(len(c[0]) for c in chunks)
     num_chunks = len(chunks)
     
@@ -1125,13 +1144,8 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
             
             user_content = safe_str(f'Данные сообщений для анализа (JSON):\n\n{messages_json}')
             
-            # Проверяем кодировку
-            try:
-                system_content.encode('utf-8')
-                user_content.encode('utf-8')
-            except UnicodeEncodeError as ue:
-                print(f"   ⚠️  Ошибка кодировки в контенте: {ue}")
-                user_content = user_content.encode('utf-8', errors='ignore').decode('utf-8')
+            # Санитизация: удаляем NULL bytes которые могут быть проблемой
+            user_content = user_content.replace('\x00', '')
             
             request_params = {
                 'model': actual_model,
@@ -1276,6 +1290,11 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
         print(f"⚠️  Данных слишком много ({len(messages_json)} символов)")
         print(f"   Максимум для модели {actual_model}: {max_chars} символов")
         
+        # Защита от деления на ноль и слишком маленьких данных
+        if len(messages_json) < 100:
+            print("⚠️ Слишком мало данных для анализа")
+            return "❌ Недостаточно данных для анализа", None
+        
         ratio = max_chars / len(messages_json)
         limit = int(total_messages * ratio * 0.95)
         
@@ -1291,14 +1310,8 @@ async def create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_re
     try:
         user_content = safe_str(f'Данные сообщений для анализа (JSON):\n\n{messages_json}')
         
-        # Проверяем кодировку
-        try:
-            system_content.encode('utf-8')
-            user_content.encode('utf-8')
-        except UnicodeEncodeError as ue:
-            print(f"⚠️  Ошибка кодировки в контенте: {ue}")
-            system_content = system_content.encode('utf-8', errors='ignore').decode('utf-8')
-            user_content = user_content.encode('utf-8', errors='ignore').decode('utf-8')
+        # Санитизация: удаляем NULL bytes которые могут быть проблемой
+        user_content = user_content.replace('\x00', '')
         
         request_params = {
             'model': actual_model,
@@ -1513,7 +1526,7 @@ def save_analysis(messages_data, summary):
     """Сохраняет результаты анализа в JSON файл
     
     Returns:
-        str: Имя созданного файла
+        str: Имя созданного файла или None в случае ошибки
     """
     result = {
         'timestamp': datetime.now().isoformat(),
@@ -1523,11 +1536,14 @@ def save_analysis(messages_data, summary):
     }
     
     filename = f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    
-    print(f"💾 Результаты сохранены в {filename}")
-    return filename
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        print(f"💾 Результаты сохранены в {filename}")
+        return filename
+    except Exception as e:
+        print(f"❌ Ошибка сохранения анализа: {e}")
+        return None
 
 
 def calculate_period_info(messages_data, optimized_messages, period_start_date, label="анализа"):
@@ -1894,9 +1910,11 @@ async def process_chat_command(event, use_ai=True):
         message_text = event.raw_text
         parts = message_text.split()
         
-        # Логируем получение команды
+        # Получаем чат один раз и используем для логирования и далее
         chat = await event.get_chat()
         chat_name_log = chat.title if hasattr(chat, 'title') else "Private"
+        chat_name = chat.title if hasattr(chat, 'title') else "чата"
+        
         command_name = "/sum" if use_ai else "/copy"
         params = " ".join(parts[1:]) if len(parts) > 1 else "(по умолчанию 24h)"
         print(f"\n📥 Команда: {command_name} {params} | Чат: {chat_name_log}")
@@ -1929,10 +1947,6 @@ async def process_chat_command(event, use_ai=True):
         # Если ничего не указано, по умолчанию 24 часа
         if hours is None and days is None and limit is None:
             hours = 24
-        
-        # Получаем название чата для информации
-        chat = await event.get_chat()
-        chat_name = chat.title if hasattr(chat, 'title') else "чата"
         
         # Удаляем команду из чата (для приватности)
         await event.delete()
@@ -2480,15 +2494,16 @@ async def handle_add_excluded_command(event):
     username = event.pattern_match.group(1).strip()
     print(f"\n📥 Команда: /add_excluded {username} | Чат: {chat_name}")
     
-    if username in EXCLUDED_USERS:
-        text = f"⚠️ Пользователь **{username}** уже в списке исключенных"
-    else:
-        EXCLUDED_USERS.append(username)
-        if save_users_to_file(EXCLUDED_USERS_FILE, EXCLUDED_USERS):
-            text = f"✅ Пользователь **{username}** добавлен в исключенные\n\nТекущий список ({len(EXCLUDED_USERS)}): {', '.join(EXCLUDED_USERS)}"
+    async with config_lock:
+        if username in EXCLUDED_USERS:
+            text = f"⚠️ Пользователь **{username}** уже в списке исключенных"
         else:
-            EXCLUDED_USERS.remove(username)  # Откатываем изменение
-            text = f"❌ Ошибка при сохранении в файл"
+            EXCLUDED_USERS.append(username)
+            if save_users_to_file(EXCLUDED_USERS_FILE, EXCLUDED_USERS):
+                text = f"✅ Пользователь **{username}** добавлен в исключенные\n\nТекущий список ({len(EXCLUDED_USERS)}): {', '.join(EXCLUDED_USERS)}"
+            else:
+                EXCLUDED_USERS.remove(username)  # Откатываем изменение
+                text = f"❌ Ошибка при сохранении в файл"
     
     await event.delete()
     topic_id = await get_or_create_topic(chat_name)
@@ -2504,15 +2519,16 @@ async def handle_remove_excluded_command(event):
     username = event.pattern_match.group(1).strip()
     print(f"\n📥 Команда: /remove_excluded {username} | Чат: {chat_name}")
     
-    if username not in EXCLUDED_USERS:
-        text = f"⚠️ Пользователь **{username}** не найден в списке исключенных"
-    else:
-        EXCLUDED_USERS.remove(username)
-        if save_users_to_file(EXCLUDED_USERS_FILE, EXCLUDED_USERS):
-            text = f"✅ Пользователь **{username}** удален из исключенных\n\nТекущий список ({len(EXCLUDED_USERS)}): {', '.join(EXCLUDED_USERS) if EXCLUDED_USERS else 'Пуст'}"
+    async with config_lock:
+        if username not in EXCLUDED_USERS:
+            text = f"⚠️ Пользователь **{username}** не найден в списке исключенных"
         else:
-            EXCLUDED_USERS.append(username)  # Откатываем изменение
-            text = f"❌ Ошибка при сохранении в файл"
+            EXCLUDED_USERS.remove(username)
+            if save_users_to_file(EXCLUDED_USERS_FILE, EXCLUDED_USERS):
+                text = f"✅ Пользователь **{username}** удален из исключенных\n\nТекущий список ({len(EXCLUDED_USERS)}): {', '.join(EXCLUDED_USERS) if EXCLUDED_USERS else 'Пуст'}"
+            else:
+                EXCLUDED_USERS.append(username)  # Откатываем изменение
+                text = f"❌ Ошибка при сохранении в файл"
     
     await event.delete()
     topic_id = await get_or_create_topic(chat_name)
@@ -2528,15 +2544,16 @@ async def handle_add_priority_command(event):
     username = event.pattern_match.group(1).strip()
     print(f"\n📥 Команда: /add_priority {username} | Чат: {chat_name}")
     
-    if username in PRIORITY_USERS:
-        text = f"⚠️ Пользователь **{username}** уже в списке приоритетных"
-    else:
-        PRIORITY_USERS.append(username)
-        if save_users_to_file(PRIORITY_USERS_FILE, PRIORITY_USERS):
-            text = f"✅ Пользователь **{username}** добавлен в приоритетные\n\nТекущий список ({len(PRIORITY_USERS)}): {', '.join(PRIORITY_USERS)}"
+    async with config_lock:
+        if username in PRIORITY_USERS:
+            text = f"⚠️ Пользователь **{username}** уже в списке приоритетных"
         else:
-            PRIORITY_USERS.remove(username)  # Откатываем изменение
-            text = f"❌ Ошибка при сохранении в файл"
+            PRIORITY_USERS.append(username)
+            if save_users_to_file(PRIORITY_USERS_FILE, PRIORITY_USERS):
+                text = f"✅ Пользователь **{username}** добавлен в приоритетные\n\nТекущий список ({len(PRIORITY_USERS)}): {', '.join(PRIORITY_USERS)}"
+            else:
+                PRIORITY_USERS.remove(username)  # Откатываем изменение
+                text = f"❌ Ошибка при сохранении в файл"
     
     await event.delete()
     topic_id = await get_or_create_topic(chat_name)
@@ -2552,15 +2569,16 @@ async def handle_remove_priority_command(event):
     username = event.pattern_match.group(1).strip()
     print(f"\n📥 Команда: /remove_priority {username} | Чат: {chat_name}")
     
-    if username not in PRIORITY_USERS:
-        text = f"⚠️ Пользователь **{username}** не найден в списке приоритетных"
-    else:
-        PRIORITY_USERS.remove(username)
-        if save_users_to_file(PRIORITY_USERS_FILE, PRIORITY_USERS):
-            text = f"✅ Пользователь **{username}** удален из приоритетных\n\nТекущий список ({len(PRIORITY_USERS)}): {', '.join(PRIORITY_USERS) if PRIORITY_USERS else 'Пуст'}"
+    async with config_lock:
+        if username not in PRIORITY_USERS:
+            text = f"⚠️ Пользователь **{username}** не найден в списке приоритетных"
         else:
-            PRIORITY_USERS.append(username)  # Откатываем изменение
-            text = f"❌ Ошибка при сохранении в файл"
+            PRIORITY_USERS.remove(username)
+            if save_users_to_file(PRIORITY_USERS_FILE, PRIORITY_USERS):
+                text = f"✅ Пользователь **{username}** удален из приоритетных\n\nТекущий список ({len(PRIORITY_USERS)}): {', '.join(PRIORITY_USERS) if PRIORITY_USERS else 'Пуст'}"
+            else:
+                PRIORITY_USERS.append(username)  # Откатываем изменение
+                text = f"❌ Ошибка при сохранении в файл"
     
     await event.delete()
     topic_id = await get_or_create_topic(chat_name)
@@ -2609,17 +2627,18 @@ async def handle_set_model_command(event):
     if not model:
         text = f"⚠️ Не указано название модели.\n\nПример: `/set_model {GEMINI_DEFAULT_MODEL}`"
     else:
-        old_model = GEMINI_DEFAULT_MODEL or CURRENT_MODEL
-        
-        if update_env_value('private.txt', 'GEMINI_MODEL', model):
-            GEMINI_DEFAULT_MODEL = model
-            CURRENT_MODEL = model
-            text = f"✅ Модель изменена: **{old_model}** → **{model}**\n\n"
-            text += "Изменения вступят в силу для следующего анализа.\n"
-            text += "Модель сохранена в `private.txt` (GEMINI_MODEL).\n"
-            text += "Используйте `/show_model` для просмотра деталей."
-        else:
-            text = "❌ Ошибка при сохранении модели в private.txt"
+        async with config_lock:
+            old_model = GEMINI_DEFAULT_MODEL or CURRENT_MODEL
+            
+            if update_env_value('private.txt', 'GEMINI_MODEL', model):
+                GEMINI_DEFAULT_MODEL = model
+                CURRENT_MODEL = model
+                text = f"✅ Модель изменена: **{old_model}** → **{model}**\n\n"
+                text += "Изменения вступят в силу для следующего анализа.\n"
+                text += "Модель сохранена в `private.txt` (GEMINI_MODEL).\n"
+                text += "Используйте `/show_model` для просмотра деталей."
+            else:
+                text = "❌ Ошибка при сохранении модели в private.txt"
     
     await event.delete()
     topic_id = await get_or_create_topic(chat_name)
@@ -2635,14 +2654,15 @@ async def handle_reload_config_command(event):
     chat_name = chat.title if hasattr(chat, 'title') else "Private"
     print(f"\n📥 Команда: /reload_config | Чат: {chat_name}")
     
-    load_dotenv('private.txt', override=True)
-    GEMINI_DEFAULT_MODEL = os.getenv('GEMINI_MODEL', '').strip()
-    EXCLUDED_USERS = load_users_from_file(EXCLUDED_USERS_FILE)
-    PRIORITY_USERS = load_users_from_file(PRIORITY_USERS_FILE)
-    ANALYSIS_PROMPT = load_prompt_from_file(PROMPT_FILE)
-    CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT = load_model_config(MODEL_CONFIG_FILE)
-    if GEMINI_DEFAULT_MODEL:
-        CURRENT_MODEL = GEMINI_DEFAULT_MODEL
+    async with config_lock:
+        load_dotenv('private.txt', override=True)
+        GEMINI_DEFAULT_MODEL = os.getenv('GEMINI_MODEL', '').strip()
+        EXCLUDED_USERS = load_users_from_file(EXCLUDED_USERS_FILE)
+        PRIORITY_USERS = load_users_from_file(PRIORITY_USERS_FILE)
+        ANALYSIS_PROMPT = load_prompt_from_file(PROMPT_FILE)
+        CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT = load_model_config(MODEL_CONFIG_FILE)
+        if GEMINI_DEFAULT_MODEL:
+            CURRENT_MODEL = GEMINI_DEFAULT_MODEL
     
     text = f"""
 ✅ **Конфигурация перезагружена из файлов**
@@ -2847,8 +2867,19 @@ async def main():
         await telegram_client.run_until_disconnected()
     except KeyboardInterrupt:
         print("\n🔄 Завершение работы...")
-        await telegram_client.disconnect()
-        print("✅ Соединение с Telegram закрыто")
+    finally:
+        # Graceful shutdown: закрываем HTTP клиент и Telegram соединение
+        try:
+            await http_client.aclose()
+            print("✅ HTTP клиент закрыт")
+        except Exception as e:
+            print(f"⚠️ Ошибка при закрытии HTTP клиента: {e}")
+        
+        try:
+            await telegram_client.disconnect()
+            print("✅ Соединение с Telegram закрыто")
+        except Exception as e:
+            print(f"⚠️ Ошибка при закрытии соединения Telegram: {e}")
 
 
 if __name__ == '__main__':
