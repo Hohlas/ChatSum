@@ -15,8 +15,8 @@ from telegraph import Telegraph
 from telegraph.exceptions import RetryAfterError
 
 # Скомпилированные регулярные выражения для конвертации Markdown в HTML
-MD_BOLD_RE = re.compile(r'\*\*(.*?)\*\*')
-MD_ITALIC_RE = re.compile(r'\*([^\*]+)\*')
+MD_BOLD_RE = re.compile(r'\*\*(.+?)\*\*')
+MD_ITALIC_RE = re.compile(r'\*(.+?)\*')
 MD_LINK_RE = re.compile(r'\[([^\]]+)\]\(([^\)]+)\)')
 
 # Блокировка для синхронизации доступа к глобальным конфигурационным переменным
@@ -1515,6 +1515,61 @@ TELEGRAPH_ALLOWED_TAGS = {
 }
 
 
+def fix_html_nesting(html_content):
+    """
+    Исправляет вложенность HTML-тегов, обеспечивая правильный порядок закрытия.
+    Использует стек для отслеживания открытых тегов.
+    
+    Args:
+        html_content: HTML строка
+    
+    Returns:
+        HTML строка с исправленной вложенностью
+    """
+    if not html_content:
+        return html_content
+    
+    # Паттерн для поиска HTML тегов (открывающих и закрывающих)
+    tag_pattern = re.compile(r'<(/?)(\w+)[^>]*>')
+    
+    # Стек для отслеживания открытых тегов
+    open_tags = []
+    result_parts = []
+    last_end = 0
+    
+    for match in tag_pattern.finditer(html_content):
+        # Добавляем текст перед тегом
+        result_parts.append(html_content[last_end:match.start()])
+        
+        closing_slash = match.group(1)  # '/' для закрывающего тега, '' для открывающего
+        tag_name = match.group(2).lower()  # имя тега
+        
+        if closing_slash:  # Закрывающий тег
+            # Если стек не пуст и верхний элемент совпадает с этим тегом - нормально
+            if open_tags and open_tags[-1] == tag_name:
+                open_tags.pop()
+                result_parts.append(match.group(0))  # Оставляем тег как есть
+            else:
+                # Неправильное закрытие - либо пропускаем, либо пытаемся исправить
+                # Простейший подход: пропускаем этот неправильный закрывающий тег
+                pass
+        else:  # Открывающий тег
+            open_tags.append(tag_name)
+            result_parts.append(match.group(0))  # Оставляем тег как есть
+        
+        last_end = match.end()
+    
+    # Добавляем оставшийся текст после последнего тега
+    result_parts.append(html_content[last_end:])
+    
+    # Закрываем все незакрытые теги в обратном порядке
+    while open_tags:
+        tag_name = open_tags.pop()
+        result_parts.append(f'</{tag_name}>')
+    
+    return ''.join(result_parts)
+
+
 def sanitize_html_for_telegraph(html_content):
     """
     Удаляет HTML-теги, не разрешенные Telegraph API.
@@ -1622,8 +1677,8 @@ def convert_markdown_to_html(content):
                 html_paragraphs.append('<ul>')
                 in_list = True
             text = line_stripped.lstrip('- *•').strip()
-            text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
-            text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', text)
+            text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+            text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
             text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', text)
             html_paragraphs.append(f'<li>{text}</li>')
             continue
@@ -1637,8 +1692,8 @@ def convert_markdown_to_html(content):
     # Завершаем последний параграф
     if current_paragraph:
         para_text = '<br>'.join(current_paragraph)
-        para_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', para_text)
-        para_text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', para_text)
+        para_text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', para_text)
+        para_text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', para_text)
         para_text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', para_text)
         html_paragraphs.append(f'<p>{para_text}</p>')
     
@@ -1646,6 +1701,9 @@ def convert_markdown_to_html(content):
         html_paragraphs.append('</ul>')
     
     html_content = ''.join(html_paragraphs)
+    
+    # Исправляем вложенность HTML-тегов
+    html_content = fix_html_nesting(html_content)
     
     # Санитизация: удаляем теги, не разрешенные Telegraph
     html_content = sanitize_html_for_telegraph(html_content)
