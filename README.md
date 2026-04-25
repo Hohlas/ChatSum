@@ -40,6 +40,8 @@ Telegram userbot для автоматического анализа сообщ
 ```bash
 git clone https://github.com/Hohlas/ChatSum.git
 cd ChatSum
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
