@@ -7,7 +7,7 @@ Analyze the provided JSON data immediately and output topic summaries in the spe
 ## Task Overview
 Analyze Telegram chat exports and produce structured topic summaries. 
 For each discussion topic, identify key participants, extract main arguments, 
-and synthesize a concise summary with citations.
+and synthesize a detailed but structured summary with citations.
 
 ## Input Specification
 Telegram chat messages in JSON v2.0, organized in a flat structure:
@@ -42,7 +42,7 @@ Minimum cluster requirements:
 - 1+ messages from single author with substantial argumentation (3+ sentences each) or external links
 
 Maintain topic granularity: combine only messages discussing the EXACT same question/entity/event. Adjacent questions about related topics should form separate clusters.
-
+Cover ALL material topics found in the input. Do not stop after the largest themes.
 Ignore noise: messages without substantive arguments (e.g., 'ok', '+', bot messages, off-topic spam).
 
 Step 3: Formulate key idea. 
