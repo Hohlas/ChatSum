@@ -149,6 +149,7 @@ if RESULTS_DESTINATION != 'me':
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '').strip()
 GEMINI_DEFAULT_MODEL = os.getenv('GEMINI_MODEL', '').strip()
 GEMINI_REASONING_EFFORT = os.getenv('GEMINI_REASONING_EFFORT', '').strip().lower()
+GEMINI_CHUNK_MAX_CHARS = os.getenv('GEMINI_CHUNK_MAX_CHARS', '').strip()
 
 ALLOWED_REASONING_EFFORTS = {'none', 'low', 'medium', 'high'}
 
@@ -212,7 +213,48 @@ def get_model_generation_config(model_name):
                 f"Использую значение по умолчанию для модели."
             )
 
+    if GEMINI_CHUNK_MAX_CHARS:
+        try:
+            chunk_max_chars = int(GEMINI_CHUNK_MAX_CHARS)
+            if chunk_max_chars <= 0:
+                raise ValueError
+            config['chunk_max_chars'] = chunk_max_chars
+            config['chunk_overlap_chars'] = int(chunk_max_chars * DEFAULT_CHUNK_OVERLAP_RATIO)
+        except ValueError:
+            print(
+                f"⚠️  Неверное значение GEMINI_CHUNK_MAX_CHARS: {GEMINI_CHUNK_MAX_CHARS}. "
+                f"Ожидается положительное целое число. Использую значение по умолчанию для модели."
+            )
+
     return config
+
+
+def extract_api_error_message(error):
+    """
+    Извлекает поле error.message из ответа API, если оно доступно.
+    Возвращает короткий человекочитаемый текст для логов и Telegram.
+    """
+    response = getattr(error, 'response', None)
+    if response is None:
+        return str(error)
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+
+    if isinstance(payload, dict):
+        error_obj = payload.get('error')
+        if isinstance(error_obj, dict):
+            message = error_obj.get('message')
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+
+    text = getattr(response, 'text', None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    return str(error)
 
 # Пути к конфигурационным файлам
 EXCLUDED_USERS_FILE = 'EXCLUDED_USERS.txt'
@@ -1242,7 +1284,8 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         total_usage = {
             'prompt_tokens': 0,
             'completion_tokens': 0,
-            'total_tokens': 0
+            'total_tokens': 0,
+            'errors': []
         }
         errors_count = 0
         
@@ -1355,22 +1398,27 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                 chunk_summaries.append((start_idx, end_idx, chunk_summary, False))
                 
             except AuthenticationError as e:
-                error_msg = f"❌ Ошибка доступа к API: {type(e).__name__}"
+                api_message = extract_api_error_message(e)
+                error_msg = f"❌ Ошибка доступа к API: {api_message}"
                 print(f"   {error_msg}")
                 chunk_summaries.append((start_idx, end_idx, error_msg, True))
+                total_usage['errors'].append(error_msg)
                 errors_count += 1
                 
             except APIStatusError as e:
                 status_code = getattr(e, 'status_code', 'неизвестен')
-                error_msg = f"❌ Ошибка API (HTTP {status_code}): {e}"
+                api_message = extract_api_error_message(e)
+                error_msg = f"❌ Ошибка API (HTTP {status_code}): {api_message}"
                 print(f"   {error_msg}")
                 chunk_summaries.append((start_idx, end_idx, error_msg, True))
+                total_usage['errors'].append(error_msg)
                 errors_count += 1
                 
             except Exception as e:
                 error_msg = f"❌ Ошибка: {type(e).__name__}: {e}"
                 print(f"   {error_msg}")
                 chunk_summaries.append((start_idx, end_idx, error_msg, True))
+                total_usage['errors'].append(error_msg)
                 errors_count += 1
             
             # Пауза между запросами (кроме последнего чанка)
@@ -2342,6 +2390,12 @@ async def process_chat_command(event, use_ai=True):
                 stats_message += f"• С {period_start_time} по {period_end_time}\n"
             if usage_info and total_tokens:
                 stats_message += f"• Токенов: {total_tokens:,}\n"
+            if usage_info and usage_info.get('errors'):
+                stats_message += "\n⚠️ Ошибки API:\n"
+                for error_text in usage_info['errors'][:3]:
+                    stats_message += f"• {error_text}\n"
+                if len(usage_info['errors']) > 3:
+                    stats_message += f"• ... и ещё {len(usage_info['errors']) - 3}\n"
             
             # Формируем полный контент для Telegraph (с статистикой в конце)
             full_content = summary
