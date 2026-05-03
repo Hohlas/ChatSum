@@ -169,6 +169,19 @@ CHUNK_MAX_CHARS = 70000     # Максимум символов JSON-сообщ�
 CHUNK_OVERLAP_CHARS = int(CHUNK_MAX_CHARS * 0.05)  # Минимум перехлёста (5%)
 CHUNK_DELAY_SECONDS = 10   # Задержка между запросами к API (для соблюдения RPM лимита)
 
+# Настройки генерации для отдельных моделей Gemini через OpenAI-compatible API.
+# gemini-2.5-flash:
+# - официальный output token limit: 65,536
+# - явно понижаем thinking до low, чтобы длинные саммари не "съедались"
+#   внутренними рассуждениями модели.
+MODEL_OUTPUT_LIMITS = {
+    'gemini-2.5-flash': 65536,
+}
+
+MODEL_REASONING_EFFORT = {
+    'gemini-2.5-flash': 'low',
+}
+
 # Пути к конфигурационным файлам
 EXCLUDED_USERS_FILE = 'EXCLUDED_USERS.txt'
 PRIORITY_USERS_FILE = 'PRIORITY_USERS.txt'
@@ -1130,6 +1143,10 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
     actual_model = model or GEMINI_DEFAULT_MODEL
     if not actual_model:
         return "❌ В private.txt не задана переменная GEMINI_MODEL", None
+
+    output_max_tokens = MODEL_OUTPUT_LIMITS.get(actual_model, 10000)
+    reasoning_effort = MODEL_REASONING_EFFORT.get(actual_model)
+
     total_messages = sum(len(c[0]) for c in chunks)
     num_chunks = len(chunks)
     
@@ -1154,6 +1171,9 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
 
     print(f"   🤖 Модель: {actual_model}")
     print(f"   📊 Лимит контекста: {max_tokens:,} токенов ({max_chars:,} символов для кириллицы)")
+    print(f"   ✍️ Лимит генерации ответа: {output_max_tokens:,} токенов")
+    if reasoning_effort:
+        print(f"   🧠 Thinking: {reasoning_effort}")
     
     # Подготовка промпта с приоритетными пользователями
     # Извлекаем уникальные имена отправителей из всех чанков
@@ -1229,8 +1249,11 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                     {'role': 'user', 'content': user_content}
                 ],
                 'temperature': 0.3,
-                'max_tokens': 10000
+                'max_tokens': output_max_tokens
             }
+
+            if reasoning_effort:
+                request_params['reasoning_effort'] = reasoning_effort
             
             total_chars = len(system_content) + len(user_content)
             print(f"   📊 Размер запроса: {total_chars:,} символов")
@@ -1403,8 +1426,11 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                 {'role': 'user', 'content': user_content}
             ],
             'temperature': 0.3,
-            'max_tokens': 10000
+            'max_tokens': output_max_tokens
         }
+
+        if reasoning_effort:
+            request_params['reasoning_effort'] = reasoning_effort
         
         total_chars = len(system_content) + len(user_content)
         print(f"   📊 Размер запроса: {total_chars:,} символов")
