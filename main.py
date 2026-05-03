@@ -148,6 +148,9 @@ if RESULTS_DESTINATION != 'me':
 # Очищаем API ключ от возможных невидимых символов и пробелов
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '').strip()
 GEMINI_DEFAULT_MODEL = os.getenv('GEMINI_MODEL', '').strip()
+GEMINI_REASONING_EFFORT = os.getenv('GEMINI_REASONING_EFFORT', '').strip().lower()
+
+ALLOWED_REASONING_EFFORTS = {'none', 'low', 'medium', 'high'}
 
 if not GOOGLE_API_KEY:
     print("⚠️  ВНИМАНИЕ: GOOGLE_API_KEY не найден в private.txt!")
@@ -198,6 +201,16 @@ def get_model_generation_config(model_name):
             'chunk_max_chars': 70000,
         })
         config['chunk_overlap_chars'] = int(config['chunk_max_chars'] * DEFAULT_CHUNK_OVERLAP_RATIO)
+
+    if GEMINI_REASONING_EFFORT:
+        if GEMINI_REASONING_EFFORT in ALLOWED_REASONING_EFFORTS:
+            config['reasoning_effort'] = GEMINI_REASONING_EFFORT
+        else:
+            print(
+                f"⚠️  Неверное значение GEMINI_REASONING_EFFORT: {GEMINI_REASONING_EFFORT}. "
+                f"Допустимые значения: {', '.join(sorted(ALLOWED_REASONING_EFFORTS))}. "
+                f"Использую значение по умолчанию для модели."
+            )
 
     return config
 
