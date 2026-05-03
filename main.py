@@ -3130,10 +3130,11 @@ async def main():
             print(f"   💡 Убедитесь что вы являетесь владельцем/админом канала")
             print(f"   💡 Или закомментируйте TELEGRAM_GROUP_ID в private.txt")
     
-    # Показываем настройки модели
-    print(f"\n🤖 Модель AI:")
-    print(f"   • Текущая модель: {CURRENT_MODEL}")
-    print(f"   • Reasoning режим: {'Включен' if USE_REASONING else 'Выключен'}")
+    # Показываем текущую Gemini-конфигурацию из private.txt
+    print(f"\n🤖 Конфигурация Gemini (private.txt):")
+    print(f"   • GEMINI_MODEL={GEMINI_DEFAULT_MODEL or 'не задан'}")
+    print(f"   • GEMINI_REASONING_EFFORT={GEMINI_REASONING_EFFORT or 'не задан'}")
+    print(f"   • GEMINI_CHUNK_MAX_CHARS={GEMINI_CHUNK_MAX_CHARS or 'не задан'}")
     print(f"   • Экспорт результатов: {'HTML файлы 📄' if USE_HTML_EXPORT else 'Telegraph 🌐'}")
     
     # Показываем настройки фильтрации
