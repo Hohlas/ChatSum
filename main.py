@@ -161,26 +161,45 @@ NOISE_PATTERNS = [
     r'^[👍👎👌✅❌🔥💪🎉😂😅]+$',  # Только эмодзи
 ]
 
-# Конфигурация разбиения на чанки (по символам)
-# Лимит контекста: 128,000 токенов
-# Целевое использование: ≤35% (~45,000 токенов ≈ 90,000 символов для кириллицы)
-# CHUNK_MAX_CHARS=70000 чтобы с запасом учесть system_content (~20k) и отступы JSON
-CHUNK_MAX_CHARS = 70000     # Максимум символов JSON-сообщений (итоговый запрос ~90k)
-CHUNK_OVERLAP_CHARS = int(CHUNK_MAX_CHARS * 0.05)  # Минимум перехлёста (5%)
+# Базовая конфигурация разбиения на чанки (по символам)
+# Используется как fallback для моделей без специальных настроек.
+DEFAULT_CHUNK_MAX_CHARS = 70000
+DEFAULT_CHUNK_OVERLAP_RATIO = 0.05
+CHUNK_MAX_CHARS = DEFAULT_CHUNK_MAX_CHARS
+CHUNK_OVERLAP_CHARS = int(DEFAULT_CHUNK_MAX_CHARS * DEFAULT_CHUNK_OVERLAP_RATIO)
 CHUNK_DELAY_SECONDS = 10   # Задержка между запросами к API (для соблюдения RPM лимита)
 
-# Настройки генерации для отдельных моделей Gemini через OpenAI-compatible API.
-# gemini-2.5-flash:
-# - официальный output token limit: 65,536
-# - явно понижаем thinking до low, чтобы длинные саммари не "съедались"
-#   внутренними рассуждениями модели.
-MODEL_OUTPUT_LIMITS = {
-    'gemini-2.5-flash': 65536,
-}
+def get_model_generation_config(model_name):
+    """
+    Возвращает параметры генерации и чанкования для выбранной модели.
 
-MODEL_REASONING_EFFORT = {
-    'gemini-2.5-flash': 'low',
-}
+    Модель продолжает задаваться через private.txt, а эта функция лишь
+    подбирает безопасные дефолты и точечные overrides.
+    """
+    config = {
+        'context_limit_tokens': 128000,
+        'output_max_tokens': 10000,
+        'reasoning_effort': None,
+        'chunk_max_chars': DEFAULT_CHUNK_MAX_CHARS,
+        'chunk_overlap_chars': int(DEFAULT_CHUNK_MAX_CHARS * DEFAULT_CHUNK_OVERLAP_RATIO),
+    }
+
+    if model_name in ('gemini-1.5-flash', 'gemini-1.5-flash-latest'):
+        config['context_limit_tokens'] = 128000
+    elif model_name in ('gemini-1.5-pro', 'gemini-1.5-pro-latest'):
+        config['context_limit_tokens'] = 2000000
+    elif model_name in ('gemini-2.0-flash', 'gemini-2.0-flash-lite'):
+        config['context_limit_tokens'] = 1048576
+    elif model_name == 'gemini-2.5-flash':
+        config.update({
+            'context_limit_tokens': 1048576,
+            'output_max_tokens': 65536,
+            'reasoning_effort': 'low',
+            'chunk_max_chars': 250000,
+        })
+        config['chunk_overlap_chars'] = int(config['chunk_max_chars'] * DEFAULT_CHUNK_OVERLAP_RATIO)
+
+    return config
 
 # Пути к конфигурационным файлам
 EXCLUDED_USERS_FILE = 'EXCLUDED_USERS.txt'
@@ -1143,9 +1162,11 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
     actual_model = model or GEMINI_DEFAULT_MODEL
     if not actual_model:
         return "❌ В private.txt не задана переменная GEMINI_MODEL", None
-
-    output_max_tokens = MODEL_OUTPUT_LIMITS.get(actual_model, 10000)
-    reasoning_effort = MODEL_REASONING_EFFORT.get(actual_model)
+    model_config = get_model_generation_config(actual_model)
+    output_max_tokens = model_config['output_max_tokens']
+    reasoning_effort = model_config['reasoning_effort']
+    chunk_max_chars = model_config['chunk_max_chars']
+    chunk_overlap_chars = model_config['chunk_overlap_chars']
 
     total_messages = sum(len(c[0]) for c in chunks)
     num_chunks = len(chunks)
@@ -1156,17 +1177,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
     else:
         print(f"   ⚡ Используем стандартную модель: {actual_model}")
     
-    # Определяем лимиты контекста в зависимости от модели (в токенах)
-    CONTEXT_LIMITS = {
-        'gemini-1.5-flash': 128000,
-        'gemini-1.5-flash-latest': 128000,
-        'gemini-1.5-pro': 2000000,
-        'gemini-1.5-pro-latest': 2000000,
-        'gemini-2.0-flash': 1048576,
-        'gemini-2.0-flash-lite': 1048576,
-    }
-
-    max_tokens = CONTEXT_LIMITS.get(actual_model, 128000)
+    max_tokens = model_config['context_limit_tokens']
     max_chars = int(max_tokens * 2.5 * 0.8)  # Для кириллицы с запасом 20%
 
     print(f"   🤖 Модель: {actual_model}")
@@ -1174,6 +1185,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
     print(f"   ✍️ Лимит генерации ответа: {output_max_tokens:,} токенов")
     if reasoning_effort:
         print(f"   🧠 Thinking: {reasoning_effort}")
+    print(f"   📦 Лимит входа на чанк: {chunk_max_chars:,} символов")
     
     # Подготовка промпта с приоритетными пользователями
     # Извлекаем уникальные имена отправителей из всех чанков
@@ -1211,7 +1223,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         # ═══════════════════════════════════════════════════════════════
         # РЕЖИМ ЧАНКОВ: работаем с переданными чанками
         # ═══════════════════════════════════════════════════════════════
-        print(f"📦 Разбиение на {num_chunks} чанков (по символам, max={CHUNK_MAX_CHARS}, перехлест={CHUNK_OVERLAP_CHARS})")
+        print(f"📦 Разбиение на {num_chunks} чанков (по символам, max={chunk_max_chars}, перехлест={chunk_overlap_chars})")
         
         chunk_summaries = []  # Список кортежей: (start_idx, end_idx, summary_text, is_error)
         total_usage = {
@@ -2204,7 +2216,16 @@ async def process_chat_command(event, use_ai=True):
         
         # Разбиваем сообщения на чанки заранее (используется и для предупреждения, и для анализа)
         # Используем разбиение по символам вместо количества сообщений
-        chunks = split_messages_by_chars(optimized_messages)
+        summary_model = GEMINI_DEFAULT_MODEL if use_ai else None
+        model_config = get_model_generation_config(summary_model) if summary_model else {
+            'chunk_max_chars': CHUNK_MAX_CHARS,
+            'chunk_overlap_chars': CHUNK_OVERLAP_CHARS,
+        }
+        chunks = split_messages_by_chars(
+            optimized_messages,
+            max_chars=model_config['chunk_max_chars'],
+            overlap_chars=model_config['chunk_overlap_chars']
+        )
         num_chunks = len(chunks)
 
         # Предупреждение о больших запросах (особенно для AI анализа)
