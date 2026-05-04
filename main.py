@@ -60,6 +60,11 @@ def validate_config():
     api_hash = os.getenv('TELEGRAM_API_HASH', '')
     phone = os.getenv('TELEGRAM_PHONE', '')
     google_key = os.getenv('GOOGLE_API_KEY', '').strip()
+    extra_google_keys = [
+        value.strip()
+        for key, value in os.environ.items()
+        if re.fullmatch(r'GOOGLE_API_KEY\d+', key) and value.strip()
+    ]
     gemini_model = os.getenv('GEMINI_MODEL', '').strip()
     
     # Список заглушек, которые могут быть в шаблоне
@@ -91,14 +96,55 @@ def validate_config():
         errors.append("TELEGRAM_PHONE должен начинаться с '+' (например, +79001234567)")
     
     # Проверка GOOGLE_API_KEY
-    if not google_key or google_key in placeholders:
-        errors.append("GOOGLE_API_KEY не заполнен или содержит заглушку")
+    valid_google_keys = [k for k in ([google_key] + extra_google_keys) if k and k not in placeholders]
+    if not valid_google_keys:
+        errors.append("Не найден ни один валидный GOOGLE_API_KEY / GOOGLE_API_KEYN")
     
     # Проверка GEMINI_MODEL
     if not gemini_model or gemini_model in placeholders:
         errors.append("GEMINI_MODEL не заполнен или содержит заглушку")
     
     return errors
+
+
+def load_google_api_keys():
+    """
+    Загружает список Google API ключей из private.txt / environment.
+    Поддерживает GOOGLE_API_KEY, GOOGLE_API_KEY1, GOOGLE_API_KEY2, ...
+    """
+    keys = []
+
+    primary_key = os.getenv('GOOGLE_API_KEY', '').strip()
+    if primary_key:
+        keys.append(primary_key)
+
+    indexed_keys = []
+    for env_key, env_value in os.environ.items():
+        if re.fullmatch(r'GOOGLE_API_KEY\d+', env_key):
+            value = env_value.strip()
+            if value:
+                indexed_keys.append((env_key, value))
+
+    indexed_keys.sort(key=lambda item: int(re.search(r'(\d+)$', item[0]).group(1)))
+    keys.extend([value for _, value in indexed_keys])
+
+    # Убираем дубликаты с сохранением порядка
+    unique_keys = []
+    seen = set()
+    for key in keys:
+        if key not in seen:
+            seen.add(key)
+            unique_keys.append(key)
+
+    return unique_keys
+
+
+def mask_api_key(api_key):
+    if not api_key:
+        return 'пустой'
+    if len(api_key) <= 12:
+        return api_key
+    return f"{api_key[:8]}...{api_key[-6:]}"
 
 
 # Создаем private.txt из шаблона, если его нет
@@ -153,8 +199,8 @@ GEMINI_CHUNK_MAX_CHARS = os.getenv('GEMINI_CHUNK_MAX_CHARS', '').strip()
 
 ALLOWED_REASONING_EFFORTS = {'none', 'low', 'medium', 'high'}
 
-if not GOOGLE_API_KEY:
-    print("⚠️  ВНИМАНИЕ: GOOGLE_API_KEY не найден в private.txt!")
+if not load_google_api_keys():
+    print("⚠️  ВНИМАНИЕ: Не найден ни один GOOGLE_API_KEY / GOOGLE_API_KEYN в private.txt!")
 
 # Конфигурация фильтрации сообщений
 MIN_MESSAGE_LENGTH = 3  # Минимальная длина сообщения (символов)
@@ -285,6 +331,52 @@ def trim_text_for_telegram(text, max_length=3500):
         return text
 
     return text[:max_length - 20].rstrip() + "\n... [обрезано]"
+
+
+def should_rotate_key_for_error(error_message):
+    """
+    Ошибки, при которых есть смысл переключить API key и повторить запрос.
+    """
+    if not error_message:
+        return False
+
+    error_lower = error_message.lower()
+    return (
+        is_quota_exceeded_error(error_message)
+        or 'invalid api key' in error_lower
+        or 'api key not valid' in error_lower
+        or 'permission denied' in error_lower
+        or 'access denied' in error_lower
+    )
+
+
+async def execute_gemini_request(request_params):
+    """
+    Выполняет запрос к Gemini с возможной ротацией ключей при ошибках квоты/доступа.
+    """
+    last_error = None
+    attempts = max(1, len(GOOGLE_API_KEYS))
+
+    for attempt_idx in range(attempts):
+        try:
+            return await google_client.chat.completions.create(**request_params)
+        except AuthenticationError as e:
+            last_error = e
+            api_message = extract_api_error_message(e)
+            if attempt_idx < attempts - 1 and should_rotate_key_for_error(api_message):
+                rotate_google_api_key("ключ недоступен или невалиден, пробуем следующий")
+                continue
+            raise
+        except APIStatusError as e:
+            last_error = e
+            api_message = extract_api_error_message(e)
+            if attempt_idx < attempts - 1 and should_rotate_key_for_error(api_message):
+                rotate_google_api_key("квота/доступ исчерпаны, пробуем следующий ключ")
+                continue
+            raise
+
+    if last_error:
+        raise last_error
 
 # Пути к конфигурационным файлам
 EXCLUDED_USERS_FILE = 'EXCLUDED_USERS.txt'
@@ -531,21 +623,24 @@ if GEMINI_DEFAULT_MODEL:
 
 # Инициализация клиентов
 telegram_client = TelegramClient('session_name', API_ID, API_HASH)
+GOOGLE_API_KEYS = load_google_api_keys()
+current_google_key_index = 0
+google_analysis_counter = 0
 
 # Валидация API ключа
-print(f"🔑 Проверка ключа Google AI Studio:")
-print(f"   Длина: {len(GOOGLE_API_KEY)} символов")
-print(f"   Первые 10 символов: {GOOGLE_API_KEY[:10]}...")
-print(f"   Последние 10 символов: ...{GOOGLE_API_KEY[-10:]}")
+print(f"🔑 Проверка ключей Google AI Studio:")
+for idx, api_key in enumerate(GOOGLE_API_KEYS, 1):
+    print(f"   • Ключ {idx}: {mask_api_key(api_key)} (длина {len(api_key)} символов)")
+    try:
+        api_key.encode('ascii')
+        print("     ✅ API-ключ корректный (ASCII)")
+    except UnicodeEncodeError:
+        print("     ❌ ОШИБКА: API-ключ содержит недопустимые символы!")
+        print("     Проверьте файл private.txt на наличие невидимых символов")
+        exit(1)
 
-# Проверка, что ключ содержит только ASCII символы
-try:
-    GOOGLE_API_KEY.encode('ascii')
-    print(f"   ✅ API-ключ корректный (ASCII)")
-except UnicodeEncodeError:
-    print("   ❌ ОШИБКА: API-ключ содержит недопустимые символы!")
-    print("   Проверьте файл private.txt на наличие невидимых символов")
-    exit(1)
+print(f"   🔁 Всего ключей: {len(GOOGLE_API_KEYS)}")
+print(f"   🔑 Стартовый активный ключ: {mask_api_key(GOOGLE_API_KEYS[0] if GOOGLE_API_KEYS else GOOGLE_API_KEY)}")
 
 # Создаём асинхронный HTTP-клиент с настройками таймаута и лимитов соединений
 http_client = httpx.AsyncClient(
@@ -556,12 +651,61 @@ http_client = httpx.AsyncClient(
     )
 )
 
-google_client = AsyncOpenAI(
-    api_key=GOOGLE_API_KEY,
-    base_url='https://generativelanguage.googleapis.com/v1beta/openai/',
-    http_client=http_client,
-    max_retries=2
-)
+def create_google_client(api_key):
+    return AsyncOpenAI(
+        api_key=api_key,
+        base_url='https://generativelanguage.googleapis.com/v1beta/openai/',
+        http_client=http_client,
+        max_retries=2
+    )
+def get_current_google_api_key():
+    if not GOOGLE_API_KEYS:
+        return GOOGLE_API_KEY
+    return GOOGLE_API_KEYS[current_google_key_index]
+
+
+def set_google_api_key_index(index):
+    global current_google_key_index, google_client
+    if not GOOGLE_API_KEYS:
+        return
+    current_google_key_index = index % len(GOOGLE_API_KEYS)
+    google_client = create_google_client(GOOGLE_API_KEYS[current_google_key_index])
+
+
+def rotate_google_api_key(reason=None):
+    """
+    Переключает активный Google API key на следующий по кругу.
+    """
+    if not GOOGLE_API_KEYS:
+        return None
+
+    set_google_api_key_index(current_google_key_index + 1)
+    active_key = get_current_google_api_key()
+    if reason:
+        print(f"🔄 Переключение Google API key: {reason}")
+    print(f"   🔑 Активный ключ: {mask_api_key(active_key)} ({current_google_key_index + 1}/{len(GOOGLE_API_KEYS)})")
+    return active_key
+
+
+def select_google_api_key_for_new_analysis():
+    """
+    Выбирает ключ по кругу для нового запуска /sum.
+    Первый анализ использует первый ключ, затем второй, третий и т.д.
+    """
+    global google_analysis_counter
+    if not GOOGLE_API_KEYS:
+        return None
+
+    next_index = google_analysis_counter % len(GOOGLE_API_KEYS)
+    google_analysis_counter += 1
+    set_google_api_key_index(next_index)
+    active_key = get_current_google_api_key()
+    print("🔄 Выбор Google API key для нового анализа")
+    print(f"   🔑 Активный ключ: {mask_api_key(active_key)} ({current_google_key_index + 1}/{len(GOOGLE_API_KEYS)})")
+    return active_key
+
+
+google_client = create_google_client(get_current_google_api_key())
 
 
 async def get_or_create_topic(chat_name):
@@ -1371,7 +1515,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                 
                 while retry_count <= max_retries:
                     try:
-                        response = await google_client.chat.completions.create(**request_params)
+                        response = await execute_gemini_request(request_params)
                         break
                     except Exception as retry_error:
                         if 'timeout' in str(retry_error).lower() and retry_count < max_retries:
@@ -1399,7 +1543,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                     validation_passed = False
                     while retry_valid_count <= max_valid_retries:
                         try:
-                            response = await google_client.chat.completions.create(**request_params)
+                            response = await execute_gemini_request(request_params)
                             chunk_summary = response.choices[0].message.content
                             if is_valid_summary(chunk_summary):
                                 print(f"   ✅ Валидация пройдена после retry {retry_valid_count}")
@@ -1560,7 +1704,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         
         while retry_count <= max_retries:
             try:
-                response = await google_client.chat.completions.create(**request_params)
+                response = await execute_gemini_request(request_params)
                 break
             except Exception as retry_error:
                 if 'timeout' in str(retry_error).lower() and retry_count < max_retries:
@@ -2307,6 +2451,9 @@ async def process_chat_command(event, use_ai=True):
                 reply_to=topic_id
             )
             return
+
+        if use_ai and GOOGLE_API_KEYS:
+            select_google_api_key_for_new_analysis()
         
         # Оптимизируем сообщения (фильтруем шум)
         optimized_messages = optimize_messages(messages_data, chat_id_str)
@@ -2994,7 +3141,7 @@ async def handle_set_model_command(event):
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/reload_config'))
 async def handle_reload_config_command(event):
     """Перезагружает конфигурацию из файлов"""
-    global EXCLUDED_USERS, PRIORITY_USERS, ANALYSIS_PROMPT, CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT, GEMINI_DEFAULT_MODEL
+    global EXCLUDED_USERS, PRIORITY_USERS, ANALYSIS_PROMPT, CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT, GEMINI_DEFAULT_MODEL, GEMINI_REASONING_EFFORT, GEMINI_CHUNK_MAX_CHARS, GOOGLE_API_KEYS, google_analysis_counter
     
     chat = await event.get_chat()
     chat_name = chat.title if hasattr(chat, 'title') else "Private"
@@ -3003,6 +3150,12 @@ async def handle_reload_config_command(event):
     async with config_lock:
         load_dotenv('private.txt', override=True)
         GEMINI_DEFAULT_MODEL = os.getenv('GEMINI_MODEL', '').strip()
+        GEMINI_REASONING_EFFORT = os.getenv('GEMINI_REASONING_EFFORT', '').strip().lower()
+        GEMINI_CHUNK_MAX_CHARS = os.getenv('GEMINI_CHUNK_MAX_CHARS', '').strip()
+        GOOGLE_API_KEYS = load_google_api_keys()
+        google_analysis_counter = 0
+        if GOOGLE_API_KEYS:
+            set_google_api_key_index(0)
         EXCLUDED_USERS = load_users_from_file(EXCLUDED_USERS_FILE)
         PRIORITY_USERS = load_users_from_file(PRIORITY_USERS_FILE)
         ANALYSIS_PROMPT = load_prompt_from_file(PROMPT_FILE)
@@ -3017,6 +3170,7 @@ async def handle_reload_config_command(event):
 ⭐ Приоритетные пользователи: {len(PRIORITY_USERS)}
 📄 Промпт: {len(ANALYSIS_PROMPT)} символов
 🤖 Модель: {CURRENT_MODEL}
+🔑 Google API keys: {len(GOOGLE_API_KEYS)}
 
 💡 Используйте `/config` для просмотра деталей
 """
