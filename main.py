@@ -1218,6 +1218,41 @@ def split_messages_by_chars(messages_data, max_chars=CHUNK_MAX_CHARS, overlap_ch
     return chunks
 
 
+def estimate_chunk_request_chars(chunk_messages):
+    """
+    Грубая оценка размера одного AI-запроса в символах.
+    Нужна только для пользовательской оценки времени ожидания.
+    """
+    messages_chars = sum(estimate_message_json_size(msg) for msg in chunk_messages)
+    prompt_chars = len(ANALYSIS_PROMPT) if ANALYSIS_PROMPT else 0
+    # Запас на JSON-обертку, system/user роли и служебные поля.
+    overhead_chars = 2500
+    return prompt_chars + messages_chars + overhead_chars
+
+
+def estimate_total_ai_processing_seconds(chunks, use_ai=True, use_html_export=True):
+    """
+    Консервативная оценка полного времени анализа:
+    AI-обработка чанков + паузы между чанками + публикация результатов.
+    """
+    if not use_ai or not chunks:
+        return 0
+
+    ai_seconds = 0
+    for chunk_messages, _, _ in chunks:
+        request_chars = estimate_chunk_request_chars(chunk_messages)
+        # Консервативная эвристика: большие запросы к Gemini часто занимают
+        # десятки секунд и больше, поэтому берем более реалистичную оценку,
+        # чем просто паузы между чанками.
+        ai_seconds += max(45, request_chars // 2000)
+
+    chunk_pause_seconds = max(0, len(chunks) - 1) * CHUNK_DELAY_SECONDS
+    publish_pause_seconds = max(0, len(chunks) - 1) * 4
+    publish_overhead_seconds = 10 if use_html_export else 5
+
+    return ai_seconds + chunk_pause_seconds + publish_pause_seconds + publish_overhead_seconds
+
+
 def is_valid_summary(text):
     """
     Проверяет, что ответ содержит саммари, а не сырой JSON.
@@ -2479,18 +2514,21 @@ async def process_chat_command(event, use_ai=True):
 
         # Предупреждение о больших запросах (особенно для AI анализа)
         if use_ai and num_chunks > 1:
-            # Расчет примерного времени ожидания
-            # Паузы: (n-1) между чанками в create_summary и (n-1) между публикациями в Telegraph
-            wait_time_seconds = (num_chunks - 1) * (CHUNK_DELAY_SECONDS + 4)
+            # Расчет примерного полного времени: AI + паузы + публикация
+            wait_time_seconds = estimate_total_ai_processing_seconds(
+                chunks,
+                use_ai=use_ai,
+                use_html_export=USE_HTML_EXPORT
+            )
             
             wait_info = ""
             if wait_time_seconds > 0:
                 minutes = wait_time_seconds // 60
                 seconds = wait_time_seconds % 60
                 if minutes > 0:
-                    wait_info = f"\n⏳ Примерное время ожидания пауз: **{minutes} мин {seconds} сек**"
+                    wait_info = f"\n⏳ Примерное полное время обработки: **{minutes} мин {seconds} сек**"
                 else:
-                    wait_info = f"\n⏳ Примерное время ожидания пауз: **{seconds} сек**"
+                    wait_info = f"\n⏳ Примерное полное время обработки: **{seconds} сек**"
 
             await telegram_client.send_message(
                 RESULTS_DESTINATION,
