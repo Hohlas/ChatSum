@@ -243,6 +243,11 @@ def extract_api_error_message(error):
     except Exception:
         payload = None
 
+    if isinstance(payload, list) and payload:
+        first_item = payload[0]
+        if isinstance(first_item, dict):
+            payload = first_item
+
     if isinstance(payload, dict):
         error_obj = payload.get('error')
         if isinstance(error_obj, dict):
@@ -255,6 +260,31 @@ def extract_api_error_message(error):
         return text.strip()
 
     return str(error)
+
+
+def is_quota_exceeded_error(error_message):
+    """
+    Проверяет, что ошибка связана с исчерпанием квоты Gemini.
+    """
+    if not error_message:
+        return False
+
+    error_lower = error_message.lower()
+    return (
+        'quota exceeded' in error_lower
+        or 'resource_exhausted' in error_lower
+        or 'generaterequestsperdayperprojectpermodel-freetier' in error_lower
+    )
+
+
+def trim_text_for_telegram(text, max_length=3500):
+    """
+    Ограничивает длину текста для безопасной отправки в Telegram.
+    """
+    if not text or len(text) <= max_length:
+        return text
+
+    return text[:max_length - 20].rstrip() + "\n... [обрезано]"
 
 # Пути к конфигурационным файлам
 EXCLUDED_USERS_FILE = 'EXCLUDED_USERS.txt'
@@ -1288,8 +1318,15 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
             'errors': []
         }
         errors_count = 0
+        stop_due_to_quota = False
         
         for chunk_idx, (chunk_messages, start_idx, end_idx) in enumerate(chunks, 1):
+            if stop_due_to_quota:
+                skipped_msg = "⚠️ Чанк пропущен: обработка остановлена после исчерпания квоты Gemini API"
+                chunk_summaries.append((start_idx, end_idx, skipped_msg, True))
+                errors_count += 1
+                continue
+
             chunk_size = len(chunk_messages)
             print(f"\n📦 Обработка чанка {chunk_idx} из {num_chunks} ({chunk_size} сообщений: {start_idx}-{end_idx})")
             
@@ -1413,6 +1450,10 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                 chunk_summaries.append((start_idx, end_idx, error_msg, True))
                 total_usage['errors'].append(error_msg)
                 errors_count += 1
+
+                if is_quota_exceeded_error(api_message):
+                    stop_due_to_quota = True
+                    print("   ⛔ Обработка следующих чанков остановлена: исчерпана квота Gemini API")
                 
             except Exception as e:
                 error_msg = f"❌ Ошибка: {type(e).__name__}: {e}"
@@ -2393,7 +2434,7 @@ async def process_chat_command(event, use_ai=True):
             if usage_info and usage_info.get('errors'):
                 stats_message += "\n⚠️ Ошибки API:\n"
                 for error_text in usage_info['errors'][:3]:
-                    stats_message += f"• {error_text}\n"
+                    stats_message += f"• {trim_text_for_telegram(error_text, max_length=500)}\n"
                 if len(usage_info['errors']) > 3:
                     stats_message += f"• ... и ещё {len(usage_info['errors']) - 3}\n"
             
@@ -2465,6 +2506,7 @@ async def process_chat_command(event, use_ai=True):
                     header += "\n"
                     stats_message = header + stats_message
                     stats_message += f"\n<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
+                    stats_message = trim_text_for_telegram(stats_message)
                     
                     # Отправляем сообщение с ссылками
                     await telegram_client.send_message(
@@ -2535,6 +2577,7 @@ async def process_chat_command(event, use_ai=True):
                     header = f"📰 Саммари чата <a href=\"{article_url}\"><b>{chat_name}</b></a>\n\n"
                     stats_message = header + stats_message
                     stats_message += f"\n<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
+                    stats_message = trim_text_for_telegram(stats_message)
 
                     # отправляем сообщение с статистикой и ссылкой на Telegraph
                     await telegram_client.send_message(
