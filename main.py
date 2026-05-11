@@ -912,7 +912,7 @@ def count_messages_with_urls(messages_data):
     return count, urls
 
 
-async def collect_messages(chat_id, hours=None, days=None, limit=None):
+async def collect_messages(chat_id, hours=None, days=None, limit=None, range_start=None, range_end=None, time_range_start=None, time_range_end=None):
     """
     Собирает сообщения из чата с догрузкой родительских сообщений для контекста
     
@@ -921,6 +921,10 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None):
         hours: Количество часов назад (опционально)
         days: Количество дней назад (опционально)
         limit: Количество последних сообщений (опционально)
+        range_start: Номер первого сообщения от конца, включительно (опционально)
+        range_end: Номер последнего сообщения от конца, включительно (опционально)
+        time_range_start: Ближняя граница диапазона времени от текущего момента (опционально)
+        time_range_end: Дальняя граница диапазона времени от текущего момента (опционально)
     
     Returns:
         Кортеж (список сообщений, chat_id_str для ссылок, period_start_date)
@@ -935,7 +939,77 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None):
     loaded_ids = set()  # Отслеживаем загруженные ID
     reply_to_ids = set()  # Отслеживаем ID на которые есть ответы
     
-    if limit:
+    if time_range_start and time_range_end:
+        # Режим: диапазон по времени от текущего момента.
+        # Например 2d-3d означает сообщения старше 2 дней, но новее 3 дней.
+        print(f"🔄 Загрузка сообщений за диапазон {time_range_start}-{time_range_end} назад...")
+        now_utc = datetime.now(timezone.utc)
+        newer_than = now_utc - time_range_end
+        older_than = now_utc - time_range_start
+
+        async for message in telegram_client.iter_messages(chat_id):
+            msg_date = message.date
+            if msg_date.tzinfo is None:
+                msg_date = msg_date.replace(tzinfo=timezone.utc)
+            elif msg_date.tzinfo != timezone.utc:
+                msg_date = msg_date.astimezone(timezone.utc)
+
+            if msg_date < newer_than:
+                break
+            if msg_date > older_than:
+                continue
+
+            if message.text:
+                sender = await message.get_sender()
+                sender_name = get_sender_name(sender)
+
+                # Добавляем информацию об ответе на сообщение (если есть)
+                reply_to = None
+                if message.reply_to and hasattr(message.reply_to, 'reply_to_msg_id'):
+                    reply_to = message.reply_to.reply_to_msg_id
+                    reply_to_ids.add(reply_to)
+
+                loaded_ids.add(message.id)
+                messages_data.append({
+                    'sender': sender_name,
+                    'text': message.text,
+                    'date': message.date.strftime('%Y-%m-%d %H:%M:%S'),
+                    'message_id': message.id,
+                    'reply_to': reply_to
+                })
+    elif range_start and range_end:
+        # Режим: диапазон текстовых сообщений от конца чата.
+        # Например 600-800 означает сообщения с 600-го по 800-е от newest к oldest.
+        print(f"🔄 Загрузка сообщений диапазона {range_start}-{range_end} от конца...")
+        text_position = 0
+        async for message in telegram_client.iter_messages(chat_id):
+            if not message.text:
+                continue
+
+            text_position += 1
+            if text_position < range_start:
+                continue
+            if text_position > range_end:
+                break
+
+            sender = await message.get_sender()
+            sender_name = get_sender_name(sender)
+
+            # Добавляем информацию об ответе на сообщение (если есть)
+            reply_to = None
+            if message.reply_to and hasattr(message.reply_to, 'reply_to_msg_id'):
+                reply_to = message.reply_to.reply_to_msg_id
+                reply_to_ids.add(reply_to)
+
+            loaded_ids.add(message.id)
+            messages_data.append({
+                'sender': sender_name,
+                'text': message.text,
+                'date': message.date.strftime('%Y-%m-%d %H:%M:%S'),
+                'message_id': message.id,
+                'reply_to': reply_to
+            })
+    elif limit:
         # Режим: последние N сообщений
         print(f"🔄 Загрузка последних {limit} сообщений...")
         count = 0
@@ -1066,6 +1140,19 @@ def safe_str(value):
     if isinstance(value, bytes):
         return value.decode('utf-8', errors='ignore')
     return str(value)
+
+
+def format_timedelta_short(delta):
+    """Форматирует timedelta для командного статуса: 2d, 12h или 1d6h."""
+    total_seconds = int(delta.total_seconds())
+    days = total_seconds // 86400
+    hours = (total_seconds % 86400) // 3600
+
+    if days and hours:
+        return f"{days}d{hours}h"
+    if days:
+        return f"{days}d"
+    return f"{hours}h"
 
 
 def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, total_messages=None, filtered_messages=None, period_start_date=None):
@@ -2430,30 +2517,64 @@ async def process_chat_command(event, use_ai=True):
         hours = None
         days = None
         limit = None
+        range_start = None
+        range_end = None
+        time_range_start = None
+        time_range_end = None
         
         # Обрабатываем параметры
-        # Поддерживаем форматы: /sum 3h, /sum 2d, /sum 100, /sum 1d 6h
+        # Поддерживаем форматы: /sum 3h, /sum 2d, /sum 100, /sum 1d 6h, /sum 600-800, /sum 2d-3d
         if len(parts) > 1:
             # Обрабатываем все параметры (может быть несколько, напр. "1d 6h")
             for param in parts[1:]:
                 param_clean = param.lower().strip()
                 
-                if param_clean.endswith('h'):
+                time_range_match = re.fullmatch(r'(\d+)([hd])\s*-\s*(\d+)([hd])', param_clean)
+                range_match = re.fullmatch(r'(\d+)\s*-\s*(\d+)', param_clean)
+                if time_range_match:
+                    start_val = int(time_range_match.group(1))
+                    start_unit = time_range_match.group(2)
+                    end_val = int(time_range_match.group(3))
+                    end_unit = time_range_match.group(4)
+
+                    start_delta = timedelta(days=start_val) if start_unit == 'd' else timedelta(hours=start_val)
+                    end_delta = timedelta(days=end_val) if end_unit == 'd' else timedelta(hours=end_val)
+
+                    if start_delta > timedelta(0) and end_delta > start_delta:
+                        time_range_start = start_delta
+                        time_range_end = end_delta
+                        range_start = None
+                        range_end = None
+                        limit = None
+                        hours = None
+                        days = None
+                elif range_match:
+                    start_val = int(range_match.group(1))
+                    end_val = int(range_match.group(2))
+                    if start_val > 0 and end_val >= start_val:
+                        range_start = start_val
+                        range_end = end_val
+                        time_range_start = None
+                        time_range_end = None
+                        limit = None
+                        hours = None
+                        days = None
+                elif param_clean.endswith('h') and range_start is None and time_range_start is None:
                     # Параметр часов
                     hours_val = int(param_clean.replace('h', ''))
                     if hours_val > 0:
                         hours = hours_val
-                elif param_clean.endswith('d'):
+                elif param_clean.endswith('d') and range_start is None and time_range_start is None:
                     # Параметр дней
                     days_val = int(param_clean.replace('d', ''))
                     if days_val > 0:
                         days = days_val
-                elif param_clean.isdigit():
+                elif param_clean.isdigit() and range_start is None and time_range_start is None:
                     # Это количество сообщений
                     limit = int(param_clean)
         
         # Если ничего не указано, по умолчанию 24 часа
-        if hours is None and days is None and limit is None:
+        if hours is None and days is None and limit is None and range_start is None and time_range_start is None:
             hours = 24
         
         # Удаляем команду из чата (для приватности)
@@ -2464,7 +2585,11 @@ async def process_chat_command(event, use_ai=True):
         
         # Формируем сообщение о начале
         action = "анализ" if use_ai else "экспорт"
-        if limit:
+        if time_range_start and time_range_end:
+            status_msg = f"🔄 Начинаю {action} сообщений за диапазон {format_timedelta_short(time_range_start)}-{format_timedelta_short(time_range_end)} назад из чата '{chat_name}'..."
+        elif range_start and range_end:
+            status_msg = f"🔄 Начинаю {action} сообщений {range_start}-{range_end} от конца чата '{chat_name}'..."
+        elif limit:
             status_msg = f"🔄 Начинаю {action} последних {limit} сообщений из чата '{chat_name}'..."
         else:
             status_msg = f"🔄 Начинаю {action} чата '{chat_name}' за последние {days or 0} дней и {hours or 0} часов..."
@@ -2477,7 +2602,16 @@ async def process_chat_command(event, use_ai=True):
         )
         
         # Собираем сообщения
-        messages_data, chat_id_str, period_start_date = await collect_messages(event.chat_id, hours=hours, days=days, limit=limit)
+        messages_data, chat_id_str, period_start_date = await collect_messages(
+            event.chat_id,
+            hours=hours,
+            days=days,
+            limit=limit,
+            range_start=range_start,
+            range_end=range_end,
+            time_range_start=time_range_start,
+            time_range_end=time_range_end
+        )
         
         if not messages_data:
             await telegram_client.send_message(
@@ -3226,6 +3360,8 @@ async def handle_sum_command(event):
     Примеры:
     /sum 3h - анализ за 3 часа
     /sum 45 - анализ 45 сообщений
+    /sum 600-800 - анализ сообщений с 600-го по 800-е от конца
+    /sum 2d-3d - анализ сообщений от 3 до 2 дней назад
     """
     await process_chat_command(event, use_ai=True)
 
@@ -3238,6 +3374,8 @@ async def handle_copy_command(event):
     Примеры:
     /copy 3h - экспорт за 3 часа
     /copy 45 - экспорт 45 сообщений
+    /copy 600-800 - экспорт сообщений с 600-го по 800-е от конца
+    /copy 2d-3d - экспорт сообщений от 3 до 2 дней назад
     """
     await process_chat_command(event, use_ai=False)
 
@@ -3260,11 +3398,15 @@ async def handle_help_command(event):
   • `/sum 2d` - за последние 2 дня
   • `/sum 45` - последние 45 сообщений
   • `/sum 100` - последние 100 сообщений
+  • `/sum 600-800` - сообщения с 600-го по 800-е от конца
+  • `/sum 2d-3d` - сообщения от 3 до 2 дней назад
 
 `/copy` - экспорт без анализа (для ручной обработки)
 Примеры:
   • `/copy 3h` - экспорт за 3 часа
   • `/copy 50` - экспорт 50 сообщений
+  • `/copy 600-800` - экспорт сообщений с 600-го по 800-е от конца
+  • `/copy 2d-3d` - экспорт сообщений от 3 до 2 дней назад
   • Результат: JSON файл + текст для Google AI Studio
 
 `/help` - показать эту справку
@@ -3383,10 +3525,14 @@ async def main():
     print("    /sum - анализ чата с AI (по времени или количеству)")
     print("    /sum 3h - последние 3 часа")
     print("    /sum 45 - последние 45 сообщений")
+    print("    /sum 600-800 - сообщения с 600-го по 800-е от конца")
+    print("    /sum 2d-3d - сообщения от 3 до 2 дней назад")
     print("  Экспорт:")
     print("    /copy - экспорт без AI (для ручного анализа)")
     print("    /copy 3h - экспорт за 3 часа")
     print("    /copy 50 - экспорт 50 сообщений")
+    print("    /copy 600-800 - экспорт сообщений с 600-го по 800-е от конца")
+    print("    /copy 2d-3d - экспорт сообщений от 3 до 2 дней назад")
     print("  Конфигурация:")
     print("    /config - показать конфигурацию")
     print("    /show_model - показать настройки модели AI")
