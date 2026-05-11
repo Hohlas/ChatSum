@@ -2919,7 +2919,7 @@ async def process_chat_command(event, use_ai=True):
                 
                 if article_url:
                     # Вставляем заголовок с саммари в начало сообщения
-                    header = f"📰 Саммари чата <a href=\"{article_url}\"><b>{chat_name}</b></a>\n\n"
+                    header = f"📰 <a href=\"{article_url}\"><b>Саммари чата {chat_name}</b></a>\n\n"
                     stats_message = header + stats_message
                     stats_message += f"\n<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
                     stats_message = trim_text_for_telegram(stats_message)
