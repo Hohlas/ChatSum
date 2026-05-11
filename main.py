@@ -1155,6 +1155,18 @@ def format_timedelta_short(delta):
     return f"{hours}h"
 
 
+def build_processed_label(count, range_start=None, range_end=None, time_range_start=None, time_range_end=None):
+    """
+    Формирует подпись для статистики.
+    Для явных диапазонов показывает исходный диапазон команды, а не только число после фильтрации.
+    """
+    if range_start and range_end:
+        return f"{range_start}-{range_end} сообщений"
+    if time_range_start and time_range_end:
+        return f"{format_timedelta_short(time_range_start)}-{format_timedelta_short(time_range_end)} назад ({count} сообщений)"
+    return f"{count} сообщений"
+
+
 def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, total_messages=None, filtered_messages=None, period_start_date=None):
     """
     Формирует оптимизированную JSON структуру для экспорта/анализа
@@ -2683,6 +2695,14 @@ async def process_chat_command(event, use_ai=True):
         
         # Ветвление: с AI или без
         if use_ai:
+            processed_label = build_processed_label(
+                len(optimized_messages),
+                range_start=range_start,
+                range_end=range_end,
+                time_range_start=time_range_start,
+                time_range_end=time_range_end
+            )
+
             # Режим /sum - анализ с AI
             summary, usage_info = await create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_reasoning=USE_REASONING, period_start_date=period_start_date)
             
@@ -2742,7 +2762,7 @@ async def process_chat_command(event, use_ai=True):
             # Формируем статистику в новом формате
             stats_message = ""
             stats_message += f"• Модель: {GEMINI_DEFAULT_MODEL}\n"
-            stats_message += f"• Обработано: {len(optimized_messages)} сообщений = {topics_count} Тем\n"
+            stats_message += f"• Обработано: {processed_label} = {topics_count} Тем\n"
             if url_count > 0:
                 stats_message += f"• URL в сообщениях: {url_count}\n"
             if period_text:
@@ -2889,7 +2909,13 @@ async def process_chat_command(event, use_ai=True):
                 # ═══════════════════════════════════════════════════════════════
                 # ОБЫЧНЫЙ РЕЖИМ: одна публикация в Telegraph
                 # ═══════════════════════════════════════════════════════════════
-                article_url = await publish_to_telegraph(article_title, full_content, author_name="ChatSumBot")
+                single_article_title = article_title
+                if range_start and range_end:
+                    single_article_title = f"{article_title} - сообщения {range_start}-{range_end}"
+                elif time_range_start and time_range_end:
+                    single_article_title = f"{article_title} - {format_timedelta_short(time_range_start)}-{format_timedelta_short(time_range_end)} назад"
+
+                article_url = await publish_to_telegraph(single_article_title, full_content, author_name="ChatSumBot")
                 
                 if article_url:
                     # Вставляем заголовок с саммари в начало сообщения
@@ -2908,7 +2934,7 @@ async def process_chat_command(event, use_ai=True):
 
                     # Если USE_HTML_EXPORT=true, дополнительно создаем и отправляем HTML файл
                     if USE_HTML_EXPORT:
-                        html_file = create_html_report(article_title, full_content, author_name="ChatSumBot")
+                        html_file = create_html_report(single_article_title, full_content, author_name="ChatSumBot")
                         
                         if html_file:
                             #  отправляем HTML файл отдельным сообщением
@@ -2963,6 +2989,14 @@ async def process_chat_command(event, use_ai=True):
             print("✅ Анализ с AI успешно завершён")
         
         else:
+            processed_label = build_processed_label(
+                len(optimized_messages),
+                range_start=range_start,
+                range_end=range_end,
+                time_range_start=time_range_start,
+                time_range_end=time_range_end
+            )
+
             # Режим /copy - экспорт без AI
             # Используем общую функцию для формирования структуры (такая же как в /sum)
             export_data = build_optimized_json_structure(
@@ -3005,7 +3039,7 @@ async def process_chat_command(event, use_ai=True):
             
             # Формируем caption в новом формате
             caption = f"📋 Экспорт завершен\n\n"
-            caption += f"• Обработано: {len(optimized_messages)} сообщений\n"
+            caption += f"• Обработано: {processed_label}\n"
             if period_text:
                 caption += f"• За период: {period_text}\n"
                 caption += f"• С {period_start_time} по {period_end_time}\n"
