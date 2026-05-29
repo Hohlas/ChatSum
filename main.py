@@ -1546,7 +1546,7 @@ def split_summary_into_parts(summary_text):
         end_idx = int(match[2])
         content = match[3].strip()
         
-        part_title = f"Часть {part_num} (сообщения {start_idx}-{end_idx})"
+        part_title = f"Часть {part_num}"
         parts.append((part_title, content, start_idx, end_idx))
     
     return parts
@@ -1972,6 +1972,62 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         traceback.print_exc()
         
         return error_msg, None
+def enrich_summary_with_timestamps(summary_text, messages_data):
+    msg_date_map = {}
+    for msg in messages_data:
+        mid = msg.get('message_id')
+        if mid is not None:
+            msg_date_map[mid] = msg.get('date', '')
+
+    if not msg_date_map:
+        return summary_text
+
+    parts = summary_text.split('\n💡')
+    if len(parts) <= 1:
+        return summary_text
+
+    enriched = [parts[0]]
+
+    for block in parts[1:]:
+        block = '💡' + block
+
+        link_match = re.search(r'https://t\.me/c/\d+/(\d+)', block)
+        if not link_match:
+            enriched.append(block)
+            continue
+
+        message_id = int(link_match.group(1))
+        date_str = msg_date_map.get(message_id, '')
+        if not date_str:
+            enriched.append(block)
+            continue
+
+        try:
+            dt = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+            formatted_date = dt.strftime('%d.%m %H:%M')
+        except ValueError:
+            enriched.append(block)
+            continue
+
+        timestamp_line = f'\n- *{formatted_date}* -\n'
+
+        link_pos = link_match.start()
+        newline_before_link = block.rfind('\n', 0, link_pos)
+        if newline_before_link == -1:
+            enriched.append(block)
+            continue
+
+        enriched_block = block[:newline_before_link] + timestamp_line + block[newline_before_link:]
+        enriched.append(enriched_block)
+
+    return '\n💡'.join([enriched[0]] + [b[1:] for b in enriched[1:]])
+
+
+def extract_summary_time_range(summary_text):
+    matches = re.findall(r'^- \*(\d{2}\.\d{2} \d{2}:\d{2})\* -$', summary_text, re.MULTILINE)
+    if len(matches) >= 1:
+        return matches[0], matches[-1]
+    return None, None
 
 
 # Разрешенные теги Telegraph (whitelist)
@@ -2130,7 +2186,38 @@ def convert_markdown_to_html(content):
             text = MD_ITALIC_RE.sub(r'<i>\1</i>', text)
             html_paragraphs.append(f'<h3>{text}</h3>')
             continue
-        
+        # Строка с датой/временем (центрированный курсив)
+        ts_match = re.match(r'^-\s*\*(\d{2}\.\d{2}\s+\d{2}:\d{2})\*\s*-$', line_stripped)
+        if ts_match:
+            if current_paragraph:
+                para_text = '<br>'.join(current_paragraph)
+                para_text = MD_BOLD_RE.sub(r'<b>\1</b>', para_text)
+                para_text = MD_ITALIC_RE.sub(r'<i>\1</i>', para_text)
+                para_text = MD_LINK_RE.sub(r'<a href="\2">\1</a>', para_text)
+                html_paragraphs.append(f'<p>{para_text}</p>')
+                current_paragraph = []
+            if in_list:
+                html_paragraphs.append('</ul>')
+                in_list = False
+            html_paragraphs.append(f'<p align="center"><i>\u2014 {ts_match.group(1)} \u2014</i></p>')
+            continue
+
+        # Строка с диапазоном времени (центрированный курсив в скобках)
+        tr_match = re.match(r'^\*\((\d{2}\.\d{2} \d{2}:\d{2} - \d{2}\.\d{2} \d{2}:\d{2})\)\*$', line_stripped)
+        if tr_match:
+            if current_paragraph:
+                para_text = '<br>'.join(current_paragraph)
+                para_text = MD_BOLD_RE.sub(r'<b>\1</b>', para_text)
+                para_text = MD_ITALIC_RE.sub(r'<i>\1</i>', para_text)
+                para_text = MD_LINK_RE.sub(r'<a href="\2">\1</a>', para_text)
+                html_paragraphs.append(f'<p>{para_text}</p>')
+                current_paragraph = []
+            if in_list:
+                html_paragraphs.append('</ul>')
+                in_list = False
+            html_paragraphs.append(f'<p align="center"><i>({tr_match.group(1)})</i></p>')
+            continue
+
         # Пункт списка (может быть - или • или *)
         if line_stripped.startswith('- ') or line_stripped.startswith('* ') or line_stripped.startswith('• '):
             if current_paragraph:
@@ -2757,6 +2844,8 @@ async def process_chat_command(event, use_ai=True):
                 )
                 return
             
+            summary = enrich_summary_with_timestamps(summary, optimized_messages)
+            
             analysis_filename = save_analysis(optimized_messages, summary)
             
             # Подсчитываем количество тем (по разделителю "---")
@@ -2816,7 +2905,14 @@ async def process_chat_command(event, use_ai=True):
                     stats_message += f"• ... и ещё {len(usage_info['errors']) - 3}\n"
             
             # Формируем полный контент для Telegraph (с статистикой в конце)
-            full_content = summary
+            overall_first, overall_last = extract_summary_time_range(summary)
+            if overall_first and overall_last:
+                overall_time_line = f"*({overall_first} - {overall_last})*\n\n"
+                if overall_first == overall_last:
+                    overall_time_line = f"*({overall_first})*\n\n"
+                full_content = overall_time_line + summary
+            else:
+                full_content = summary
             # Закомментировано: статистика токенов в конце статьи Telegraph
             # if usage_info and prompt_tokens is not None:
             #     full_content += f"\n\n---\n\n"
@@ -2846,9 +2942,17 @@ async def process_chat_command(event, use_ai=True):
                 
                 article_urls = []
                 for part_idx, (part_title, part_content, start_idx, end_idx) in enumerate(summary_parts, 1):
+                    # Извлекаем диапазон времени для этой части
+                    part_time_first, part_time_last = extract_summary_time_range(part_content)
+                    if part_time_first and part_time_last:
+                        time_range_line = f"\n*({part_time_first} - {part_time_last})*\n"
+                        if part_time_first == part_time_last:
+                            time_range_line = f"\n*({part_time_first})*\n"
+                    else:
+                        time_range_line = ""
                     # Добавляем футер к каждой части
-                    part_with_footer = part_content + bot_footer
-                    part_article_title = f"Саммари чата: {chat_name} - {part_title}"
+                    part_with_footer = time_range_line + part_content + bot_footer
+                    part_article_title = f"Саммари чата: {chat_name} - Часть {part_idx}"
                     
                     part_url = await publish_to_telegraph(
                         part_article_title, 
@@ -2858,11 +2962,12 @@ async def process_chat_command(event, use_ai=True):
                     )
                     
                     if part_url:
-                        article_urls.append((part_title, part_url, start_idx, end_idx))
+                        part_time_label = f"{part_time_first} - {part_time_last}" if part_time_first and part_time_last else ""
+                        article_urls.append((part_title, part_url, part_time_label))
                         print(f"   ✅ Часть {part_idx}: {part_url}")
                     else:
                         print(f"   ❌ Не удалось опубликовать часть {part_idx}")
-                        article_urls.append((part_title, None, start_idx, end_idx))
+                        article_urls.append((part_title, None, part_time_label))
                     
                     # Пауза между публикациями (кроме последней части)
                     if part_idx < len(summary_parts):
@@ -2870,15 +2975,16 @@ async def process_chat_command(event, use_ai=True):
                         await asyncio.sleep(4)
                 
                 # Формируем сообщение со ссылками на все части
-                if any(url for _, url, _, _ in article_urls):
+                if any(url for _, url, _ in article_urls):
                     header = f"📰 Саммари чата <b>{chat_name}</b>\n"
                     # header += f"📊 Обработано в {len(summary_parts)} частях:\n\n"
                     
-                    for part_title, part_url, start_idx, end_idx in article_urls:
+                    for part_title, part_url, part_time_label in article_urls:
+                        display_label = f"{part_title} ({part_time_label})" if part_time_label else part_title
                         if part_url:
-                            header += f"• <a href=\"{part_url}\">{part_title}</a>\n\n"
+                            header += f"• <a href=\"{part_url}\">{display_label}</a>\n\n"
                         else:
-                            header += f"• {part_title} (⚠️ ошибка публикации)\n"
+                            header += f"• {display_label} (⚠️ ошибка публикации)\n"
                     
                     header += "\n"
                     stats_message = header + stats_message
@@ -2948,10 +3054,6 @@ async def process_chat_command(event, use_ai=True):
                 # ОБЫЧНЫЙ РЕЖИМ: одна публикация в Telegraph
                 # ═══════════════════════════════════════════════════════════════
                 single_article_title = article_title
-                if range_start and range_end:
-                    single_article_title = f"{article_title} - сообщения {range_start}-{range_end}"
-                elif time_range_start and time_range_end:
-                    single_article_title = f"{article_title} - {format_timedelta_short(time_range_start)}-{format_timedelta_short(time_range_end)} назад"
 
                 article_url = await publish_to_telegraph(single_article_title, full_content, author_name="ChatSumBot")
                 
