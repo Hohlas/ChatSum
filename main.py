@@ -1142,6 +1142,55 @@ def safe_str(value):
     return str(value)
 
 
+def plural_days(n):
+    """Правильная форма слова 'день' для числа n: 1 день, 2 дня, 6 дней."""
+    if 11 <= n % 100 <= 19:
+        return "дней"
+    last_digit = n % 10
+    if last_digit == 1:
+        return "день"
+    if 2 <= last_digit <= 4:
+        return "дня"
+    return "дней"
+
+
+def plural_hours(n):
+    """Правильная форма слова 'час' для числа n: 1 час, 2 часа, 6 часов."""
+    if 11 <= n % 100 <= 19:
+        return "часов"
+    last_digit = n % 10
+    if last_digit == 1:
+        return "час"
+    if 2 <= last_digit <= 4:
+        return "часа"
+    return "часов"
+
+
+def plural_messages(n):
+    """Правильная форма слова 'сообщение' для числа n."""
+    if 11 <= n % 100 <= 19:
+        return "сообщений"
+    last_digit = n % 10
+    if last_digit == 1:
+        return "сообщение"
+    if 2 <= last_digit <= 4:
+        return "сообщения"
+    return "сообщений"
+
+
+def format_period_text(period_hours):
+    """Форматирует длительность периода с правильными склонениями."""
+    if period_hours is None:
+        return ""
+    if period_hours < 24:
+        return f"{period_hours} {plural_hours(period_hours)}"
+    period_days = period_hours // 24
+    remaining_hours = period_hours % 24
+    if remaining_hours > 0:
+        return f"{period_days} {plural_days(period_days)} {remaining_hours} {plural_hours(remaining_hours)}"
+    return f"{period_days} {plural_days(period_days)}"
+
+
 def format_timedelta_short(delta):
     """Форматирует timedelta для командного статуса: 2d, 12h или 1d6h."""
     total_seconds = int(delta.total_seconds())
@@ -1163,8 +1212,8 @@ def build_processed_label(count, range_start=None, range_end=None, time_range_st
     if range_start and range_end:
         return f"{range_start}-{range_end} сообщений"
     if time_range_start and time_range_end:
-        return f"{format_timedelta_short(time_range_start)}-{format_timedelta_short(time_range_end)} назад ({count} сообщений)"
-    return f"{count} сообщений"
+        return f"{format_timedelta_short(time_range_start)}-{format_timedelta_short(time_range_end)} назад ({count} {plural_messages(count)})"
+    return f"{count} {plural_messages(count)}"
 
 
 def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, total_messages=None, filtered_messages=None, period_start_date=None):
@@ -2204,18 +2253,10 @@ def calculate_period_info(messages_data, optimized_messages, period_start_date, 
     # Формируем информацию о периоде
     period_info = ""
     if period_hours is not None:
+        msg_count = len(optimized_messages)
         period_info = f"\n\n📅 **Период {label}:**\n"
-        period_info += f"• Обработано: {len(optimized_messages)} сообщений\n"
-        if period_hours < 24:
-            period_info += f"• За период: {period_hours} часов\n"
-        else:
-            period_days = period_hours // 24
-            remaining_hours = period_hours % 24
-            if remaining_hours > 0:
-                period_info += f"• За период: {period_days} дней {remaining_hours} часов\n"
-            else:
-                period_info += f"• За период: {period_days} дней\n"
-        period_info += f"• С {period_start_time} по {period_end_time}\n"
+        period_info += f"• Обработано: {msg_count} {plural_messages(msg_count)}\n"
+        period_info += f"• За {format_period_text(period_hours)} (с {period_start_time} по {period_end_time})\n"
     
     return period_info, period_start_time, period_end_time, period_start_dt, period_end_dt
 
@@ -2730,20 +2771,11 @@ async def process_chat_command(event, use_ai=True):
             )
             
             # Вычисляем длительность для вывода
-            # Используем результат calculate_period_info
             period_text = ""
             if period_start_dt and period_end_dt:
                 delta = period_end_dt - period_start_dt
                 period_hours = abs(round(delta.total_seconds() / 3600))
-                if period_hours < 24:
-                    period_text = f"{period_hours} часов"
-                else:
-                    period_days = period_hours // 24
-                    remaining_hours = period_hours % 24
-                    if remaining_hours > 0:
-                        period_text = f"{period_days} дней {remaining_hours} часов"
-                    else:
-                        period_text = f"{period_days} дней"
+                period_text = format_period_text(period_hours)
             
             # Добавляем информацию о токенах и стоимости
             prompt_tokens = None
@@ -2759,17 +2791,23 @@ async def process_chat_command(event, use_ai=True):
                 # Стоимость не рассчитываем без явных тарифов
                 total_cost = None
             
-            # Формируем статистику в новом формате
+            # Формируем статистику в компактном формате
             stats_message = ""
-            stats_message += f"• Модель: {GEMINI_DEFAULT_MODEL}\n"
-            stats_message += f"• Обработано: {processed_label} = {topics_count} Тем\n"
+            extra_info = []
+            if topics_count > 0:
+                extra_info.append(f"{topics_count} Тем")
             if url_count > 0:
-                stats_message += f"• URL в сообщениях: {url_count}\n"
-            if period_text:
-                stats_message += f"• За период: {period_text}\n"
-                stats_message += f"• С {period_start_time} по {period_end_time}\n"
+                extra_info.append(f"{url_count} URL")
+            stats_message += f"• Обработано: {processed_label}"
+            if extra_info:
+                stats_message += f" ({', '.join(extra_info)})"
+            stats_message += "\n"
+            if period_text and period_start_time and period_end_time:
+                stats_message += f"• За {period_text} (с {period_start_time} по {period_end_time})\n"
             if usage_info and total_tokens:
-                stats_message += f"• Токенов: {total_tokens:,}\n"
+                stats_message += f"• Токенов: {total_tokens:,} / {GEMINI_DEFAULT_MODEL}\n"
+            else:
+                stats_message += f"• Модель: {GEMINI_DEFAULT_MODEL}\n"
             if usage_info and usage_info.get('errors'):
                 stats_message += "\n⚠️ Ошибки API:\n"
                 for error_text in usage_info['errors'][:3]:
@@ -3022,27 +3060,17 @@ async def process_chat_command(event, use_ai=True):
                 f.write(json_export)
             
             # Вычисляем длительность для caption
-            # Используем результат calculate_period_info
             period_text = ""
             if period_start_dt and period_end_dt:
                 delta = period_end_dt - period_start_dt
                 period_hours = abs(round(delta.total_seconds() / 3600))
-                if period_hours < 24:
-                    period_text = f"{period_hours} часов"
-                else:
-                    period_days = period_hours // 24
-                    remaining_hours = period_hours % 24
-                    if remaining_hours > 0:
-                        period_text = f"{period_days} дней {remaining_hours} часов"
-                    else:
-                        period_text = f"{period_days} дней"
+                period_text = format_period_text(period_hours)
             
-            # Формируем caption в новом формате
+            # Формируем caption в компактном формате
             caption = f"📋 Экспорт завершен\n\n"
             caption += f"• Обработано: {processed_label}\n"
-            if period_text:
-                caption += f"• За период: {period_text}\n"
-                caption += f"• С {period_start_time} по {period_end_time}\n"
+            if period_text and period_start_time and period_end_time:
+                caption += f"• За {period_text} (с {period_start_time} по {period_end_time})\n"
             caption += f"\n💡 Готово для копирования в Google AI Studio!\n"
             caption += f"📊 Формат: JSON v2.0 (s/t/r)"
             
