@@ -59,7 +59,13 @@ Step 4: Select citations and key arguments.
 
 ## Output Format
 Output in the Russian language.
-Format participant names as Markdown links: [{s}](https://t.me/c/{chat_id}/{id})
+Format participant names as Markdown links using placeholders from the input messages array:
+- {s} — placeholder for field "s" (sender name)
+- {id} — placeholder for field "id" (message ID)
+- {chat_id} — placeholder for field metadata.chat_id
+At output, replace each placeholder with the actual value from the corresponding field.
+Format: [{s}](https://t.me/c/{chat_id}/{id})
+Example: [SomeUserName](https://t.me/c/193/546)
 
 ⚠️ **CRITICAL INSTRUCTIONS - FOLLOW STRICTLY:**
 1. Return ONLY plain text summary - NEVER return JSON
