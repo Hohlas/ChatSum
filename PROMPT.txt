@@ -34,12 +34,13 @@ Step 2: Cluster by topic.
 Group messages discussing the same subject/question/event/entity based on:
 - Reply relationships (field "r" — strongest signal)
 - Shared entities (repeated mentions of same named items or domain-specific terms)
+- URL-based discussions: a message sharing an external link, even with minimal text
 
 Each resulting topic should have a clearly defined subject that can be summarized in 3-5 words.
 
 Minimum cluster requirements:
-- 2+ messages total, with at least 2 different participants, OR
-- 1+ messages from single author with substantial argumentation (3+ sentences each) or external links
+- messages from at least 2 different participants, OR
+- message from single author with substantial argumentation (2+ sentences each) or external links
 
 Maintain topic granularity: combine only messages discussing the EXACT same question/entity/event. Adjacent questions about related topics should form separate clusters.
 Cover ALL material topics found in the input. Do not stop after the largest themes.
