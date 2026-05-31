@@ -2823,14 +2823,6 @@ async def process_chat_command(event, use_ai=True):
         
         # Ветвление: с AI или без
         if use_ai:
-            processed_label = build_processed_label(
-                len(optimized_messages),
-                range_start=range_start,
-                range_end=range_end,
-                time_range_start=time_range_start,
-                time_range_end=time_range_end
-            )
-
             # Режим /sum - анализ с AI
             summary, usage_info = await create_summary(chunks, chat_id_str, model=GEMINI_DEFAULT_MODEL, use_reasoning=USE_REASONING, period_start_date=period_start_date)
             
@@ -2881,20 +2873,17 @@ async def process_chat_command(event, use_ai=True):
                 total_cost = None
             
             # Формируем статистику в компактном формате
-            stats_message = ""
-            extra_info = []
+            msg_count = len(optimized_messages)
+            stats_message = f"• {msg_count} {plural_messages(msg_count)}"
             if topics_count > 0:
-                extra_info.append(f"{topics_count} Тем")
+                stats_message += f", {topics_count} Тем"
             if url_count > 0:
-                extra_info.append(f"{url_count} URL")
-            stats_message += f"• Обработано: {processed_label}"
-            if extra_info:
-                stats_message += f" ({', '.join(extra_info)})"
+                stats_message += f", {url_count} URL"
             stats_message += "\n"
             if period_text and period_start_time and period_end_time:
-                stats_message += f"• За {period_text} (с {period_start_time} по {period_end_time})\n"
+                stats_message += f"• За {period_text} с {period_start_time} по {period_end_time}\n"
             if usage_info and total_tokens:
-                stats_message += f"• Токенов: {total_tokens:,} / {GEMINI_DEFAULT_MODEL}\n"
+                stats_message += f"• {total_tokens:,} токенов / {GEMINI_DEFAULT_MODEL}\n"
             else:
                 stats_message += f"• Модель: {GEMINI_DEFAULT_MODEL}\n"
             if usage_info and usage_info.get('errors'):
@@ -2986,9 +2975,8 @@ async def process_chat_command(event, use_ai=True):
                         else:
                             header += f"• {display_label} (⚠️ ошибка публикации)\n"
                     
-                    header += "\n"
+                    header += "\n---\n"
                     stats_message = header + stats_message
-                    stats_message += f"\n<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
                     stats_message = trim_text_for_telegram(stats_message)
                     
                     # Отправляем сообщение с ссылками
@@ -3059,9 +3047,8 @@ async def process_chat_command(event, use_ai=True):
                 
                 if article_url:
                     # Вставляем заголовок с саммари в начало сообщения
-                    header = f"📰 <a href=\"{article_url}\"><b>Саммари чата {chat_name}</b></a>\n\n"
+                    header = f"📰 <a href=\"{article_url}\"><b>Саммари чата {chat_name}</b></a>\n---\n"
                     stats_message = header + stats_message
-                    stats_message += f"\n<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
                     stats_message = trim_text_for_telegram(stats_message)
 
                     # отправляем сообщение с статистикой и ссылкой на Telegraph
