@@ -358,28 +358,47 @@ def should_rotate_key_for_error(error_message):
 
 async def execute_gemini_request(request_params):
     """
-    Выполняет запрос к Gemini с возможной ротацией ключей при ошибках квоты/доступа.
+    Выполняет запрос к Gemini с retry при временных сбоях и ротацией ключей при ошибках квоты/доступа.
     """
     last_error = None
     attempts = max(1, len(GOOGLE_API_KEYS))
+    max_retries_per_key = 3
 
     for attempt_idx in range(attempts):
-        try:
-            return await google_client.chat.completions.create(**request_params)
-        except AuthenticationError as e:
-            last_error = e
-            api_message = extract_api_error_message(e)
-            if attempt_idx < attempts - 1 and should_rotate_key_for_error(api_message):
-                rotate_google_api_key("ключ недоступен или невалиден, пробуем следующий")
-                continue
-            raise
-        except APIStatusError as e:
-            last_error = e
-            api_message = extract_api_error_message(e)
-            if attempt_idx < attempts - 1 and should_rotate_key_for_error(api_message):
-                rotate_google_api_key("квота/доступ исчерпаны, пробуем следующий ключ")
-                continue
-            raise
+        for retry in range(max_retries_per_key):
+            try:
+                return await google_client.chat.completions.create(**request_params)
+            except Exception as e:
+                last_error = e
+                error_str = str(e)
+
+                # Временные сбои сервера / лимиты — retry с задержкой на том же ключе
+                is_retryable = any(
+                    code in error_str for code in ('503', '429', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED')
+                ) or 'timeout' in error_str.lower()
+                if is_retryable and retry < max_retries_per_key - 1:
+                    delay = (retry + 1) * 10
+                    print(f"   ⚠️  Сервер перегружен/таймаут. Повтор через {delay}с (попытка {retry + 2}/{max_retries_per_key})...")
+                    await asyncio.sleep(delay)
+                    continue
+
+                # Ошибки аутентификации — ротация ключа
+                if isinstance(e, AuthenticationError):
+                    api_message = extract_api_error_message(e)
+                    if attempt_idx < attempts - 1 and should_rotate_key_for_error(api_message):
+                        rotate_google_api_key("ключ недоступен или невалиден, пробуем следующий")
+                        break  # выходим из retry-цикла, пробуем следующий ключ
+                    raise
+
+                # Ошибки статуса API (квоты, доступ) — ротация ключа
+                if isinstance(e, APIStatusError):
+                    api_message = extract_api_error_message(e)
+                    if attempt_idx < attempts - 1 and should_rotate_key_for_error(api_message):
+                        rotate_google_api_key("квота/доступ исчерпаны, пробуем следующий ключ")
+                        break  # выходим из retry-цикла, пробуем следующий ключ
+                    raise
+
+                raise
 
     if last_error:
         raise last_error
@@ -1696,23 +1715,9 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
             total_chars = len(system_content) + len(user_content)
             print(f"   📊 Размер запроса: {total_chars:,} символов")
             
-            # Отправляем запрос с retry логикой
+            # Отправляем запрос
             try:
-                max_retries = 2
-                retry_count = 0
-                response = None
-                
-                while retry_count <= max_retries:
-                    try:
-                        response = await execute_gemini_request(request_params)
-                        break
-                    except Exception as retry_error:
-                        if 'timeout' in str(retry_error).lower() and retry_count < max_retries:
-                            retry_count += 1
-                            print(f"   ⚠️  Таймаут. Повторная попытка {retry_count}/{max_retries}...")
-                            continue
-                        else:
-                            raise
+                response = await execute_gemini_request(request_params)
                 
                 chunk_summary = response.choices[0].message.content
                 
@@ -1887,21 +1892,8 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
             print(f"   ⏱️  Ожидаемое время обработки: ~{estimated_time} сек")
             print(f"   ⏳ Пожалуйста, подождите...")
         
-        # Отправляем запрос с retry логикой
-        max_retries = 2
-        retry_count = 0
-        
-        while retry_count <= max_retries:
-            try:
-                response = await execute_gemini_request(request_params)
-                break
-            except Exception as retry_error:
-                if 'timeout' in str(retry_error).lower() and retry_count < max_retries:
-                    retry_count += 1
-                    print(f"   ⚠️  Таймаут. Повторная попытка {retry_count}/{max_retries}...")
-                    continue
-                else:
-                    raise
+        # Отправляем запрос
+        response = await execute_gemini_request(request_params)
         
         summary = response.choices[0].message.content
         
