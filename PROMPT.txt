@@ -49,7 +49,7 @@ Ignore noise: messages without substantive arguments (e.g., 'ok', '+', bot messa
 Step 3: Formulate key idea. 
 For each topic, write 1-2 sentence summary reflecting dominant opinion, consensus, or main conclusion (note disagreements if no consensus).
 
-Step 4: Select citations and key arguments.
+Step 4: Select quotes and key arguments.
 - LIMIT: Include quotes from maximum 5 participants per topic.
 - MANDATORY: Any message that received 2+ replies must form its own separate 💡 topic.
 - Prioritize messages that: 
@@ -57,7 +57,7 @@ Step 4: Select citations and key arguments.
   2) contain external URLs 
   3) most accurately reflect the discussion essence.
 - Preserve original terminology and key phrases.
-- If a single quote exceeds 200 characters, summarize it.
+- MUST summarize quotes exceeding 200 characters.
 
 ## Output Format
 Output in the Russian language.
