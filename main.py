@@ -196,6 +196,12 @@ GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '').strip()
 GEMINI_DEFAULT_MODEL = os.getenv('GEMINI_MODEL', '').strip()
 GEMINI_REASONING_EFFORT = os.getenv('GEMINI_REASONING_EFFORT', '').strip().lower()
 GEMINI_CHUNK_MAX_CHARS = os.getenv('GEMINI_CHUNK_MAX_CHARS', '').strip()
+GEMINI_TEMPERATURE_STR = os.getenv('GEMINI_TEMPERATURE', '0').strip()
+try:
+    GEMINI_TEMPERATURE = float(GEMINI_TEMPERATURE_STR)
+except ValueError:
+    print(f"⚠️ Неверное значение GEMINI_TEMPERATURE={GEMINI_TEMPERATURE_STR}, использую 0")
+    GEMINI_TEMPERATURE = 0.0
 
 ALLOWED_REASONING_EFFORTS = {'none', 'low', 'medium', 'high'}
 
@@ -1680,7 +1686,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                     {'role': 'system', 'content': system_content},
                     {'role': 'user', 'content': user_content}
                 ],
-                'temperature': 0.3,
+                'temperature': GEMINI_TEMPERATURE,
                 'max_tokens': output_max_tokens
             }
 
@@ -1866,7 +1872,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                 {'role': 'system', 'content': system_content},
                 {'role': 'user', 'content': user_content}
             ],
-            'temperature': 0.3,
+            'temperature': GEMINI_TEMPERATURE,
             'max_tokens': output_max_tokens
         }
 
