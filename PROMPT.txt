@@ -51,7 +51,7 @@ For each topic, write 1-2 sentence summary reflecting dominant opinion, consensu
 
 Step 4: Select citations and key arguments.
 - LIMIT: Include quotes from maximum 5 participants per topic.
-- MANDATORY: Any message that received 2+ replies must form a 💡 topic.
+- MANDATORY: Any message that received 2+ replies must form its own separate 💡 topic.
 - Prioritize messages that: 
   1) are from {PRIORITY_USERS} (key contributors by field "s") 
   2) contain external URLs 
