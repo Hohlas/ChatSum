@@ -32,7 +32,8 @@ Use field "r" to identify reply relationships between messages.
 
 Step 2: Cluster by topic. 
 Group messages discussing the same subject/question/event/entity based on:
-- Reply relationships (field "r" — strongest signal)
+- Reply relationships (field "r" — strongest signal).
+  MANDATORY: Any message that received 2+ replies must form its own separate 💡 topic. Never merge a reply chain into another topic — even if thematically related.
 - Shared entities (repeated mentions of same named items or domain-specific terms)
 - URL-based discussions: a message sharing an external link, even with minimal text
 
@@ -51,7 +52,6 @@ For each topic, write 1-2 sentence summary reflecting dominant opinion, consensu
 
 Step 4: Select quotes and key arguments.
 - LIMIT: Include quotes from maximum 5 participants per topic.
-- MANDATORY: Any message that received 2+ replies must form its own separate 💡 topic.
 - Prioritize messages that: 
   1) are from {PRIORITY_USERS} (key contributors by field "s") 
   2) contain external URLs 

@@ -250,7 +250,6 @@ def get_model_generation_config(model_name):
         config.update({
             'context_limit_tokens': 1048576,
             'output_max_tokens': 65536,
-            'reasoning_effort': 'low',
             'chunk_max_chars': 60000,
         })
         config['chunk_overlap_chars'] = int(config['chunk_max_chars'] * DEFAULT_CHUNK_OVERLAP_RATIO)

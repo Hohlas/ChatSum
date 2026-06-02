@@ -16,5 +16,5 @@ GOOGLE_API_KEY3=AIzaSy...
 # Google Gemini
 GEMINI_MODEL=gemini-2.5-flash
 GEMINI_TEMPERATURE=0           # 0 = детерминированный (рекомендуется), 0.3 = вариативный
-GEMINI_REASONING_EFFORT=medium   # none low medium high
+GEMINI_REASONING_EFFORT=none     # none low medium high (none — детерминизм, medium — глубже анализ но нестабилен)
 GEMINI_CHUNK_MAX_CHARS=60000     # 60000 гарантирует влезание в лимит Telegraph 64KB
