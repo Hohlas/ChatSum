@@ -2916,16 +2916,16 @@ async def process_chat_command(event, use_ai=True):
             
             # Проверяем, содержит ли саммари несколько частей (результат обработки чанков)
             summary_parts = split_summary_into_parts(summary)
-            # Если одна часть — проверяем, влезает ли в Telegraph (лимит ~60KB HTML)
+            # Если одна часть — проверяем, влезает ли в Telegraph (лимит ~64KB HTML)
             if len(summary_parts) <= 1:
-                html_size = len(convert_markdown_to_html(summary).encode('utf-8'))
-                if html_size > 60000:
+                html_size = len(convert_markdown_to_html(summary + bot_footer).encode('utf-8'))
+                if html_size > 50000:
                     topics = [t.strip() for t in summary.split('\n---\n') if t.strip()]
                     parts = []
                     current = []
                     for topic in topics:
-                        test = '\n---\n'.join(current + [topic])
-                        if len(convert_markdown_to_html(test).encode('utf-8')) > 60000 and current:
+                        test = '\n---\n'.join(current + [topic]) + bot_footer
+                        if len(convert_markdown_to_html(test).encode('utf-8')) > 50000 and current:
                             parts.append('\n---\n'.join(current))
                             current = [topic]
                         else:
@@ -2970,6 +2970,7 @@ async def process_chat_command(event, use_ai=True):
                         article_urls.append((part_title, part_url, part_time_label))
                         print(f"   ✅ Часть {part_idx}: {part_url}")
                     else:
+                        part_time_label = f"{part_time_first} - {part_time_last}" if part_time_first and part_time_last else ""
                         print(f"   ❌ Не удалось опубликовать часть {part_idx}")
                         article_urls.append((part_title, None, part_time_label))
                     
