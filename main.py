@@ -219,7 +219,7 @@ NOISE_PATTERNS = [
 
 # Базовая конфигурация разбиения на чанки (по символам)
 # Используется как fallback для моделей без специальных настроек.
-DEFAULT_CHUNK_MAX_CHARS = 70000
+DEFAULT_CHUNK_MAX_CHARS = 60000
 DEFAULT_CHUNK_OVERLAP_RATIO = 0.05
 CHUNK_MAX_CHARS = DEFAULT_CHUNK_MAX_CHARS
 CHUNK_OVERLAP_CHARS = int(DEFAULT_CHUNK_MAX_CHARS * DEFAULT_CHUNK_OVERLAP_RATIO)
@@ -251,7 +251,7 @@ def get_model_generation_config(model_name):
             'context_limit_tokens': 1048576,
             'output_max_tokens': 65536,
             'reasoning_effort': 'low',
-            'chunk_max_chars': 70000,
+            'chunk_max_chars': 60000,
         })
         config['chunk_overlap_chars'] = int(config['chunk_max_chars'] * DEFAULT_CHUNK_OVERLAP_RATIO)
 
@@ -2915,12 +2915,30 @@ async def process_chat_command(event, use_ai=True):
             
             article_title = f"Саммари чата: {chat_name} ({period_start_time})"
             
-            # Проверяем, содержит ли саммари несколько частей (результат обработки чанками)
+            # Проверяем, содержит ли саммари несколько частей (результат обработки чанков)
             summary_parts = split_summary_into_parts(summary)
+            # Если одна часть — проверяем, влезает ли в Telegraph (лимит ~60KB HTML)
+            if len(summary_parts) <= 1:
+                html_size = len(convert_markdown_to_html(summary).encode('utf-8'))
+                if html_size > 60000:
+                    topics = [t.strip() for t in summary.split('\n---\n') if t.strip()]
+                    parts = []
+                    current = []
+                    for topic in topics:
+                        test = '\n---\n'.join(current + [topic])
+                        if len(convert_markdown_to_html(test).encode('utf-8')) > 60000 and current:
+                            parts.append('\n---\n'.join(current))
+                            current = [topic]
+                        else:
+                            current.append(topic)
+                    if current:
+                        parts.append('\n---\n'.join(current))
+                    if len(parts) > 1:
+                        summary_parts = [(f"Часть {i + 1}", content, None, None) for i, content in enumerate(parts)]
             
             if len(summary_parts) > 1:
                 # ═══════════════════════════════════════════════════════════════
-                # РЕЖИМ ЧАНКОВ: публикуем каждую часть отдельно в Telegraph
+                # РЕЖИМ НЕСКОЛЬКИХ ЧАСТЕЙ: публикуем каждую часть отдельно в Telegraph
                 # ═══════════════════════════════════════════════════════════════
                 print(f"📝 Публикация {len(summary_parts)} частей в Telegraph...")
                 
