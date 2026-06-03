@@ -2993,8 +2993,9 @@ async def process_chat_command(event, use_ai=True):
                     
                     header += "\n"
                     stats_message = header + stats_message
+                    stats_message += f"\n<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
                     stats_message = trim_text_for_telegram(stats_message)
-                    
+
                     # Отправляем сообщение с ссылками
                     await telegram_client.send_message(
                         RESULTS_DESTINATION,
