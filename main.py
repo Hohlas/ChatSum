@@ -2914,26 +2914,25 @@ async def process_chat_command(event, use_ai=True):
             
             article_title = f"Саммари чата: {chat_name} ({period_start_time})"
             
-            # Проверяем, содержит ли саммари несколько частей (результат обработки чанков)
-            summary_parts = split_summary_into_parts(summary)
-            # Если одна часть — проверяем, влезает ли в Telegraph (лимит ~64KB HTML)
-            if len(summary_parts) <= 1:
-                html_size = len(convert_markdown_to_html(summary + bot_footer).encode('utf-8'))
-                if html_size > 50000:
-                    topics = [t.strip() for t in summary.split('\n---\n') if t.strip()]
-                    parts = []
-                    current = []
-                    for topic in topics:
-                        test = '\n---\n'.join(current + [topic]) + bot_footer
-                        if len(convert_markdown_to_html(test).encode('utf-8')) > 50000 and current:
-                            parts.append('\n---\n'.join(current))
-                            current = [topic]
-                        else:
-                            current.append(topic)
-                    if current:
-                        parts.append('\n---\n'.join(current))
-                    if len(parts) > 1:
-                        summary_parts = [(f"Часть {i + 1}", content, None, None) for i, content in enumerate(parts)]
+            # Убираем разделители чанков Gemini и делим полный саммари на темы
+            # для публикации в Telegraph (лимит ~64KB HTML на страницу)
+            clean = re.sub(r'═+\nЧАСТЬ \d+ \(сообщения \d+-\d+\):.*?\n═+\n', '', summary)
+            topics = [t.strip() for t in clean.split('\n---\n') if t.strip()]
+            parts = []
+            current = []
+            for topic in topics:
+                test = '\n---\n'.join(current + [topic]) + bot_footer
+                if len(convert_markdown_to_html(test).encode('utf-8')) > 50000 and current:
+                    parts.append('\n---\n'.join(current))
+                    current = [topic]
+                else:
+                    current.append(topic)
+            if current:
+                parts.append('\n---\n'.join(current))
+            if len(parts) > 1:
+                summary_parts = [(f"Часть {i + 1}", content, None, None) for i, content in enumerate(parts)]
+            else:
+                summary_parts = [(None, parts[0] if parts else clean, None, None)]
             
             if len(summary_parts) > 1:
                 # ═══════════════════════════════════════════════════════════════
