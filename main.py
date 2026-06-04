@@ -2052,6 +2052,9 @@ def fix_html_nesting(html_content):
     # Паттерн для поиска HTML тегов (открывающих и закрывающих)
     tag_pattern = re.compile(r'<(/?)(\w+)[^>]*>')
     
+    # Void-элементы не требуют закрывающего тега и не должны попадать в стек
+    VOID_ELEMENTS = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'}
+    
     # Стек для отслеживания открытых тегов
     open_tags = []
     result_parts = []
@@ -2065,8 +2068,10 @@ def fix_html_nesting(html_content):
         tag_name = match.group(2).lower()  # имя тега
         
         if closing_slash:  # Закрывающий тег
-            # Если стек не пуст и верхний элемент совпадает с этим тегом - нормально
-            if open_tags and open_tags[-1] == tag_name:
+            # Void-элементы не должны были попасть в стек — пропускаем их закрывающий тег
+            if tag_name in VOID_ELEMENTS:
+                pass
+            elif open_tags and open_tags[-1] == tag_name:
                 open_tags.pop()
                 result_parts.append(match.group(0))  # Оставляем тег как есть
             else:
@@ -2074,15 +2079,16 @@ def fix_html_nesting(html_content):
                 # Простейший подход: пропускаем этот неправильный закрывающий тег
                 pass
         else:  # Открывающий тег
-            open_tags.append(tag_name)
             result_parts.append(match.group(0))  # Оставляем тег как есть
+            if tag_name not in VOID_ELEMENTS:
+                open_tags.append(tag_name)
         
         last_end = match.end()
     
     # Добавляем оставшийся текст после последнего тега
     result_parts.append(html_content[last_end:])
     
-    # Закрываем все незакрытые теги в обратном порядке
+    # Закрываем все незакрытые теги в обратном порядке (void-элементов в стеке нет)
     while open_tags:
         tag_name = open_tags.pop()
         result_parts.append(f'</{tag_name}>')
