@@ -45,7 +45,9 @@ Minimum cluster requirements:
 
 Maintain topic granularity: combine only messages discussing the EXACT same question/entity/event. Adjacent questions about related topics should form separate clusters.
 Cover ALL material topics found in the input. Do not stop after the largest themes.
-Ignore noise: messages without substantive arguments (e.g., 'ok', '+', bot messages, off-topic spam).
+MUST EXCLUDE from topic formation:
+- messages without substantive arguments (e.g., 'ok', '+', bot messages, off-topic spam).
+- single unreplied one-liners, jokes, or brief remarks — a lone comment without replies or substantial argumentation is NOT a discussion topic.
 
 Step 3: Formulate key idea. 
 For each topic, write 1-2 sentence summary reflecting dominant opinion, consensus, or main conclusion (note disagreements if no consensus).
