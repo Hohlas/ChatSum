@@ -2896,15 +2896,20 @@ async def process_chat_command(event, use_ai=True):
                 if len(usage_info['errors']) > 3:
                     stats_message += f"• ... и ещё {len(usage_info['errors']) - 3}\n"
             
+            # Убираем разделители чанков Gemini из саммари
+            clean_summary = re.sub(r'📊 Обработано \d+ сообщений в \d+ частях\n\n?', '', summary)
+            clean_summary = re.sub(r'⚠️ Внимание: \d+ из \d+ частей обработаны с ошибками\n\n?', '', clean_summary)
+            clean_summary = re.sub(r'═+\nЧАСТЬ \d+ \(сообщения \d+-\d+\):.*?\n═+\n', '', clean_summary)
+
             # Формируем полный контент для Telegraph (с статистикой в конце)
-            overall_first, overall_last = extract_summary_time_range(summary)
+            overall_first, overall_last = extract_summary_time_range(clean_summary)
             if overall_first and overall_last:
                 overall_time_line = f"*({overall_first} - {overall_last})*\n\n"
                 if overall_first == overall_last:
                     overall_time_line = f"*({overall_first})*\n\n"
-                full_content = overall_time_line + summary
+                full_content = overall_time_line + clean_summary
             else:
-                full_content = summary
+                full_content = clean_summary
             # Закомментировано: статистика токенов в конце статьи Telegraph
             # if usage_info and prompt_tokens is not None:
             #     full_content += f"\n\n---\n\n"
@@ -2920,10 +2925,9 @@ async def process_chat_command(event, use_ai=True):
             
             article_title = f"Саммари чата: {chat_name} ({period_start_time})"
             
-            # Убираем разделители чанков Gemini и делим полный саммари на темы
-            # для публикации в Telegraph (лимит ~64KB HTML на страницу)
-            clean = re.sub(r'═+\nЧАСТЬ \d+ \(сообщения \d+-\d+\):.*?\n═+\n', '', summary)
-            topics = [t.strip() for t in clean.split('\n---\n') if t.strip()]
+            # Делим очищенный саммари на темы для публикации в Telegraph
+            # (лимит ~64KB HTML на страницу)
+            topics = [t.strip() for t in clean_summary.split('\n---\n') if t.strip()]
             parts = []
             current = []
             for topic in topics:
@@ -2938,7 +2942,7 @@ async def process_chat_command(event, use_ai=True):
             if len(parts) > 1:
                 summary_parts = [(f"Часть {i + 1}", content, None, None) for i, content in enumerate(parts)]
             else:
-                summary_parts = [(None, parts[0] if parts else clean, None, None)]
+                summary_parts = [(None, parts[0] if parts else clean_summary, None, None)]
             
             if len(summary_parts) > 1:
                 # ═══════════════════════════════════════════════════════════════
