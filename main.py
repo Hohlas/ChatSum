@@ -2433,7 +2433,11 @@ async def publish_to_telegraph(title, content, author_name="Chat Filter Bot", te
             await asyncio.sleep(wait_time)
             
         except Exception as e:
-            print(f"❌ Ошибка при публикации в Telegraph: {e}")
+            error_str = str(e)
+            print(f"❌ Ошибка при публикации в Telegraph: {error_str}")
+            if 'CONTENT_TOO_BIG' in error_str:
+                html_size = len(html_content.encode('utf-8'))
+                print(f"   📏 Размер HTML: {html_size} байт (лимит Telegraph ~64KB)")
             import traceback
             traceback.print_exc()
             return None
@@ -2923,22 +2927,45 @@ async def process_chat_command(event, use_ai=True):
             bot_footer = f"\n---\ncreated by [ChatSumBot](https://github.com/Hohlas/ChatSum) \n"
             full_content += bot_footer
             
+            def _split_content(items, separator, footer, max_size):
+                res = []
+                cur = []
+                for item in items:
+                    test = separator.join(cur + [item]) + footer
+                    if len(convert_markdown_to_html(test).encode('utf-8')) > max_size and cur:
+                        res.append(separator.join(cur))
+                        cur = [item]
+                    else:
+                        cur.append(item)
+                if cur:
+                    res.append(separator.join(cur))
+                return res
+
             article_title = f"Саммари чата: {chat_name} ({period_start_time})"
             
             # Делим очищенный саммари на темы для публикации в Telegraph
-            # (лимит ~64KB HTML на страницу)
+            # (лимит ~64KB HTML на страницу, оставляем запас ~50KB)
+            MAX_PART_HTML = 50000
             topics = [t.strip() for t in clean_summary.split('\n---\n') if t.strip()]
-            parts = []
-            current = []
-            for topic in topics:
-                test = '\n---\n'.join(current + [topic]) + bot_footer
-                if len(convert_markdown_to_html(test).encode('utf-8')) > 50000 and current:
-                    parts.append('\n---\n'.join(current))
-                    current = [topic]
+            parts = _split_content(topics, '\n---\n', bot_footer, MAX_PART_HTML)
+            # Дополнительное дробление: если часть всё ещё превышает лимит,
+            # разбиваем её по параграфам (\n\n)
+            final_parts = []
+            for part in parts:
+                if len(convert_markdown_to_html(part + bot_footer).encode('utf-8')) > MAX_PART_HTML:
+                    sub_topics = [p.strip() for p in part.split('\n\n') if p.strip()]
+                    sub_parts = _split_content(sub_topics, '\n\n', bot_footer, MAX_PART_HTML)
+                    # Если всё ещё слишком большие — бьём по строкам
+                    for sp in sub_parts:
+                        if len(convert_markdown_to_html(sp + bot_footer).encode('utf-8')) > MAX_PART_HTML:
+                            lines = [l for l in sp.split('\n') if l.strip()]
+                            line_parts = _split_content(lines, '\n', bot_footer, MAX_PART_HTML)
+                            final_parts.extend(line_parts)
+                        else:
+                            final_parts.append(sp)
                 else:
-                    current.append(topic)
-            if current:
-                parts.append('\n---\n'.join(current))
+                    final_parts.append(part)
+            parts = final_parts
             if len(parts) > 1:
                 summary_parts = [(f"Часть {i + 1}", content, None, None) for i, content in enumerate(parts)]
             else:
