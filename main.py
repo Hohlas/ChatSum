@@ -2135,6 +2135,10 @@ def convert_markdown_to_html(content):
     Returns:
         HTML текст
     """
+    # Экранируем HTML-спецсимволы, чтобы предотвратить поломку вёрстки
+    # из-за ников пользователей с символами < > & (например, sprintf(username, "id%04d", 1<<9))
+    content = content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
     lines = content.split('\n')
     html_paragraphs = []
     in_list = False
