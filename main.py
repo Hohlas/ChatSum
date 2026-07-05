@@ -2674,13 +2674,14 @@ async def process_chat_command(event, use_ai=True):
         time_range_end = None
         
         # Обрабатываем параметры
-        # Поддерживаем форматы: /sum 3h, /sum 2d, /sum 100, /sum 1d 6h, /sum 600-800, /sum 2d-3d
+        # Поддерживаем форматы: /sum 3h, /sum 2d, /sum 100, /sum 1d 6h, /sum 600-800, /sum 2d-3d, /sum 3-5d, /sum 2-4h
         if len(parts) > 1:
             # Обрабатываем все параметры (может быть несколько, напр. "1d 6h")
             for param in parts[1:]:
                 param_clean = param.lower().strip()
                 
                 time_range_match = re.fullmatch(r'(\d+)([hd])\s*-\s*(\d+)([hd])', param_clean)
+                time_range_match2 = re.fullmatch(r'(\d+)\s*-\s*(\d+)([hd])', param_clean)
                 range_match = re.fullmatch(r'(\d+)\s*-\s*(\d+)', param_clean)
                 if time_range_match:
                     start_val = int(time_range_match.group(1))
@@ -2690,6 +2691,22 @@ async def process_chat_command(event, use_ai=True):
 
                     start_delta = timedelta(days=start_val) if start_unit == 'd' else timedelta(hours=start_val)
                     end_delta = timedelta(days=end_val) if end_unit == 'd' else timedelta(hours=end_val)
+
+                    if start_delta > timedelta(0) and end_delta > start_delta:
+                        time_range_start = start_delta
+                        time_range_end = end_delta
+                        range_start = None
+                        range_end = None
+                        limit = None
+                        hours = None
+                        days = None
+                elif time_range_match2:
+                    start_val = int(time_range_match2.group(1))
+                    end_val = int(time_range_match2.group(2))
+                    unit = time_range_match2.group(3)
+
+                    start_delta = timedelta(days=start_val) if unit == 'd' else timedelta(hours=start_val)
+                    end_delta = timedelta(days=end_val) if unit == 'd' else timedelta(hours=end_val)
 
                     if start_delta > timedelta(0) and end_delta > start_delta:
                         time_range_start = start_delta

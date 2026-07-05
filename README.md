@@ -224,6 +224,8 @@ python3 main.py
 /sum 600-800
 /sum 2d-3d
 /sum 12h-24h
+/sum 3-5d
+/sum 2-4h
 ```
 
 Что это значит:
