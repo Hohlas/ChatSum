@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from telegraph import Telegraph
 from telegraph.exceptions import RetryAfterError
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # Скомпилированные регулярные выражения для конвертации Markdown в HTML
 MD_BOLD_RE = re.compile(r'\*\*(.+?)\*\*')
