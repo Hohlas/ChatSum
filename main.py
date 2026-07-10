@@ -24,6 +24,9 @@ MD_LINK_RE = re.compile(r'\[([^\]]+)\]\(([^\)]+)\)')
 # Блокировка для синхронизации доступа к глобальным конфигурационным переменным
 config_lock = asyncio.Lock()
 
+# Московское время (UTC+3) — для отображения и планировщика
+MSK = timezone(timedelta(hours=3))
+
 
 def ensure_private_file():
     """
@@ -409,6 +412,7 @@ EXCLUDED_USERS_FILE = 'EXCLUDED_USERS.txt'
 PRIORITY_USERS_FILE = 'PRIORITY_USERS.txt'
 PROMPT_FILE = 'PROMPT.txt'
 MODEL_CONFIG_FILE = 'MODEL_CONFIG.txt'
+SCHEDULE_FILE = 'SCHEDULE.txt'
 
 
 def load_users_from_file(filename):
@@ -3388,6 +3392,65 @@ async def process_chat_command(event, use_ai=True):
 # ──────────────────────────────────────────────
 # Планировщик ежедневных саммари
 # ──────────────────────────────────────────────
+
+
+def load_schedule(filename):
+    """Загружает расписание из файла. Формат: chat_id|HH:MM|период[+]"""
+    if not os.path.exists(filename):
+        return []
+    entries = []
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split('|')
+                if len(parts) < 3:
+                    continue
+                chat_id_str, time_str, period_str = [p.strip() for p in parts[:3]]
+                try:
+                    chat_id = int(chat_id_str)
+                except ValueError:
+                    continue
+                time_match = re.fullmatch(r'(\d{1,2}):(\d{2})', time_str)
+                if not time_match:
+                    continue
+                hour = int(time_match.group(1))
+                minute = int(time_match.group(2))
+                if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+                    continue
+                post_to_source = period_str.endswith('+')
+                clean_period = period_str[:-1] if post_to_source else period_str
+                if not re.fullmatch(r'\d+[hd]', clean_period):
+                    continue
+                entries.append({
+                    'chat_id': chat_id, 'hour': hour, 'minute': minute,
+                    'period': clean_period, 'post_to_source': post_to_source
+                })
+    except Exception as e:
+        print(f"⚠️ Ошибка при чтении {filename}: {e}")
+    return entries
+
+
+def save_schedule(filename, entries):
+    """Сохраняет расписание в файл."""
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write("# Расписание ежедневных саммари\n")
+            f.write("# Формат: chat_id|HH:MM|период\n")
+            f.write("# + после периода = публикация в исходном чате\n\n")
+            for entry in entries:
+                period = entry['period']
+                if entry['post_to_source']:
+                    period += '+'
+                f.write(f"{entry['chat_id']}|{entry['hour']:02d}:{entry['minute']:02d}|{period}\n")
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при сохранении {filename}: {e}")
+        return False
+
+
 scheduler = AsyncIOScheduler()
 
 
@@ -4161,8 +4224,9 @@ async def main():
     finally:
         # Остановка планировщика
         try:
-            scheduler.shutdown(wait=False)
-            print("✅ Планировщик остановлен")
+            if scheduler.running:
+                scheduler.shutdown(wait=False)
+                print("✅ Планировщик остановлен")
         except Exception as e:
             print(f"⚠️ Ошибка при остановке планировщика: {e}")
         
