@@ -2655,7 +2655,26 @@ async def process_chat_command(event, use_ai=True):
         # Парсим параметры команды
         message_text = event.raw_text
         parts = message_text.split()
-        
+
+        # Если параметры прикреплены к команде без пробела (например /sum2d+)
+        if len(parts) == 1:
+            m = re.match(r'^(/(?:sum|copy))(.+)$', parts[0], re.IGNORECASE)
+            if m:
+                parts = [m.group(1), m.group(2)]
+
+        # Проверяем суффикс '+' для публикации в исходном чате
+        post_to_source = False
+        filtered_params = []
+        for p in parts[1:]:
+            if p == '+' or p.endswith('+'):
+                post_to_source = True
+                if p != '+':
+                    filtered_params.append(p[:-1])
+            else:
+                filtered_params.append(p)
+        if filtered_params != parts[1:]:
+            parts = [parts[0]] + filtered_params
+
         # Получаем чат один раз и используем для логирования и далее
         chat = await event.get_chat()
         chat_name_log = chat.title if hasattr(chat, 'title') else "Private"
@@ -2962,7 +2981,7 @@ async def process_chat_command(event, use_ai=True):
                     res.append(separator.join(cur))
                 return res
 
-            article_title = f"Саммари чата: {chat_name} ({period_start_time})"
+            article_title = f"Саммари чата: {chat_name}"
             
             # Делим очищенный саммари на темы для публикации в Telegraph
             # (лимит ~64KB HTML на страницу, оставляем запас ~50KB)
@@ -3061,6 +3080,17 @@ async def process_chat_command(event, use_ai=True):
                         reply_to=topic_id
                     )
                     
+                    # Если запрошено, дублируем в исходный чат
+                    if post_to_source:
+                        try:
+                            await telegram_client.send_message(
+                                event.chat_id,
+                                stats_message,
+                                parse_mode='html'
+                            )
+                        except Exception as e:
+                            print(f"⚠️  Не удалось отправить результат в исходный чат: {e}")
+
                     # Если USE_HTML_EXPORT=true, создаем ОБЩИЙ HTML файл со всеми частями
                     if USE_HTML_EXPORT:
                         html_file = create_html_report(article_title, full_content, author_name="ChatSumBot")
@@ -3102,6 +3132,17 @@ async def process_chat_command(event, use_ai=True):
                         parse_mode='html',
                         reply_to=topic_id
                     )
+
+                    # Если запрошено, дублируем в исходный чат
+                    if post_to_source:
+                        try:
+                            await telegram_client.send_message(
+                                event.chat_id,
+                                stats_message,
+                                parse_mode='html'
+                            )
+                        except Exception as e:
+                            print(f"⚠️  Не удалось отправить результат в исходный чат: {e}")
                 
                 # Удаляем временный файл
                 try:
@@ -3133,6 +3174,17 @@ async def process_chat_command(event, use_ai=True):
                         parse_mode='html',
                         reply_to=topic_id
                     )
+
+                    # Если запрошено, дублируем в исходный чат
+                    if post_to_source:
+                        try:
+                            await telegram_client.send_message(
+                                event.chat_id,
+                                stats_message,
+                                parse_mode='html'
+                            )
+                        except Exception as e:
+                            print(f"⚠️  Не удалось отправить результат в исходный чат: {e}")
 
                     # Если USE_HTML_EXPORT=true, дополнительно создаем и отправляем HTML файл
                     if USE_HTML_EXPORT:
@@ -3187,6 +3239,17 @@ async def process_chat_command(event, use_ai=True):
                         parse_mode='html',
                         reply_to=topic_id
                     )
+
+                    # Если запрошено, дублируем в исходный чат
+                    if post_to_source:
+                        try:
+                            await telegram_client.send_message(
+                                event.chat_id,
+                                stats_message,
+                                parse_mode='html'
+                            )
+                        except Exception as e:
+                            print(f"⚠️  Не удалось отправить результат в исходный чат: {e}")
             
             print("✅ Анализ с AI успешно завершён")
         
@@ -3626,6 +3689,8 @@ async def handle_help_command(event):
   • `/sum 100` - последние 100 сообщений
   • `/sum 600-800` - сообщения с 600-го по 800-е от конца
   • `/sum 2d-3d` - сообщения от 3 до 2 дней назад
+  • `/sum 1d+` - анализ + публикация в исходном чате
+  • `/sum1d+` - пробел после команды не обязателен
 
 `/copy` - экспорт без анализа (для ручной обработки)
 Примеры:
@@ -3665,6 +3730,7 @@ async def handle_help_command(event):
 3. Отправляет в Google Gemini (модель из конфигурации)
 4. Получает структурированную выжимку по темам
 5. Отправляет результат в ваш канал
+6. Если добавить суффикс `+` (например `/sum 1d+`), результат также публикуется в исходном чате
 
 **`/copy` (без AI, только экспорт):**
 1. Собирает и фильтрует сообщения
@@ -3753,6 +3819,7 @@ async def main():
     print("    /sum 45 - последние 45 сообщений")
     print("    /sum 600-800 - сообщения с 600-го по 800-е от конца")
     print("    /sum 2d-3d - сообщения от 3 до 2 дней назад")
+    print("    /sum 1d+ - анализ + публикация в исходном чате")
     print("  Экспорт:")
     print("    /copy - экспорт без AI (для ручного анализа)")
     print("    /copy 3h - экспорт за 3 часа")
