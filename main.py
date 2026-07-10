@@ -1287,7 +1287,7 @@ def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, t
     # Дополнительные поля для экспорта (/copy)
     if chat_name is not None:
         metadata['chat_name'] = chat_name
-        metadata['export_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        metadata['export_date'] = datetime.now(MSK).strftime('%Y-%m-%d %H:%M:%S')
     if total_messages is not None:
         metadata['total_messages'] = total_messages
     if filtered_messages is not None:
@@ -2001,6 +2001,7 @@ def enrich_summary_with_timestamps(summary_text, messages_data):
 
         try:
             dt = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+            dt = dt.replace(tzinfo=timezone.utc).astimezone(MSK)
             formatted_date = dt.strftime('%d.%m %H:%M')
         except ValueError:
             enriched.append(block)
@@ -2279,13 +2280,13 @@ def save_analysis(messages_data, summary):
         str: Имя созданного файла или None в случае ошибки
     """
     result = {
-        'timestamp': datetime.now().isoformat(),
+        'timestamp': datetime.now(MSK).isoformat(),
         'messages_count': len(messages_data),
         'messages': messages_data,
         'summary': summary
     }
     
-    filename = f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    filename = f"analysis_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}.json"
     try:
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
@@ -2315,12 +2316,13 @@ def calculate_period_info(messages_data, optimized_messages, period_start_date, 
     if period_start_date:
         try:
             period_start_dt = datetime.strptime(period_start_date, '%Y-%m-%d %H:%M:%S')
+            period_start_dt = period_start_dt.replace(tzinfo=timezone.utc).astimezone(MSK)
             period_start_time = period_start_dt.strftime('%d.%m %H:%M')
         except (ValueError, TypeError):
             period_start_time = period_start_date[:16] if len(period_start_date) >= 16 else period_start_date
     
     if not period_start_time:
-        period_start_dt = datetime.now()
+        period_start_dt = datetime.now(MSK)
         period_start_time = period_start_dt.strftime('%d.%m %H:%M')
     
     # Получаем дату последнего сообщения (самое свежее)
@@ -2332,9 +2334,10 @@ def calculate_period_info(messages_data, optimized_messages, period_start_date, 
             last_date_str = last_message.get('date', '')
             if last_date_str:
                 period_end_dt = datetime.strptime(last_date_str, '%Y-%m-%d %H:%M:%S')
+                period_end_dt = period_end_dt.replace(tzinfo=timezone.utc).astimezone(MSK)
                 period_end_time = period_end_dt.strftime('%d.%m %H:%M')
         except (ValueError, TypeError, KeyError):
-            period_end_dt = datetime.now()
+            period_end_dt = datetime.now(MSK)
             period_end_time = period_end_dt.strftime('%d.%m %H:%M')
     
     # Вычисляем период в часах
@@ -2618,14 +2621,14 @@ def create_html_report(title, content, author_name="Chat Filter Bot"):
         <h1>{title}</h1>
         {html_body}
         <div class="footer">
-            Создано {datetime.now().strftime('%d.%m.%Y %H:%M')}
+            Создано {datetime.now(MSK).strftime('%d.%m.%Y %H:%M')}
         </div>
     </div>
 </body>
 </html>'''
         
         # Генерируем имя файла
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = datetime.now(MSK).strftime('%Y%m%d_%H%M%S')
         safe_title = re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '_')[:50]
         filename = f"{reports_dir}/{safe_title}_{timestamp}.html"
         
@@ -2643,154 +2646,31 @@ def create_html_report(title, content, author_name="Chat Filter Bot"):
         return None
 
 
-async def process_chat_command(event, use_ai=True):
+async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
+                        range_start=None, range_end=None, time_range_start=None,
+                        time_range_end=None, use_ai=True, post_to_source=False, scheduled=False):
     """
-    Универсальная функция обработки команд /sum и /copy
+    Ядро анализа: выполняет сбор сообщений, AI анализ и публикацию.
     
     Args:
-        event: Событие Telegram
-        use_ai: True для /sum (с AI анализом), False для /copy (только экспорт)
+        chat_id: ID чата
+        chat_name: Имя чата (для отображения)
+        hours, days, limit, range_start, range_end, time_range_start, time_range_end: параметры сбора
+        use_ai: True для /sum, False для /copy
+        post_to_source: публиковать ли результат в исходном чате
+        scheduled: True при вызове из планировщика
     """
     try:
-        # Парсим параметры команды
-        message_text = event.raw_text
-        parts = message_text.split()
-
-        # Если параметры прикреплены к команде без пробела (например /sum2d+)
-        if len(parts) == 1:
-            m = re.match(r'^(/(?:sum|copy))(.+)$', parts[0], re.IGNORECASE)
-            if m:
-                parts = [m.group(1), m.group(2)]
-
-        # Проверяем суффикс '+' для публикации в исходном чате
-        post_to_source = False
-        filtered_params = []
-        for p in parts[1:]:
-            if p == '+' or p.endswith('+'):
-                post_to_source = True
-                if p != '+':
-                    filtered_params.append(p[:-1])
-            else:
-                filtered_params.append(p)
-        if filtered_params != parts[1:]:
-            parts = [parts[0]] + filtered_params
-
-        # Получаем чат один раз и используем для логирования и далее
-        chat = await event.get_chat()
-        chat_name_log = chat.title if hasattr(chat, 'title') else "Private"
-        chat_name = chat.title if hasattr(chat, 'title') else "чата"
-        
-        command_name = "/sum" if use_ai else "/copy"
-        params = " ".join(parts[1:]) if len(parts) > 1 else "(по умолчанию 24h)"
-        print(f"\n📥 Команда: {command_name} {params} | Чат: {chat_name_log}")
-        
-        hours = None
-        days = None
-        limit = None
-        range_start = None
-        range_end = None
-        time_range_start = None
-        time_range_end = None
-        
-        # Обрабатываем параметры
-        # Поддерживаем форматы: /sum 3h, /sum 2d, /sum 100, /sum 1d 6h, /sum 600-800, /sum 2d-3d, /sum 3-5d, /sum 2-4h
-        if len(parts) > 1:
-            # Обрабатываем все параметры (может быть несколько, напр. "1d 6h")
-            for param in parts[1:]:
-                param_clean = param.lower().strip()
-                
-                time_range_match = re.fullmatch(r'(\d+)([hd])\s*-\s*(\d+)([hd])', param_clean)
-                time_range_match2 = re.fullmatch(r'(\d+)\s*-\s*(\d+)([hd])', param_clean)
-                range_match = re.fullmatch(r'(\d+)\s*-\s*(\d+)', param_clean)
-                if time_range_match:
-                    start_val = int(time_range_match.group(1))
-                    start_unit = time_range_match.group(2)
-                    end_val = int(time_range_match.group(3))
-                    end_unit = time_range_match.group(4)
-
-                    start_delta = timedelta(days=start_val) if start_unit == 'd' else timedelta(hours=start_val)
-                    end_delta = timedelta(days=end_val) if end_unit == 'd' else timedelta(hours=end_val)
-
-                    if start_delta > timedelta(0) and end_delta > start_delta:
-                        time_range_start = start_delta
-                        time_range_end = end_delta
-                        range_start = None
-                        range_end = None
-                        limit = None
-                        hours = None
-                        days = None
-                elif time_range_match2:
-                    start_val = int(time_range_match2.group(1))
-                    end_val = int(time_range_match2.group(2))
-                    unit = time_range_match2.group(3)
-
-                    start_delta = timedelta(days=start_val) if unit == 'd' else timedelta(hours=start_val)
-                    end_delta = timedelta(days=end_val) if unit == 'd' else timedelta(hours=end_val)
-
-                    if start_delta > timedelta(0) and end_delta > start_delta:
-                        time_range_start = start_delta
-                        time_range_end = end_delta
-                        range_start = None
-                        range_end = None
-                        limit = None
-                        hours = None
-                        days = None
-                elif range_match:
-                    start_val = int(range_match.group(1))
-                    end_val = int(range_match.group(2))
-                    if start_val > 0 and end_val >= start_val:
-                        range_start = start_val
-                        range_end = end_val
-                        time_range_start = None
-                        time_range_end = None
-                        limit = None
-                        hours = None
-                        days = None
-                elif param_clean.endswith('h') and range_start is None and time_range_start is None:
-                    # Параметр часов
-                    hours_val = int(param_clean.replace('h', ''))
-                    if hours_val > 0:
-                        hours = hours_val
-                elif param_clean.endswith('d') and range_start is None and time_range_start is None:
-                    # Параметр дней
-                    days_val = int(param_clean.replace('d', ''))
-                    if days_val > 0:
-                        days = days_val
-                elif param_clean.isdigit() and range_start is None and time_range_start is None:
-                    # Это количество сообщений
-                    limit = int(param_clean)
-        
-        # Если ничего не указано, по умолчанию 24 часа
-        if hours is None and days is None and limit is None and range_start is None and time_range_start is None:
-            hours = 24
-        
-        # Удаляем команду из чата (для приватности)
-        await event.delete()
-        
         # Получаем или создаем тему для этого чата
         topic_id = await get_or_create_topic(chat_name)
         
-        # Формируем сообщение о начале
-        action = "анализ" if use_ai else "экспорт"
-        if time_range_start and time_range_end:
-            status_msg = f"🔄 Начинаю {action} сообщений за диапазон {format_timedelta_short(time_range_start)}-{format_timedelta_short(time_range_end)} назад из чата '{chat_name}'..."
-        elif range_start and range_end:
-            status_msg = f"🔄 Начинаю {action} сообщений {range_start}-{range_end} от конца чата '{chat_name}'..."
-        elif limit:
-            status_msg = f"🔄 Начинаю {action} последних {limit} сообщений из чата '{chat_name}'..."
-        else:
-            status_msg = f"🔄 Начинаю {action} чата '{chat_name}' за последние {days or 0} дней и {hours or 0} часов..."
-        
-        # Информируем о начале в канале/Избранном/Теме
-        await telegram_client.send_message(
-            RESULTS_DESTINATION, 
-            status_msg,
-            reply_to=topic_id
-        )
-        
+        if scheduled:
+            action = "анализ" if use_ai else "экспорт"
+            status_msg = f"🔄 Запланированный {action} чата '{chat_name}'..."
+            await telegram_client.send_message(RESULTS_DESTINATION, status_msg, reply_to=topic_id)
         # Собираем сообщения
         messages_data, chat_id_str, period_start_date = await collect_messages(
-            event.chat_id,
+            chat_id,
             hours=hours,
             days=days,
             limit=limit,
@@ -3084,7 +2964,7 @@ async def process_chat_command(event, use_ai=True):
                     if post_to_source:
                         try:
                             await telegram_client.send_message(
-                                event.chat_id,
+                                chat_id,
                                 stats_message,
                                 parse_mode='html'
                             )
@@ -3112,7 +2992,7 @@ async def process_chat_command(event, use_ai=True):
                 else:
                     # Все публикации провалились - сохраняем в файл
                     stats_message += f"\n⚠️ Не удалось опубликовать в Telegraph. Сохраняю в файл..."
-                    filename = f"analysis_{chat_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+                    filename = f"analysis_{chat_name.replace(' ', '_')}_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}.md"
                     with open(filename, 'w', encoding='utf-8') as f:
                         f.write(full_content)
                     
@@ -3137,7 +3017,7 @@ async def process_chat_command(event, use_ai=True):
                     if post_to_source:
                         try:
                             await telegram_client.send_message(
-                                event.chat_id,
+                                chat_id,
                                 stats_message,
                                 parse_mode='html'
                             )
@@ -3179,7 +3059,7 @@ async def process_chat_command(event, use_ai=True):
                     if post_to_source:
                         try:
                             await telegram_client.send_message(
-                                event.chat_id,
+                                chat_id,
                                 stats_message,
                                 parse_mode='html'
                             )
@@ -3218,7 +3098,7 @@ async def process_chat_command(event, use_ai=True):
                 else:
                     # Если не удалось опубликовать в Telegraph, сохраняем в файл как запасной вариант
                     stats_message += f"\n⚠️ Не удалось опубликовать в Telegraph. Сохраняю в файл..."
-                    filename = f"analysis_{chat_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+                    filename = f"analysis_{chat_name.replace(' ', '_')}_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}.md"
                     with open(filename, 'w', encoding='utf-8') as f:
                         f.write(full_content)
                     
@@ -3244,7 +3124,7 @@ async def process_chat_command(event, use_ai=True):
                     if post_to_source:
                         try:
                             await telegram_client.send_message(
-                                event.chat_id,
+                                chat_id,
                                 stats_message,
                                 parse_mode='html'
                             )
@@ -3282,7 +3162,7 @@ async def process_chat_command(event, use_ai=True):
             json_export = json.dumps(export_data, ensure_ascii=False)
             
             # Сохраняем в файл
-            filename = f"export_{chat_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            filename = f"export_{chat_name.replace(' ', '_')}_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}.json"
             with open(filename, 'w', encoding='utf-8') as f:
                 f.write(json_export)
             
@@ -3315,12 +3195,183 @@ async def process_chat_command(event, use_ai=True):
             print(f"✅ Экспорт завершен: {len(optimized_messages)} сообщений")
         
     except Exception as e:
+        error_msg = f"❌ Ошибка при выполнении анализа: {e}"
+        print(error_msg)
+        import traceback
+        traceback.print_exc()
+        
+        try:
+            topic_id = await get_or_create_topic(chat_name)
+            await telegram_client.send_message(RESULTS_DESTINATION, error_msg, reply_to=topic_id)
+        except:
+            await telegram_client.send_message(RESULTS_DESTINATION, error_msg)
+
+
+async def process_chat_command(event, use_ai=True):
+    """
+    Универсальная функция обработки команд /sum и /copy
+    
+    Args:
+        event: Событие Telegram
+        use_ai: True для /sum (с AI анализом), False для /copy (только экспорт)
+    """
+    try:
+        # Парсим параметры команды
+        message_text = event.raw_text
+        parts = message_text.split()
+
+        # Если параметры прикреплены к команде без пробела (например /sum2d+)
+        if len(parts) == 1:
+            m = re.match(r'^(/(?:sum|copy))(.+)$', parts[0], re.IGNORECASE)
+            if m:
+                parts = [m.group(1), m.group(2)]
+
+        # Проверяем суффикс '+' для публикации в исходном чате
+        post_to_source = False
+        filtered_params = []
+        for p in parts[1:]:
+            if p == '+' or p.endswith('+'):
+                post_to_source = True
+                if p != '+':
+                    filtered_params.append(p[:-1])
+            else:
+                filtered_params.append(p)
+        if filtered_params != parts[1:]:
+            parts = [parts[0]] + filtered_params
+
+        # Получаем чат один раз и используем для логирования и далее
+        chat = await event.get_chat()
+        chat_name_log = chat.title if hasattr(chat, 'title') else "Private"
+        chat_name = chat.title if hasattr(chat, 'title') else "чата"
+        
+        command_name = "/sum" if use_ai else "/copy"
+        params = " ".join(parts[1:]) if len(parts) > 1 else "(по умолчанию 24h)"
+        print(f"\n📥 Команда: {command_name} {params} | Чат: {chat_name_log}")
+        
+        hours = None
+        days = None
+        limit = None
+        range_start = None
+        range_end = None
+        time_range_start = None
+        time_range_end = None
+        
+        # Обрабатываем параметры
+        # Поддерживаем форматы: /sum 3h, /sum 2d, /sum 100, /sum 1d 6h, /sum 600-800, /sum 2d-3d, /sum 3-5d, /sum 2-4h
+        if len(parts) > 1:
+            # Обрабатываем все параметры (может быть несколько, напр. "1d 6h")
+            for param in parts[1:]:
+                param_clean = param.lower().strip()
+                
+                time_range_match = re.fullmatch(r'(\d+)([hd])\s*-\s*(\d+)([hd])', param_clean)
+                time_range_match2 = re.fullmatch(r'(\d+)\s*-\s*(\d+)([hd])', param_clean)
+                range_match = re.fullmatch(r'(\d+)\s*-\s*(\d+)', param_clean)
+                if time_range_match:
+                    start_val = int(time_range_match.group(1))
+                    start_unit = time_range_match.group(2)
+                    end_val = int(time_range_match.group(3))
+                    end_unit = time_range_match.group(4)
+
+                    start_delta = timedelta(days=start_val) if start_unit == 'd' else timedelta(hours=start_val)
+                    end_delta = timedelta(days=end_val) if end_unit == 'd' else timedelta(hours=end_val)
+
+                    if start_delta > timedelta(0) and end_delta > start_delta:
+                        time_range_start = start_delta
+                        time_range_end = end_delta
+                        range_start = None
+                        range_end = None
+                        limit = None
+                        hours = None
+                        days = None
+                elif time_range_match2:
+                    start_val = int(time_range_match2.group(1))
+                    end_val = int(time_range_match2.group(2))
+                    unit = time_range_match2.group(3)
+
+                    start_delta = timedelta(days=start_val) if unit == 'd' else timedelta(hours=start_val)
+                    end_delta = timedelta(days=end_val) if unit == 'd' else timedelta(hours=end_val)
+
+                    if start_delta > timedelta(0) and end_delta > start_delta:
+                        time_range_start = start_delta
+                        time_range_end = end_delta
+                        range_start = None
+                        range_end = None
+                        limit = None
+                        hours = None
+                        days = None
+                elif range_match:
+                    start_val = int(range_match.group(1))
+                    end_val = int(range_match.group(2))
+                    if start_val > 0 and end_val >= start_val:
+                        range_start = start_val
+                        range_end = end_val
+                        time_range_start = None
+                        time_range_end = None
+                        limit = None
+                        hours = None
+                        days = None
+                elif param_clean.endswith('h') and range_start is None and time_range_start is None:
+                    # Параметр часов
+                    hours_val = int(param_clean.replace('h', ''))
+                    if hours_val > 0:
+                        hours = hours_val
+                elif param_clean.endswith('d') and range_start is None and time_range_start is None:
+                    # Параметр дней
+                    days_val = int(param_clean.replace('d', ''))
+                    if days_val > 0:
+                        days = days_val
+                elif param_clean.isdigit() and range_start is None and time_range_start is None:
+                    # Это количество сообщений
+                    limit = int(param_clean)
+        
+        # Если ничего не указано, по умолчанию 24 часа
+        if hours is None and days is None and limit is None and range_start is None and time_range_start is None:
+            hours = 24
+        
+        # Удаляем команду из чата (для приватности)
+        await event.delete()
+        
+        # Получаем или создаем тему для этого чата
+        topic_id = await get_or_create_topic(chat_name)
+        
+        # Формируем сообщение о начале
+        action = "анализ" if use_ai else "экспорт"
+        if time_range_start and time_range_end:
+            status_msg = f"🔄 Начинаю {action} сообщений за диапазон {format_timedelta_short(time_range_start)}-{format_timedelta_short(time_range_end)} назад из чата '{chat_name}'..."
+        elif range_start and range_end:
+            status_msg = f"🔄 Начинаю {action} сообщений {range_start}-{range_end} от конца чата '{chat_name}'..."
+        elif limit:
+            status_msg = f"🔄 Начинаю {action} последних {limit} сообщений из чата '{chat_name}'..."
+        else:
+            status_msg = f"🔄 Начинаю {action} чата '{chat_name}' за последние {days or 0} дней и {hours or 0} часов..."
+        
+        await telegram_client.send_message(
+            RESULTS_DESTINATION, 
+            status_msg,
+            reply_to=topic_id
+        )
+        
+        await run_analysis(
+            chat_id=event.chat_id,
+            chat_name=chat_name,
+            hours=hours,
+            days=days,
+            limit=limit,
+            range_start=range_start,
+            range_end=range_end,
+            time_range_start=time_range_start,
+            time_range_end=time_range_end,
+            use_ai=use_ai,
+            post_to_source=post_to_source,
+            scheduled=False
+        )
+    
+    except Exception as e:
         error_msg = f"❌ Ошибка при выполнении команды: {e}"
         print(error_msg)
         import traceback
         traceback.print_exc()
         
-        # Пытаемся отправить ошибку в тему (если возможно)
         try:
             chat = await event.get_chat()
             chat_name = chat.title if hasattr(chat, 'title') else "чата"
@@ -3328,6 +3379,59 @@ async def process_chat_command(event, use_ai=True):
             await telegram_client.send_message(RESULTS_DESTINATION, error_msg, reply_to=topic_id)
         except:
             await telegram_client.send_message(RESULTS_DESTINATION, error_msg)
+
+
+
+
+# ──────────────────────────────────────────────
+# Планировщик ежедневных саммари
+# ──────────────────────────────────────────────
+scheduler = AsyncIOScheduler()
+
+
+async def scheduled_analysis_job(chat_id, period, post_to_source):
+    """Job wrapper для запланированного анализа — разрешает chat_name и вызывает run_analysis."""
+    try:
+        chat_entity = await telegram_client.get_entity(chat_id)
+        chat_name = chat_entity.title if hasattr(chat_entity, 'title') else f"чат {chat_id}"
+    except Exception as e:
+        print(f"❌ Не удалось получить информацию о чате {chat_id}: {e}")
+        return
+
+    hours = None
+    days = None
+    period_clean = period.lower().strip()
+    if period_clean.endswith('h'):
+        hours = int(period_clean[:-1])
+    elif period_clean.endswith('d'):
+        days = int(period_clean[:-1])
+    else:
+        days = 1
+
+    await run_analysis(
+        chat_id=chat_id,
+        chat_name=chat_name,
+        hours=hours,
+        days=days,
+        post_to_source=post_to_source,
+        use_ai=True,
+        scheduled=True
+    )
+
+
+def reload_schedule():
+    """Перезагружает расписание из SCHEDULE.txt в планировщик."""
+    scheduler.remove_all_jobs()
+    entries = load_schedule(SCHEDULE_FILE)
+    for entry in entries:
+        scheduler.add_job(
+            scheduled_analysis_job,
+            trigger=CronTrigger(hour=entry['hour'], minute=entry['minute'], timezone=MSK),
+            args=[entry['chat_id'], entry['period'], entry['post_to_source']],
+            id=str(entry['chat_id']),
+            replace_existing=True
+        )
+        print(f"   📅 Запланирован анализ чата {entry['chat_id']} на {entry['hour']:02d}:{entry['minute']:02d}, период {entry['period']}" + (" (в чат)" if entry['post_to_source'] else ""))
 
 
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/config'))
@@ -3624,6 +3728,7 @@ async def handle_reload_config_command(event):
         if GEMINI_DEFAULT_MODEL:
             CURRENT_MODEL = GEMINI_DEFAULT_MODEL
     
+    reload_schedule()
     text = f"""
 ✅ **Конфигурация перезагружена из файлов**
 
@@ -3718,6 +3823,14 @@ async def handle_help_command(event):
 
 `/reload_config` - перезагрузить из файлов
 
+**📅 Расписание автоматического саммари:**
+
+`/sch 09:00 1d` - запланировать саммари на 09:00 МСК каждый день
+`/sch 21:30 12h` - запланировать на 21:30 МСК, период 12 часов
+`/sch 09:00 1d+` - `+` публикует результат и в исходный чат
+`/sch_list` - показать текущее расписание
+`/unsch` - удалить текущий чат из расписания
+
 **🤖 Модели AI (Google Gemini через API):**
 • Модель задается в `MODEL_CONFIG.txt` или через `/set_model`
 • Список моделей доступен в Google AI Studio
@@ -3766,6 +3879,197 @@ async def handle_help_command(event):
     topic_id = await get_or_create_topic(chat_name)
     
     await telegram_client.send_message(RESULTS_DESTINATION, help_text, reply_to=topic_id)
+
+
+@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/sch\s+\d'))
+async def handle_sch_command(event):
+    """Добавляет текущий чат в расписание: /sch 09:00 1d или /sch 09:00 1d+"""
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
+    chat_name_display = chat.title if hasattr(chat, 'title') else "чата"
+    print(f"\n📥 Команда: /sch | Чат: {chat_name}")
+
+    parts = event.raw_text.split()
+    if len(parts) < 3:
+        await event.delete()
+        topic_id = await get_or_create_topic(chat_name)
+        await telegram_client.send_message(
+            RESULTS_DESTINATION,
+            "⚠️ **Формат:** `/sch 09:00 1d` или `/sch 09:00 1d+`\n"
+            "`+` — публикация и в исходный чат",
+            reply_to=topic_id
+        )
+        return
+
+    time_str = parts[1]
+    period_raw = parts[2].lower()
+
+    time_match = re.fullmatch(r'(\d{1,2}):(\d{2})', time_str)
+    if not time_match:
+        await event.delete()
+        topic_id = await get_or_create_topic(chat_name)
+        await telegram_client.send_message(
+            RESULTS_DESTINATION,
+            f"⚠️ Неверный формат времени: `{time_str}`. Используйте `HH:MM`.",
+            reply_to=topic_id
+        )
+        return
+
+    hour = int(time_match.group(1))
+    minute = int(time_match.group(2))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        await event.delete()
+        topic_id = await get_or_create_topic(chat_name)
+        await telegram_client.send_message(
+            RESULTS_DESTINATION,
+            "⚠️ Время должно быть в диапазоне 00:00–23:59.",
+            reply_to=topic_id
+        )
+        return
+
+    post_to_source = period_raw.endswith('+')
+    period = period_raw[:-1] if post_to_source else period_raw
+
+    if not re.fullmatch(r'\d+[hd]', period):
+        await event.delete()
+        topic_id = await get_or_create_topic(chat_name)
+        await telegram_client.send_message(
+            RESULTS_DESTINATION,
+            f"⚠️ Неверный формат периода: `{period_raw}`. Используйте `1d`, `12h`, `2d` и т.д.\n"
+            f"`+` после периода — публикация в исходном чате.",
+            reply_to=topic_id
+        )
+        return
+
+    entries = load_schedule(SCHEDULE_FILE)
+    entries = [e for e in entries if e['chat_id'] != event.chat_id]
+    entries.append({
+        'chat_id': event.chat_id,
+        'hour': hour,
+        'minute': minute,
+        'period': period,
+        'post_to_source': post_to_source
+    })
+
+    if not save_schedule(SCHEDULE_FILE, entries):
+        await event.delete()
+        topic_id = await get_or_create_topic(chat_name)
+        await telegram_client.send_message(
+            RESULTS_DESTINATION,
+            "❌ Ошибка при сохранении расписания.",
+            reply_to=topic_id
+        )
+        return
+
+    reload_schedule()
+
+    await event.delete()
+    topic_id = await get_or_create_topic(chat_name)
+
+    period_display = f"{period}h" if period.endswith('h') else f"{period}d"
+    days = int(period[:-1]) if period.endswith('d') else 0
+    hours = int(period[:-1]) if period.endswith('h') else 0
+    if days == 1:
+        period_text = "1 день"
+    elif days in (2, 3, 4):
+        period_text = f"{days} дня"
+    elif days > 0:
+        period_text = f"{days} дней"
+    elif hours == 1:
+        period_text = "1 час"
+    else:
+        period_text = f"{hours} часов"
+
+    post_text = "да ✅" if post_to_source else "нет"
+    confirm_msg = (
+        f"✅ **Расписание добавлено**\n\n"
+        f"Чат: **{chat_name_display}**\n"
+        f"Время: `{hour:02d}:{minute:02d}`\n"
+        f"Период: {period_text}\n"
+        f"Публикация в чате: {post_text}"
+    )
+    await telegram_client.send_message(RESULTS_DESTINATION, confirm_msg, reply_to=topic_id)
+
+
+@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/sch_list$'))
+async def handle_sch_list_command(event):
+    """Показывает текущее расписание."""
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
+    print(f"\n📥 Команда: /sch_list | Чат: {chat_name}")
+
+    entries = load_schedule(SCHEDULE_FILE)
+
+    await event.delete()
+    topic_id = await get_or_create_topic(chat_name)
+
+    if not entries:
+        await telegram_client.send_message(
+            RESULTS_DESTINATION,
+            "📅 **Расписание пусто**\n\nИспользуйте `/sch 09:00 1d` в нужном чате, чтобы добавить.",
+            reply_to=topic_id
+        )
+        return
+
+    lines = ["📅 **Текущее расписание:**\n"]
+    for i, entry in enumerate(entries, 1):
+        try:
+            chat_entity = await telegram_client.get_entity(entry['chat_id'])
+            display_name = chat_entity.title if hasattr(chat_entity, 'title') else f"чат {entry['chat_id']}"
+        except:
+            display_name = f"чат {entry['chat_id']}"
+        post_suffix = " (в чат)" if entry['post_to_source'] else ""
+        lines.append(f"{i}. **{display_name}**: {entry['hour']:02d}:{entry['minute']:02d}, {entry['period']}{post_suffix}")
+
+    await telegram_client.send_message(
+        RESULTS_DESTINATION,
+        "\n".join(lines),
+        reply_to=topic_id
+    )
+
+
+@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/unsch$'))
+async def handle_unsch_command(event):
+    """Удаляет текущий чат из расписания."""
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
+    chat_name_display = chat.title if hasattr(chat, 'title') else "чата"
+    print(f"\n📥 Команда: /unsch | Чат: {chat_name}")
+
+    entries = load_schedule(SCHEDULE_FILE)
+    before = len(entries)
+    entries = [e for e in entries if e['chat_id'] != event.chat_id]
+    removed = before - len(entries)
+
+    if removed == 0:
+        await event.delete()
+        topic_id = await get_or_create_topic(chat_name)
+        await telegram_client.send_message(
+            RESULTS_DESTINATION,
+            f"❌ Чат **{chat_name_display}** не найден в расписании.",
+            reply_to=topic_id
+        )
+        return
+
+    if not save_schedule(SCHEDULE_FILE, entries):
+        await event.delete()
+        topic_id = await get_or_create_topic(chat_name)
+        await telegram_client.send_message(
+            RESULTS_DESTINATION,
+            "❌ Ошибка при сохранении расписания.",
+            reply_to=topic_id
+        )
+        return
+
+    reload_schedule()
+
+    await event.delete()
+    topic_id = await get_or_create_topic(chat_name)
+    await telegram_client.send_message(
+        RESULTS_DESTINATION,
+        f"✅ **Чат {chat_name_display} удален из расписания**",
+        reply_to=topic_id
+    )
 
 
 async def main():
@@ -3833,6 +4137,10 @@ async def main():
     print("    /add_excluded, /remove_excluded - управление исключенными")
     print("    /add_priority, /remove_priority - управление приоритетными")
     print("    /reload_config - перезагрузить из файлов")
+    print("  Расписание:")
+    print("    /sch HH:MM период - запланировать ежедневное саммари")
+    print("    /sch_list - показать расписание")
+    print("    /unsch - удалить чат из расписания")
     print("  Справка:")
     print("    /help - полная справка по командам")
     print("\n💡 Отправьте команду /sum в любом чате для анализа с AI")
@@ -3842,10 +4150,20 @@ async def main():
     print("💡 Нажмите Ctrl+C для остановки бота")
     
     try:
+        # Запуск планировщика
+        reload_schedule()
+        scheduler.start()
         await telegram_client.run_until_disconnected()
     except KeyboardInterrupt:
         print("\n🔄 Завершение работы...")
     finally:
+        # Остановка планировщика
+        try:
+            scheduler.shutdown(wait=False)
+            print("✅ Планировщик остановлен")
+        except Exception as e:
+            print(f"⚠️ Ошибка при остановке планировщика: {e}")
+        
         # Graceful shutdown: закрываем HTTP клиент и Telegram соединение
         try:
             await http_client.aclose()
