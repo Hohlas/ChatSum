@@ -208,7 +208,7 @@ except ValueError:
     print(f"⚠️ Неверное значение GEMINI_TEMPERATURE={GEMINI_TEMPERATURE_STR}, использую 0")
     GEMINI_TEMPERATURE = 0.0
 
-ALLOWED_REASONING_EFFORTS = {'none', 'low', 'medium', 'high'}
+ALLOWED_REASONING_EFFORTS = {'low', 'medium', 'high'}
 
 if not load_google_api_keys():
     print("⚠️  ВНИМАНИЕ: Не найден ни один GOOGLE_API_KEY / GOOGLE_API_KEYN в private.txt!")
@@ -251,6 +251,13 @@ def get_model_generation_config(model_name):
         config['context_limit_tokens'] = 2000000
     elif model_name in ('gemini-2.0-flash', 'gemini-2.0-flash-lite'):
         config['context_limit_tokens'] = 1048576
+    elif model_name in ('gemini-3.6-flash', 'gemini-3.5-flash-lite'):
+        config.update({
+            'context_limit_tokens': 1048576,
+            'output_max_tokens': 65536,
+            'chunk_max_chars': 100000,
+        })
+        config['chunk_overlap_chars'] = int(config['chunk_max_chars'] * DEFAULT_CHUNK_OVERLAP_RATIO)
     elif model_name == 'gemini-2.5-flash':
         config.update({
             'context_limit_tokens': 1048576,
@@ -259,15 +266,16 @@ def get_model_generation_config(model_name):
         })
         config['chunk_overlap_chars'] = int(config['chunk_max_chars'] * DEFAULT_CHUNK_OVERLAP_RATIO)
 
-    if GEMINI_REASONING_EFFORT:
-        if GEMINI_REASONING_EFFORT in ALLOWED_REASONING_EFFORTS:
-            config['reasoning_effort'] = GEMINI_REASONING_EFFORT
-        else:
-            print(
-                f"⚠️  Неверное значение GEMINI_REASONING_EFFORT: {GEMINI_REASONING_EFFORT}. "
-                f"Допустимые значения: {', '.join(sorted(ALLOWED_REASONING_EFFORTS))}. "
-                f"Использую значение по умолчанию для модели."
-            )
+    if GEMINI_REASONING_EFFORT == 'none':
+        pass  # явно отключено, оставляем None
+    elif GEMINI_REASONING_EFFORT in ALLOWED_REASONING_EFFORTS:
+        config['reasoning_effort'] = GEMINI_REASONING_EFFORT
+    else:
+        print(
+            f"⚠️  Неверное значение GEMINI_REASONING_EFFORT: {GEMINI_REASONING_EFFORT}. "
+            f"Допустимые значения: none, {', '.join(sorted(ALLOWED_REASONING_EFFORTS))}. "
+            f"Использую значение по умолчанию для модели."
+        )
 
     if GEMINI_CHUNK_MAX_CHARS:
         try:
@@ -1711,10 +1719,10 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                     {'role': 'user', 'content': user_content}
                 ],
                 'temperature': GEMINI_TEMPERATURE,
-                'max_tokens': output_max_tokens
+                'max_completion_tokens': output_max_tokens
             }
 
-            if reasoning_effort:
+            if reasoning_effort and reasoning_effort != 'none':
                 request_params['reasoning_effort'] = reasoning_effort
             
             total_chars = len(system_content) + len(user_content)
@@ -1883,11 +1891,11 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                 {'role': 'user', 'content': user_content}
             ],
             'temperature': GEMINI_TEMPERATURE,
-            'max_tokens': output_max_tokens
+            'max_completion_tokens': output_max_tokens
         }
 
-        if reasoning_effort:
-            request_params['reasoning_effort'] = reasoning_effort
+        if reasoning_effort and reasoning_effort != 'none':
+                request_params['reasoning_effort'] = reasoning_effort
         
         total_chars = len(system_content) + len(user_content)
         print(f"   📊 Размер запроса: {total_chars:,} символов")
