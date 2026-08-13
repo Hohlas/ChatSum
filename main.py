@@ -2690,9 +2690,11 @@ async def send_summary_message(telegram_client, text, topic_id, post_to_source=F
 
     if post_to_source and source_chat_id is not None:
         try:
+            divider_len = max(len(line) for line in text.split('\n'))
+            divider = '━' * max(divider_len, 1)
             await telegram_client.send_message(
                 source_chat_id,
-                f"{source_chat_greeting()}\n{text}",
+                f"{source_chat_greeting()}\n{divider}\n{text}",
                 parse_mode='html'
             )
         except Exception as e:
@@ -2701,11 +2703,10 @@ async def send_summary_message(telegram_client, text, topic_id, post_to_source=F
 
 def build_summary_stats_message(stats_message, header=""):
     """Добавляет заголовок, подпись бота и обрезает итоговое сообщение."""
-    message = header + stats_message
-    if not message.endswith('\n'):
-        message += '\n'
-    message += f"<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
-    return trim_text_for_telegram(message)
+    if not stats_message.endswith('\n'):
+        stats_message += '\n'
+    body = f"<i>{stats_message}created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
+    return trim_text_for_telegram(header + body)
 
 
 async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
