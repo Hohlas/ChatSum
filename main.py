@@ -2999,13 +2999,13 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                 
                 # Формируем сообщение со ссылками на все части
                 if any(url for _, url, _ in article_urls):
-                    header = f"📰 Саммари чата <b>{chat_name}</b>\n"
+                    header = f"📄 Саммари чата <b>{chat_name}</b>\n"
                     # header += f"📊 Обработано в {len(summary_parts)} частях:\n\n"
                     
                     for part_title, part_url, part_time_label in article_urls:
                         display_label = f"{part_title} ({part_time_label})" if part_time_label else part_title
                         if part_url:
-                            header += f"• <a href=\"{part_url}\">{display_label}</a>\n\n"
+                            header += f"• <a href=\"{part_url}\"><u>{display_label}</u></a>\n\n"
                         else:
                             header += f"• {display_label} (⚠️ ошибка публикации)\n"
                     
@@ -3082,7 +3082,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                 
                 if article_url:
                     # Вставляем заголовок с саммари в начало сообщения
-                    header = f"📰 <a href=\"{article_url}\"><b>Саммари чата {chat_name}</b></a>\n\n"
+                    header = f"📄 <a href=\"{article_url}\"><b><u>Саммари чата {chat_name}</u></b></a>\n\n"
                     stats_message = build_summary_stats_message(stats_message, header)
 
                     # отправляем сообщение с статистикой и ссылкой на Telegraph (в destination и при необходимости в исходный чат)
