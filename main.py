@@ -2692,7 +2692,7 @@ async def send_summary_message(telegram_client, text, topic_id, post_to_source=F
         try:
             await telegram_client.send_message(
                 source_chat_id,
-                f"{source_chat_greeting()}\n{build_divider(text)}\n{text}",
+                f"{source_chat_greeting()}\n{text}",
                 parse_mode='html'
             )
         except Exception as e:
@@ -2705,11 +2705,6 @@ def build_summary_stats_message(stats_message, header=""):
         stats_message += '\n'
     body = f"<i>{stats_message}created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
     return trim_text_for_telegram(header + body)
-
-
-def build_divider(text):
-    """Тонкая сплошная черта в одну строку шириной под приветствие «Добрый день ☕»."""
-    return '─' * 9
 
 
 async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
@@ -3003,7 +2998,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                 
                 # Формируем сообщение со ссылками на все части
                 if any(url for _, url, _ in article_urls):
-                    header = f"📄 Саммари чата: <b>{chat_name}</b>\n"
+                    header = f"📄 Саммари чата: «<b>{chat_name}</b>»\n"
                     # header += f"📊 Обработано в {len(summary_parts)} частях:\n\n"
                     
                     for part_title, part_url, part_time_label in article_urls:
@@ -3086,7 +3081,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                 
                 if article_url:
                     # Вставляем заголовок с саммари в начало сообщения
-                    header = f"📄 <a href=\"{article_url}\"><u>Саммари чата: <b>{chat_name}</b></u></a>\n\n"
+                    header = f"📄 <a href=\"{article_url}\"><u>Саммари чата: «<b>{chat_name}</b>»</u></a>\n\n"
                     stats_message = build_summary_stats_message(stats_message, header)
 
                     # отправляем сообщение с статистикой и ссылкой на Telegraph (в destination и при необходимости в исходный чат)
