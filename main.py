@@ -2824,7 +2824,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             if period_text and period_start_time and period_end_time:
                 stats_message += f"• За {period_text} с {period_start_time} по {period_end_time}\n"
             if usage_info and total_tokens:
-                stats_message += f"• {total_tokens:,} токенов / {GEMINI_DEFAULT_MODEL}\n"
+                stats_message += f"• {GEMINI_DEFAULT_MODEL} | {total_tokens:,} токенов\n"
             else:
                 stats_message += f"• Модель: {GEMINI_DEFAULT_MODEL}\n"
             if usage_info and usage_info.get('errors'):
