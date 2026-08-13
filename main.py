@@ -1208,10 +1208,10 @@ def source_chat_greeting():
     """Приветствие для публикации в исходном чате (по времени суток МСК)."""
     current_hour = datetime.now(MSK).hour
     if current_hour < 12:
-        return "Доброе утро ☀️"
+        return "Доброе утро ☕"
     if current_hour < 18:
-        return "Добрый день ☀️"
-    return "Добрый вечер ☀️"
+        return "Добрый день ☕"
+    return "Добрый вечер ☕"
 
 
 def plural_messages(n):
@@ -2692,11 +2692,20 @@ async def send_summary_message(telegram_client, text, topic_id, post_to_source=F
         try:
             await telegram_client.send_message(
                 source_chat_id,
-                f"{source_chat_greeting()}\n\n{text}",
+                f"{source_chat_greeting()}\n{text}",
                 parse_mode='html'
             )
         except Exception as e:
             print(f"⚠️  Не удалось отправить результат в исходный чат: {e}")
+
+
+def build_summary_stats_message(stats_message, header=""):
+    """Добавляет заголовок, подпись бота и обрезает итоговое сообщение."""
+    message = header + stats_message
+    if not message.endswith('\n'):
+        message += '\n'
+    message += f"<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
+    return trim_text_for_telegram(message)
 
 
 async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
@@ -2863,7 +2872,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             if period_text and period_start_time and period_end_time:
                 stats_message += f"• За {period_text} с {period_start_time} по {period_end_time}\n"
             if usage_info and total_tokens:
-                stats_message += f"• {GEMINI_DEFAULT_MODEL} | {total_tokens:,} токенов\n"
+                stats_message += f"• {GEMINI_DEFAULT_MODEL} / {total_tokens:,} токенов\n"
             else:
                 stats_message += f"• Модель: {GEMINI_DEFAULT_MODEL}\n"
             if usage_info and usage_info.get('errors'):
@@ -3001,9 +3010,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                             header += f"• {display_label} (⚠️ ошибка публикации)\n"
                     
                     header += "\n"
-                    stats_message = header + stats_message
-                    stats_message += f"\n<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
-                    stats_message = trim_text_for_telegram(stats_message)
+                    stats_message = build_summary_stats_message(stats_message, header)
 
                     # Отправляем сообщение с ссылками (в destination и при необходимости в исходный чат)
                     await send_summary_message(
@@ -3051,7 +3058,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                     
                     await send_summary_message(
                         telegram_client,
-                        stats_message,
+                        build_summary_stats_message(stats_message),
                         topic_id,
                         post_to_source=post_to_source,
                         source_chat_id=chat_id
@@ -3076,9 +3083,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                 if article_url:
                     # Вставляем заголовок с саммари в начало сообщения
                     header = f"📰 <a href=\"{article_url}\"><b>Саммари чата {chat_name}</b></a>\n\n"
-                    stats_message = header + stats_message
-                    stats_message += f"\n<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
-                    stats_message = trim_text_for_telegram(stats_message)
+                    stats_message = build_summary_stats_message(stats_message, header)
 
                     # отправляем сообщение с статистикой и ссылкой на Telegraph (в destination и при необходимости в исходный чат)
                     await send_summary_message(
@@ -3138,7 +3143,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                     # Отправляем статистику (в destination и при необходимости в исходный чат)
                     await send_summary_message(
                         telegram_client,
-                        stats_message,
+                        build_summary_stats_message(stats_message),
                         topic_id,
                         post_to_source=post_to_source,
                         source_chat_id=chat_id
