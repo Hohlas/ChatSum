@@ -2690,11 +2690,9 @@ async def send_summary_message(telegram_client, text, topic_id, post_to_source=F
 
     if post_to_source and source_chat_id is not None:
         try:
-            divider_len = max(len(line) for line in text.split('\n'))
-            divider = '━' * max(divider_len, 1)
             await telegram_client.send_message(
                 source_chat_id,
-                f"{source_chat_greeting()}\n{divider}\n{text}",
+                f"{source_chat_greeting()}\n{build_divider(text)}\n{text}",
                 parse_mode='html'
             )
         except Exception as e:
@@ -2707,6 +2705,18 @@ def build_summary_stats_message(stats_message, header=""):
         stats_message += '\n'
     body = f"<i>{stats_message}created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
     return trim_text_for_telegram(header + body)
+
+
+def build_divider(text):
+    """Тонкая сплошная черта в одну строку шириной под заголовок «Саммари чата ...»
+    (только буквы и цифры текста, без ссылок и служебных HTML-символов)."""
+    plain = re.sub(r'<[^>]+>', '', text)
+    visible_lines = [re.sub(r'https?://\S+', '', line) for line in plain.split('\n')]
+    header_line = next((line for line in visible_lines if 'Саммари чата' in line), None)
+    if header_line is None:
+        header_line = re.sub(r'https?://\S+', '', plain)
+    visible = ''.join(ch for ch in header_line if ch.isalnum() or ch.isspace())
+    return '─' * max(1, min((len(visible) + 1) // 2, 20))
 
 
 async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
