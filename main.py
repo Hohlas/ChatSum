@@ -1204,6 +1204,16 @@ def plural_hours(n):
     return "часов"
 
 
+def source_chat_greeting():
+    """Приветствие для публикации в исходном чате (по времени суток МСК)."""
+    current_hour = datetime.now(MSK).hour
+    if current_hour < 12:
+        return "Доброе утро ☀️"
+    if current_hour < 18:
+        return "Добрый день ☀️"
+    return "Добрый вечер ☀️"
+
+
 def plural_messages(n):
     """Правильная форма слова 'сообщение' для числа n."""
     if 11 <= n % 100 <= 19:
@@ -2660,6 +2670,35 @@ def create_html_report(title, content, author_name="Chat Filter Bot"):
         return None
 
 
+async def send_summary_message(telegram_client, text, topic_id, post_to_source=False, source_chat_id=None):
+    """
+    Отправляет итоговое сообщение в RESULTS_DESTINATION и (опционально) в исходный чат.
+    
+    Args:
+        telegram_client: Клиент Telethon
+        text: Готовый текст сообщения (HTML)
+        topic_id: ID темы для ответа в RESULTS_DESTINATION
+        post_to_source: дублировать ли сообщение в исходный чат
+        source_chat_id: ID исходного чата (используется при post_to_source=True)
+    """
+    await telegram_client.send_message(
+        RESULTS_DESTINATION,
+        text,
+        parse_mode='html',
+        reply_to=topic_id
+    )
+
+    if post_to_source and source_chat_id is not None:
+        try:
+            await telegram_client.send_message(
+                source_chat_id,
+                f"{source_chat_greeting()}\n\n{text}",
+                parse_mode='html'
+            )
+        except Exception as e:
+            print(f"⚠️  Не удалось отправить результат в исходный чат: {e}")
+
+
 async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                         range_start=None, range_end=None, time_range_start=None,
                         time_range_end=None, use_ai=True, post_to_source=False, scheduled=False):
@@ -2966,24 +3005,14 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                     stats_message += f"\n<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
                     stats_message = trim_text_for_telegram(stats_message)
 
-                    # Отправляем сообщение с ссылками
-                    await telegram_client.send_message(
-                        RESULTS_DESTINATION,
+                    # Отправляем сообщение с ссылками (в destination и при необходимости в исходный чат)
+                    await send_summary_message(
+                        telegram_client,
                         stats_message,
-                        parse_mode='html',
-                        reply_to=topic_id
+                        topic_id,
+                        post_to_source=post_to_source,
+                        source_chat_id=chat_id
                     )
-                    
-                    # Если запрошено, дублируем в исходный чат
-                    if post_to_source:
-                        try:
-                            await telegram_client.send_message(
-                                chat_id,
-                                stats_message,
-                                parse_mode='html'
-                            )
-                        except Exception as e:
-                            print(f"⚠️  Не удалось отправить результат в исходный чат: {e}")
 
                     # Если USE_HTML_EXPORT=true, создаем ОБЩИЙ HTML файл со всеми частями
                     if USE_HTML_EXPORT:
@@ -3020,23 +3049,13 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                     )
                     os.remove(filename)
                     
-                    await telegram_client.send_message(
-                        RESULTS_DESTINATION, 
+                    await send_summary_message(
+                        telegram_client,
                         stats_message,
-                        parse_mode='html',
-                        reply_to=topic_id
+                        topic_id,
+                        post_to_source=post_to_source,
+                        source_chat_id=chat_id
                     )
-
-                    # Если запрошено, дублируем в исходный чат
-                    if post_to_source:
-                        try:
-                            await telegram_client.send_message(
-                                chat_id,
-                                stats_message,
-                                parse_mode='html'
-                            )
-                        except Exception as e:
-                            print(f"⚠️  Не удалось отправить результат в исходный чат: {e}")
                 
                 # Удаляем временный файл
                 try:
@@ -3061,24 +3080,14 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                     stats_message += f"\n<i>created by <a href=\"https://github.com/Hohlas/ChatSum\">ChatSumBot</a></i>"
                     stats_message = trim_text_for_telegram(stats_message)
 
-                    # отправляем сообщение с статистикой и ссылкой на Telegraph
-                    await telegram_client.send_message(
-                        RESULTS_DESTINATION,
+                    # отправляем сообщение с статистикой и ссылкой на Telegraph (в destination и при необходимости в исходный чат)
+                    await send_summary_message(
+                        telegram_client,
                         stats_message,
-                        parse_mode='html',
-                        reply_to=topic_id
+                        topic_id,
+                        post_to_source=post_to_source,
+                        source_chat_id=chat_id
                     )
-
-                    # Если запрошено, дублируем в исходный чат
-                    if post_to_source:
-                        try:
-                            await telegram_client.send_message(
-                                chat_id,
-                                stats_message,
-                                parse_mode='html'
-                            )
-                        except Exception as e:
-                            print(f"⚠️  Не удалось отправить результат в исходный чат: {e}")
 
                     # Если USE_HTML_EXPORT=true, дополнительно создаем и отправляем HTML файл
                     if USE_HTML_EXPORT:
@@ -3126,24 +3135,14 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                     )
                     os.remove(filename)
                     
-                    # Отправляем статистику
-                    await telegram_client.send_message(
-                        RESULTS_DESTINATION, 
+                    # Отправляем статистику (в destination и при необходимости в исходный чат)
+                    await send_summary_message(
+                        telegram_client,
                         stats_message,
-                        parse_mode='html',
-                        reply_to=topic_id
+                        topic_id,
+                        post_to_source=post_to_source,
+                        source_chat_id=chat_id
                     )
-
-                    # Если запрошено, дублируем в исходный чат
-                    if post_to_source:
-                        try:
-                            await telegram_client.send_message(
-                                chat_id,
-                                stats_message,
-                                parse_mode='html'
-                            )
-                        except Exception as e:
-                            print(f"⚠️  Не удалось отправить результат в исходный чат: {e}")
             
             print("✅ Анализ с AI успешно завершён")
         
