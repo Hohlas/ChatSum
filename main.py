@@ -3004,6 +3004,15 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                             except Exception as e:
                                 print(f"⚠️  Не удалось отправить в исходный чат: {e}")
                         print(f"   ✅ Часть {part_idx} отправлена как Telegram-сообщение")
+                    if USE_HTML_EXPORT:
+                        html_file = create_html_report(article_title, full_content, author_name="ChatSumBot")
+                        if html_file:
+                            await telegram_client.send_file(
+                                RESULTS_DESTINATION,
+                                html_file,
+                                reply_to=topic_id
+                            )
+                            print(f"✅ HTML отчет отправлен в Telegram")
                 else:
                     # ═══════════════════════════════════════════════════════════════
                     # РЕЖИМ НЕСКОЛЬКИХ ЧАСТЕЙ: публикуем каждую часть отдельно в Telegraph
@@ -3146,6 +3155,15 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                         except Exception as e:
                             print(f"⚠️  Не удалось отправить в исходный чат: {e}")
                     print(f"✅ Саммари отправлено как Telegram-сообщение")
+                    if USE_HTML_EXPORT:
+                        html_file = create_html_report(article_title, full_content, author_name="ChatSumBot")
+                        if html_file:
+                            await telegram_client.send_file(
+                                RESULTS_DESTINATION,
+                                html_file,
+                                reply_to=topic_id
+                            )
+                            print(f"✅ HTML отчет отправлен в Telegram")
                 else:
                     # ═══════════════════════════════════════════════════════════════
                     # ОБЫЧНЫЙ РЕЖИМ: одна публикация в Telegraph
