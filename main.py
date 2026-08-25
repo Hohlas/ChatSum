@@ -2989,8 +2989,8 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                         part_html = convert_markdown_to_html(part_content + bot_footer, for_telegram=True)
                         header = f"📄 <b>Саммари чата: «{chat_name}»</b> — Часть {part_idx}\n"
                         telegram_msg = header + part_html
-                        if len(telegram_msg) > 32000:
-                            telegram_msg = telegram_msg[:32000] + "\n\n⚠️ Сообщение обрезано из-за лимита Telegram"
+                        if len(telegram_msg) > 4000:
+                            telegram_msg = telegram_msg[:4000] + "\n\n⚠️ Сообщение обрезано из-за лимита Telegram"
                         await telegram_client.send_message(
                             RESULTS_DESTINATION, telegram_msg,
                             parse_mode='html', reply_to=topic_id
@@ -3140,8 +3140,8 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                     content_html = convert_markdown_to_html(full_content, for_telegram=True)
                     header = f"📄 <b>Саммари чата: «{chat_name}»</b>\n"
                     telegram_msg = header + content_html
-                    if len(telegram_msg) > 32000:
-                        telegram_msg = telegram_msg[:32000] + "\n\n⚠️ Сообщение обрезано из-за лимита Telegram"
+                    if len(telegram_msg) > 4000:
+                        telegram_msg = telegram_msg[:4000] + "\n\n⚠️ Сообщение обрезано из-за лимита Telegram"
                     await telegram_client.send_message(
                         RESULTS_DESTINATION, telegram_msg,
                         parse_mode='html', reply_to=topic_id
