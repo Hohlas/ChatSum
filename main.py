@@ -2149,25 +2149,59 @@ def sanitize_html_for_telegraph(html_content):
     return tag_pattern.sub(replace_tag, html_content)
 
 
+def _parse_suffixes(value):
+    post_to_source = False
+    post_as_telegram = False
+    clean = value
+    while clean and clean[-1] in ('+', '-'):
+        if clean[-1] == '+':
+            post_to_source = True
+        else:
+            post_as_telegram = True
+        clean = clean[:-1]
+    return clean, post_to_source, post_as_telegram
+
+
+def _truncate_html_safe(html, limit=4000, suffix="\n\n⚠️ Сообщение обрезано из-за лимита Telegram"):
+    if len(html) <= limit:
+        return html
+    cut = limit - len(suffix)
+    truncated = html[:cut]
+    truncated = re.sub(r'<[^>]*$', '', truncated)
+    for tag in ('a', 'i', 'b'):
+        if tag == 'a':
+            open_n = truncated.count('<a ') - truncated.count('</a>')
+            close = '</a>'
+        else:
+            open_n = truncated.count(f'<{tag}>') - truncated.count(f'</{tag}>')
+            close = f'</{tag}>'
+        if open_n > 0:
+            truncated += close * open_n
+    return truncated + suffix
+
+
+def _split_telegram_html(html, header_len, limit=4000):
+    lines = html.split('\n')
+    chunks = []
+    cur = []
+    cur_len = header_len
+    for line in lines:
+        need = len(line) + (1 if cur else 0)
+        if cur and cur_len + need > limit:
+            chunks.append('\n'.join(cur))
+            cur = [line]
+            cur_len = header_len + len(line)
+        else:
+            cur.append(line)
+            cur_len += need
+    if cur:
+        chunks.append('\n'.join(cur))
+    return chunks
+
+
 def _preprocess_for_telegram(content):
-    """Добавляет переносы строк перед временем и сообщениями пользователей для Telegram."""
-    result = []
-    for line in content.split('\n'):
-        # Если строка содержит время и не начинается с него — разделяем
-        ts_match = re.search(r'(- \*\d{2}\.\d{2} \d{2}:\d{2}\* -)', line)
-        if ts_match and ts_match.start() > 0:
-            prefix = line[:ts_match.start()].rstrip()
-            timestamp = line[ts_match.start():].strip()
-            if prefix:
-                result.append(prefix)
-            result.append(timestamp)
-            continue
-        result.append(line)
-    content = '\n'.join(result)
-    # Перед временем в начале строки
     content = re.sub(r'(?<!\n)(- \*\d{2}\.\d{2} \d{2}:\d{2}\* -)', r'\n\1', content)
-    # Перед сообщениями: [Username](https://t.me/c/...)
-    parts = re.split(r'(?=\[[^\]]+\]\(https://t\.me/c/)', content)
+    parts = re.split(r'(?=\[[^\]]+\]\(https://t\.me/)', content)
     return '\n'.join(p.strip() for p in parts if p.strip())
 
 
@@ -2239,17 +2273,6 @@ def convert_markdown_to_html(content, for_telegram=False):
                 html_paragraphs.append('<hr>')
             continue
         
-        # Временная метка: - *DD.MM HH:MM* -
-        ts_line_match = re.match(r'^- \*(\d{2}\.\d{2} \d{2}:\d{2})\* -$', line_stripped)
-        if ts_line_match:
-            flush_paragraph()
-            flush_list()
-            if for_telegram:
-                html_paragraphs.append(f'\n<i>\u2014 {ts_line_match.group(1)} \u2014</i>\n')
-            else:
-                html_paragraphs.append(f'<p align="center"><i>\u2014 {ts_line_match.group(1)} \u2014</i></p>')
-            continue
-        
         # Заголовок темы (начинается с 💡)
         if line_stripped.startswith('💡'):
             flush_paragraph()
@@ -2262,7 +2285,6 @@ def convert_markdown_to_html(content, for_telegram=False):
             else:
                 html_paragraphs.append(f'<h3>{text}</h3>')
             continue
-        # Строка с датой/временем (центрированный курсив)
         ts_match = re.match(r'^-\s*\*(\d{2}\.\d{2}\s+\d{2}:\d{2})\*\s*-$', line_stripped)
         if ts_match:
             flush_paragraph()
@@ -2734,6 +2756,68 @@ def build_summary_stats_message(stats_message, header=""):
     return trim_text_for_telegram(header + body)
 
 
+async def _send_telegram_summary_parts(chat_name, chat_id, topic_id, parts, bot_footer, post_to_source):
+    for part_idx, (_, part_content, _, _) in enumerate(parts, 1):
+        part_html = convert_markdown_to_html(part_content + bot_footer, for_telegram=True)
+        header = f"📄 <b>Саммари чата: «{chat_name}»</b> — Часть {part_idx}\n"
+        full = header + part_html
+        if len(full) > 4000:
+            chunks = _split_telegram_html(part_html, len(header), limit=4000)
+            for ci, ch in enumerate(chunks, 1):
+                ch_header = header if ci == 1 else f"📄 <b>Саммари чата: «{chat_name}»</b> — Часть {part_idx} ({ci}/{len(chunks)})\n"
+                msg = ch_header + ch
+                if len(msg) > 4000:
+                    msg = ch_header + _truncate_html_safe(ch, limit=4000 - len(ch_header))
+                await telegram_client.send_message(RESULTS_DESTINATION, msg, parse_mode='html', reply_to=topic_id)
+                if post_to_source:
+                    try:
+                        await telegram_client.send_message(chat_id, f"{source_chat_greeting()}\n{msg}", parse_mode='html')
+                    except Exception as e:
+                        print(f"⚠️  Не удалось отправить в исходный чат: {e}")
+                if ci < len(chunks) or part_idx < len(parts):
+                    await asyncio.sleep(1)
+        else:
+            await telegram_client.send_message(RESULTS_DESTINATION, full, parse_mode='html', reply_to=topic_id)
+            if post_to_source:
+                try:
+                    await telegram_client.send_message(chat_id, f"{source_chat_greeting()}\n{full}", parse_mode='html')
+                except Exception as e:
+                    print(f"⚠️  Не удалось отправить в исходный чат: {e}")
+            if part_idx < len(parts):
+                await asyncio.sleep(1)
+        print(f"   ✅ Часть {part_idx} отправлена как Telegram-сообщение")
+
+
+async def _send_telegram_single(chat_name, chat_id, topic_id, full_content, post_to_source):
+    content_html = convert_markdown_to_html(full_content, for_telegram=True)
+    header = f"📄 <b>Саммари чата: «{chat_name}»</b>\n"
+    full = header + content_html
+    if len(full) <= 4000:
+        await telegram_client.send_message(RESULTS_DESTINATION, full, parse_mode='html', reply_to=topic_id)
+        if post_to_source:
+            try:
+                await telegram_client.send_message(chat_id, f"{source_chat_greeting()}\n{full}", parse_mode='html')
+            except Exception as e:
+                print(f"⚠️  Не удалось отправить в исходный чат: {e}")
+        print("✅ Саммари отправлено как Telegram-сообщение")
+        return
+    chunks = _split_telegram_html(content_html, len(header), limit=4000)
+    for ci, ch in enumerate(chunks, 1):
+        ch_header = header if ci == 1 else f"📄 <b>Саммари чата: «{chat_name}»</b> (продолжение {ci}/{len(chunks)})\n"
+        msg = ch_header + ch
+        if len(msg) > 4000:
+            msg = ch_header + _truncate_html_safe(ch, limit=4000 - len(ch_header))
+        await telegram_client.send_message(RESULTS_DESTINATION, msg, parse_mode='html', reply_to=topic_id)
+        if post_to_source:
+            try:
+                await telegram_client.send_message(chat_id, f"{source_chat_greeting()}\n{msg}", parse_mode='html')
+            except Exception as e:
+                print(f"⚠️  Не удалось отправить в исходный чат: {e}")
+        if ci < len(chunks):
+            await asyncio.sleep(1)
+    print(f"✅ Саммари отправлено как Telegram-сообщение ({len(chunks)} частей)")
+
+
 async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                         range_start=None, range_end=None, time_range_start=None,
                         time_range_end=None, use_ai=True, post_to_source=False, post_as_telegram=False, scheduled=False):
@@ -2981,29 +3065,9 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             
             if len(summary_parts) > 1:
                 if post_as_telegram:
-                    # ═══════════════════════════════════════════════════════════════
-                    # РЕЖИМ НЕСКОЛЬКИХ ЧАСТЕЙ: публикуем каждую часть как сообщение в канал
-                    # ═══════════════════════════════════════════════════════════════
                     print(f"📝 Публикация {len(summary_parts)} частей как Telegram-сообщений...")
-                    for part_idx, (part_title, part_content, start_idx, end_idx) in enumerate(summary_parts, 1):
-                        part_html = convert_markdown_to_html(part_content + bot_footer, for_telegram=True)
-                        header = f"📄 <b>Саммари чата: «{chat_name}»</b> — Часть {part_idx}\n"
-                        telegram_msg = header + part_html
-                        if len(telegram_msg) > 4000:
-                            telegram_msg = telegram_msg[:4000] + "\n\n⚠️ Сообщение обрезано из-за лимита Telegram"
-                        await telegram_client.send_message(
-                            RESULTS_DESTINATION, telegram_msg,
-                            parse_mode='html', reply_to=topic_id
-                        )
-                        if post_to_source:
-                            try:
-                                await telegram_client.send_message(
-                                    chat_id, f"{source_chat_greeting()}\n{telegram_msg}",
-                                    parse_mode='html'
-                                )
-                            except Exception as e:
-                                print(f"⚠️  Не удалось отправить в исходный чат: {e}")
-                        print(f"   ✅ Часть {part_idx} отправлена как Telegram-сообщение")
+                    await _send_telegram_summary_parts(chat_name, chat_id, topic_id, summary_parts, bot_footer, post_to_source)
+                    await send_summary_message(telegram_client, build_summary_stats_message(stats_message, f"📄 Саммари чата: «<b>{chat_name}</b>» ({len(summary_parts)} частей)\n\n"), topic_id, post_to_source=post_to_source, source_chat_id=chat_id)
                     if USE_HTML_EXPORT:
                         html_file = create_html_report(article_title, full_content, author_name="ChatSumBot")
                         if html_file:
@@ -3134,27 +3198,8 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             
             else:
                 if post_as_telegram:
-                    # ═══════════════════════════════════════════════════════════════
-                    # ОБЫЧНЫЙ РЕЖИМ + post_as_telegram: публикуем как сообщение в канал
-                    # ═══════════════════════════════════════════════════════════════
-                    content_html = convert_markdown_to_html(full_content, for_telegram=True)
-                    header = f"📄 <b>Саммари чата: «{chat_name}»</b>\n"
-                    telegram_msg = header + content_html
-                    if len(telegram_msg) > 4000:
-                        telegram_msg = telegram_msg[:4000] + "\n\n⚠️ Сообщение обрезано из-за лимита Telegram"
-                    await telegram_client.send_message(
-                        RESULTS_DESTINATION, telegram_msg,
-                        parse_mode='html', reply_to=topic_id
-                    )
-                    if post_to_source:
-                        try:
-                            await telegram_client.send_message(
-                                chat_id, f"{source_chat_greeting()}\n{telegram_msg}",
-                                parse_mode='html'
-                            )
-                        except Exception as e:
-                            print(f"⚠️  Не удалось отправить в исходный чат: {e}")
-                    print(f"✅ Саммари отправлено как Telegram-сообщение")
+                    await _send_telegram_single(chat_name, chat_id, topic_id, full_content, post_to_source)
+                    await send_summary_message(telegram_client, build_summary_stats_message(stats_message, f"📄 Саммари чата: «<b>{chat_name}</b>»\n\n"), topic_id, post_to_source=post_to_source, source_chat_id=chat_id)
                     if USE_HTML_EXPORT:
                         html_file = create_html_report(article_title, full_content, author_name="ChatSumBot")
                         if html_file:
@@ -3336,20 +3381,15 @@ async def process_chat_command(event, use_ai=True):
             if m:
                 parts = [m.group(1), m.group(2)]
 
-        # Проверяем суффиксы '+' (публикация в исходном чате) и '-' (вместо Telegraph — сообщение в канал)
         post_to_source = False
         post_as_telegram = False
         filtered_params = []
         for p in parts[1:]:
-            modified = p
-            if modified.endswith('+'):
-                post_to_source = True
-                modified = modified[:-1]
-            if modified.endswith('-'):
-                post_as_telegram = True
-                modified = modified[:-1]
-            if modified:
-                filtered_params.append(modified)
+            clean, plus, minus = _parse_suffixes(p)
+            post_to_source = post_to_source or plus
+            post_as_telegram = post_as_telegram or minus
+            if clean:
+                filtered_params.append(clean)
         if filtered_params != parts[1:]:
             parts = [parts[0]] + filtered_params
 
@@ -3529,14 +3569,7 @@ def load_schedule(filename):
                 minute = int(time_match.group(2))
                 if hour < 0 or hour > 23 or minute < 0 or minute > 59:
                     continue
-                post_to_source = period_str.endswith('+')
-                post_as_telegram = period_str.endswith('-')
-                clean_period = period_str
-                if post_to_source:
-                    clean_period = clean_period[:-1]
-                if clean_period.endswith('-'):
-                    post_as_telegram = True
-                    clean_period = clean_period[:-1]
+                clean_period, post_to_source, post_as_telegram = _parse_suffixes(period_str)
                 if not re.fullmatch(r'\d+[hd]', clean_period):
                     continue
                 entries.append({
@@ -4117,14 +4150,7 @@ async def handle_sch_command(event):
         )
         return
 
-    post_to_source = period_raw.endswith('+')
-    post_as_telegram = period_raw.endswith('-')
-    period = period_raw
-    if post_to_source:
-        period = period[:-1]
-    if period.endswith('-'):
-        post_as_telegram = True
-        period = period[:-1]
+    period, post_to_source, post_as_telegram = _parse_suffixes(period_raw)
 
     if not re.fullmatch(r'\d+[hd]', period):
         await event.delete()
