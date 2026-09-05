@@ -3066,7 +3066,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             if len(summary_parts) > 1:
                 if post_as_telegram:
                     print(f"📝 Публикация {len(summary_parts)} частей как Telegram-сообщений...")
-                    await _send_telegram_summary_parts(chat_name, chat_id, topic_id, summary_parts, bot_footer, post_to_source)
+                    # await _send_telegram_summary_parts(chat_name, chat_id, topic_id, summary_parts, bot_footer, post_to_source)
                     await send_summary_message(telegram_client, build_summary_stats_message(stats_message, f"📄 Саммари чата: «<b>{chat_name}</b>» ({len(summary_parts)} частей)\n\n"), topic_id, post_to_source=post_to_source, source_chat_id=chat_id)
                     if USE_HTML_EXPORT:
                         html_file = create_html_report(article_title, full_content, author_name="ChatSumBot")
@@ -3198,7 +3198,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             
             else:
                 if post_as_telegram:
-                    await _send_telegram_single(chat_name, chat_id, topic_id, full_content, post_to_source)
+                    # await _send_telegram_single(chat_name, chat_id, topic_id, full_content, post_to_source)
                     await send_summary_message(telegram_client, build_summary_stats_message(stats_message, f"📄 Саммари чата: «<b>{chat_name}</b>»\n\n"), topic_id, post_to_source=post_to_source, source_chat_id=chat_id)
                     if USE_HTML_EXPORT:
                         html_file = create_html_report(article_title, full_content, author_name="ChatSumBot")
