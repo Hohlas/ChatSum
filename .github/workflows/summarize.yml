@@ -1,0 +1,94 @@
+name: ChatSum scheduled summaries
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # UTC; раннер сам решает, что «должно» в МСК
+  workflow_dispatch:          # ручной запуск из UI
+    inputs:
+      chat_id:
+        description: 'Только для ручного прогона конкретного чата'
+        required: false
+      period:
+        description: 'Период (1d, 12h)'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: chatsum
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+
+      # принести state.json из ветки state ВО ВНЕ рабочего дерева ($RUNNER_TEMP),
+      # чтобы untracked-файл не конфликтовал с git checkout при Persist
+      # checkout@v4 по умолчанию делает shallow single-branch fetch без wildcard-refspec,
+      # поэтому `git fetch origin state` НЕ создаёт origin/state — используем явный refspec.
+      - name: Fetch state
+        run: |
+          git fetch --depth=1 origin +refs/heads/state:refs/remotes/origin/state 2>/dev/null || true
+          git show origin/state:state.json > "$RUNNER_TEMP/state.json" 2>/dev/null \
+            || echo '{}' > "$RUNNER_TEMP/state.json"
+
+      - name: Run due summaries
+        env:
+          TELEGRAM_API_ID:   ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_PHONE:    ${{ secrets.TELEGRAM_PHONE }}
+          TELEGRAM_SESSION:  ${{ secrets.TELEGRAM_SESSION }}
+          TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+          GOOGLE_API_KEY:    ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_API_KEY1:   ${{ secrets.GOOGLE_API_KEY1 }}
+          GOOGLE_API_KEY2:   ${{ secrets.GOOGLE_API_KEY2 }}
+          GOOGLE_API_KEY3:   ${{ secrets.GOOGLE_API_KEY3 }}
+          GEMINI_MODEL:      ${{ vars.GEMINI_MODEL }}
+          GEMINI_TEMPERATURE:      ${{ vars.GEMINI_TEMPERATURE }}
+          GEMINI_REASONING_EFFORT: ${{ vars.GEMINI_REASONING_EFFORT }}
+          GEMINI_CHUNK_MAX_CHARS:  ${{ vars.GEMINI_CHUNK_MAX_CHARS }}
+          # inputs передаём через env, НЕ через интерполяцию ${{ }} в shell
+          # (защита от quoting/инъекций; пустой period → дефолт 1d)
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          PERIOD:  ${{ github.event.inputs.period }}
+          # run_once.py читает/пишет state по этому пути (вне рабочего дерева)
+          STATE_PATH: ${{ runner.temp }}/state.json
+        run: |
+          if [ -n "$CHAT_ID" ]; then
+            python run_once.py --chat-id "$CHAT_ID" --period "${PERIOD:-1d}"
+          else
+            python run_once.py --due
+          fi
+
+      # state.json должен попасть в ветку state даже при частичном провале:
+      # успешные задачи уже записаны в файл, а упавшая останется для повтора.
+      - name: Persist state
+        if: ${{ !cancelled() }}
+        run: |
+          # state.json лежит в $RUNNER_TEMP (вне дерева) — см. Fetch state.
+          # ВАЖНО: при первом запуске git checkout --orphan НЕ очищает дерево,
+          # поэтому используем read-tree --empty, иначе весь код попадёт в ветку state.
+          git config user.name  "chatsum-bot"
+          git config user.email "chatsum-bot@users.noreply.github.com"
+          if git fetch --quiet --depth=1 origin +refs/heads/state:refs/remotes/origin/state 2>/dev/null; then
+            git checkout -B state origin/state
+          else
+            git checkout --orphan state
+            git read-tree --empty
+          fi
+          # ветка state содержит только state.json
+          cp "$RUNNER_TEMP/state.json" state.json
+          git add -f state.json
+          git commit -m "state: $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
+          git push origin state || {
+            echo "non-fast-forward (гонка) — rebase и повторный push"
+            git pull --rebase origin state || true
+            git push origin state || true
+          }

@@ -246,8 +246,10 @@ python run_once.py --list                # напечатать расписан
 Приоритет — **отдельная ветка `state`** (переживает всё, не зависит от eviction кэша):
 
 - Ветка `state` содержит только `state.json`.
-- Раннер читает его через `git fetch origin state` + `git show origin/state:state.json`
-  (или `actions/checkout` ветки state в подкаталог).
+- Раннер читает его через `git fetch origin +refs/heads/state:refs/remotes/origin/state` +
+  `git show origin/state:state.json` (или `actions/checkout` ветки state в подкаталог).
+  Явный refspec обязателен: checkout@v4 по умолчанию делает shallow single-branch fetch без
+  wildcard-refspec, поэтому `git fetch origin state` (без refspec) НЕ создаёт `origin/state`.
 - После прогона — коммит и `git push origin state`.
 - Требует `permissions: contents: write` в workflow.
 
@@ -279,9 +281,12 @@ python run_once.py --list                # напечатать расписан
 4. `run_once.py` по каждому заданию: `ok = await main.scheduled_analysis_job(...)`;
    писать в state только при `ok is True`; накапливать флаг ошибки для кода возврата.
 
-Сигнал достоверен: `True` — только после нормального завершения публикации; `False` —
-при любом перехваченном исключении. Вариант «обёртка в run_once.py» отклонён: исключения
-внутри `run_analysis` не пробрасываются, их нечем ловить.
+Сигнал достоверен: `True` — «слот отработан»: нормальное завершение публикации, а также
+штатные не-сбойные ветки, когда задание выполнено сообщением в Telegram и повторять его
+нет смысла (нет сообщений за период; все сообщения отфильтрованы). `False` — «нужно
+повторить»: любое перехваченное исключение или нештатный отказ (например, ошибка Gemini
+`❌`-summary). Вариант «обёртка в run_once.py» отклонён: исключения внутри `run_analysis`
+не пробрасываются, их нечем ловить.
 
 ---
 
@@ -324,7 +329,7 @@ jobs:
       # чтобы untracked-файл не конфликтовал с git checkout при Persist
       - name: Fetch state
         run: |
-          git fetch origin state || true
+          git fetch --depth=1 origin +refs/heads/state:refs/remotes/origin/state 2>/dev/null || true
           git show origin/state:state.json > "$RUNNER_TEMP/state.json" 2>/dev/null \
             || echo '{}' > "$RUNNER_TEMP/state.json"
 
@@ -361,7 +366,7 @@ jobs:
           # поэтому используем read-tree --empty, иначе весь код попадёт в ветку state.
           git config user.name  "chatsum-bot"
           git config user.email "chatsum-bot@users.noreply.github.com"
-          if git fetch origin state 2>/dev/null; then
+          if git fetch --quiet --depth=1 origin +refs/heads/state:refs/remotes/origin/state 2>/dev/null; then
             git checkout -B state origin/state
           else
             git checkout --orphan state
@@ -564,7 +569,11 @@ Actions недоступны — расписание меняется реда�
 8. `README.md` — раздел про Actions + предупреждение о единственной сессии.
 
 ### Обязательные проверки (Фаза 7)
-- `pip install -r requirements.txt && TELEGRAM_SESSION=x python -c "import main"` — без ошибок.
+- `pip install -r requirements.txt` и импорт на Actions-профиле с валидным StringSession
+  из `gen_session.py`: `TELEGRAM_SESSION=<валидный StringSession> python -c "import main"` — без ошибок.
+  (Примечание: строка-пустышка `TELEGRAM_SESSION=x` НЕ валидна для Telethon и уронит импорт
+  `StringSession('x')` — проверка безопасного импорта выполняется в `run_once.py --list`,
+  см. `preflight_import_env`.)
 - `python main.py` на локальном VPS-профиле — env грузится, `/sch_list` работает, APScheduler жив.
 - `python run_once.py --list` — печатает расписание.
 - Дедуп: два `--due` подряд на слоте «сейчас−3мин» → второй no-op.

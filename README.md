@@ -528,6 +528,80 @@ sudo systemctl start telegram-bot
 sudo systemctl status telegram-bot
 ```
 
+## Запуск на GitHub Actions
+
+Тот же код может работать на GitHub Actions вместо VPS: ежедневные саммари из
+`SCHEDULE.txt` запускаются по cron (`*/5`, UTC), раннер сам определяет, какие
+задания «должны» в МСК, и не повторяет уже выполненные (дедупликация через
+ветку `state`). Интерактивные команды (`/sum`, `/config` и т.п.) при этом
+недоступны — расписание меняется правкой `SCHEDULE.txt` и push.
+
+### Выбор площадки
+
+| | VPS | GitHub Actions |
+|---|---|---|
+| Точка входа | `python3 main.py` (долгоживущий процесс) | `run_once.py --due` (cron) |
+| Сессия | файловая `session_name.session` | StringSession в секрете `TELEGRAM_SESSION` |
+| Команды `/sum`, `/config` и т.п. | ✅ | ❌ |
+| Стоимость | сервер | бесплатно на public-репо |
+
+⚠️ **Используйте одну площадку за раз.** Одновременная работа двух процессов
+с одной сессией Telegram не поддерживается: возможен рассинхрон состояния
+апдейтов и разрыв авторизации.
+
+### Настройка
+
+1. Проверьте visibility репозитория: для `schedule`-триггеров cron и
+   бесплатных минут подходит **public**-репозиторий (`Settings → General →
+   Danger Zone`).
+2. В `Settings → Secrets and variables → Actions → New repository secret`
+   добавьте (обязательные — `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`,
+   `TELEGRAM_PHONE`, `TELEGRAM_SESSION`, `GOOGLE_API_KEY`):
+   - `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` — из my.telegram.org;
+   - `TELEGRAM_PHONE` — номер аккаунта;
+   - `TELEGRAM_SESSION` — сгенерируйте один раз локально:
+     ```bash
+     python3 gen_session.py
+     ```
+     Скопируйте вывод (длинная строка) в секрет `TELEGRAM_SESSION`.
+     Не коммитьте эту строку. Перевыпускается, если пароль/сессия были изменены.
+   - `TELEGRAM_GROUP_ID` — (необязательно) канал результатов, иначе «Избранное»;
+   - `GOOGLE_API_KEY[,1..N]` — ключи Gemini.
+3. В `Settings → Secrets and variables → Actions → New repository variable`
+   настройте `GEMINI_MODEL`, `GEMINI_TEMPERATURE`,
+   `GEMINI_REASONING_EFFORT` (например, `none`), `GEMINI_CHUNK_MAX_CHARS`.
+   Обратите внимание: **Variables публичны**, секреты — нет. Если значения
+   `GEMINI_*` надо скрыть, кладите в Secrets, а не в Variables.
+   Рекомендуется явно задать `GEMINI_REASONING_EFFORT`, иначе в логах будет
+   предупреждение на каждый запуск генерации.
+4. Отредактируйте `SCHEDULE.txt` (коммитите через git) и запушите в `main`.
+5. Запустите вручную из `Actions → ChatSum scheduled summaries →
+   Run workflow`, либо дождитесь ближайшего cron-запуска.
+
+### Как это работает
+
+- `.github/workflows/summarize.yml` ставит env из Secrets/Variables и вызывает
+  `python run_once.py --due`.
+- `run_once.py` читает `SCHEDULE.txt`, `PROMPT.txt`, `EXCLUDED_USERS.txt`,
+  `PRIORITY_USERS.txt` из репозитория; `MODEL_CONFIG.txt` в репозитории нет —
+  при отсутствии используется HTML-экспорт по умолчанию, а модель берётся из
+  `GEMINI_MODEL`. Если нужно управлять `USE_HTML_EXPORT` через git — добавьте
+  `MODEL_CONFIG.txt` в репозиторий.
+- Окно «должных» заданий: `[now(МСК) − LAG_MAX, now(МСК)]`, по умолчанию
+  `LAG_MAX=15` минут. Задания не раньше этого окна не запускаются (защита от
+  повторов после долгой паузы).
+- Состояние хранится в ветке `state` (только `state.json`) и переиспользуется
+  между прогонами. Уже выполненная в тот же день (МСК) задача пропускается.
+- `run_once.py` возвращает ненулевой код, если хотя бы одна должная задача
+  упала — такой прогон виден как красный в Actions, а неуспешная задача
+  остаётся незаписанной в state и будет повторена.
+
+### Дополнительно
+
+- Для cron на public-репозитории: если 60 дней не было активности,
+  GitHub отключает `schedule` — периодически коммитьте.
+- Частота опроса и `LAG_MAX` задаются вручную в workflow/флаге `--lag-max`.
+
 ## Частые проблемы
 
 ### Бот не запускается
@@ -593,8 +667,10 @@ GEMINI_REASONING_EFFORT=medium
 - `python-dotenv`
 - `httpx`
 - `telegraph`
+- `apscheduler` (планировщик ежедневных саммари и `run_once.py`)
 
-Дополнительных обязательных пакетов для текущей версии кода не требуется.
+> `run_once.py` (GitHub Actions) импортирует `main`, поэтому `apscheduler`
+> обязателен в `requirements.txt` для обеих площадок.
 
 ## Безопасность
 

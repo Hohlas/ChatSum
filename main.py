@@ -6,6 +6,7 @@ import shutil
 import time
 from collections import Counter
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from openai import AsyncOpenAI, AuthenticationError, APIStatusError
 from dotenv import load_dotenv
 import json
@@ -152,25 +153,34 @@ def mask_api_key(api_key):
     return f"{api_key[:8]}...{api_key[-6:]}"
 
 
-# Создаем private.txt из шаблона, если его нет
-file_just_created = ensure_private_file()
+# Создаем private.txt из шаблона, если его нет (только для VPS; на Actions
+# при заданном TELEGRAM_SESSION private.txt не нужен и не создаётся).
+file_just_created = False
+if not os.getenv('TELEGRAM_SESSION'):
+    file_just_created = ensure_private_file()
 
-# Загрузка переменных окружения
-load_dotenv('private.txt')
+# Загрузка переменных окружения (env из секретов Actions не затирается)
+load_dotenv('private.txt', override=False)
 
-# Проверяем конфигурацию
-config_errors = validate_config()
-if config_errors:
+
+def _config_errors_or_exit():
+    """При невалидной конфигурации печатает инструкцию и завершает процесс.
+
+    Общий код для импорт-тайм проверки (VPS) и load_env_config().
+    """
+    config_errors = validate_config()
+    if not config_errors:
+        return
     if file_just_created:
         print("\n" + "="*60)
         print("📋 Файл private.txt создан из шаблона")
         print("="*60)
     else:
         print("\n❌ Ошибки конфигурации в private.txt:")
-    
+
     for error in config_errors:
         print(f"   • {error}")
-    
+
     print("\n📝 Инструкция:")
     print("   1. Откройте файл private.txt")
     print("   2. Замените все значения-заглушки на ваши реальные API ключи")
@@ -178,7 +188,37 @@ if config_errors:
     print("\n💡 Где получить ключи:")
     print("   • Telegram API: https://my.telegram.org/auth")
     print("   • Google AI Studio: https://aistudio.google.com")
-    exit(1)
+    raise SystemExit(1)
+
+
+def load_env_config():
+    """Валидирует окружение. Вызывается из main() (VPS) и из run_once.py (preflight)."""
+    _config_errors_or_exit()
+    _check_google_key_chars()
+
+
+def _check_google_key_chars():
+    """Проверяет, что все Google API ключи содержат только ASCII (иначе exit)."""
+    print(f"🔑 Проверка ключей Google AI Studio:")
+    for idx, api_key in enumerate(GOOGLE_API_KEYS, 1):
+        print(f"   • Ключ {idx}: {mask_api_key(api_key)} (длина {len(api_key)} символов)")
+        try:
+            api_key.encode('ascii')
+            print("     ✅ API-ключ корректный (ASCII)")
+        except UnicodeEncodeError:
+            print("     ❌ ОШИБКА: API-ключ содержит недопустимые символы!")
+            print("     Проверьте файл private.txt на наличие невидимых символов")
+            raise SystemExit(1)
+
+    print(f"   🔁 Всего ключей: {len(GOOGLE_API_KEYS)}")
+    print(f"   🔑 Стартовый активный ключ: {mask_api_key(GOOGLE_API_KEYS[0] if GOOGLE_API_KEYS else GOOGLE_API_KEY)}")
+
+
+# VPS-поведение как раньше: валидация на импорте (fail-fast при невалидной
+# конфигурации, до int(API_ID) ниже). На Actions (TELEGRAM_SESSION задан)
+# валидацию выполняет run_once.py — здесь она пропускается.
+if not os.getenv('TELEGRAM_SESSION'):
+    _config_errors_or_exit()
 
 # Конфигурация Telegram
 API_ID = int(os.getenv('TELEGRAM_API_ID'))
@@ -660,25 +700,18 @@ if GEMINI_DEFAULT_MODEL:
     CURRENT_MODEL = GEMINI_DEFAULT_MODEL
 
 # Инициализация клиентов
-telegram_client = TelegramClient('session_name', API_ID, API_HASH)
+def build_session():
+    """Возвращает сессию Telethon: StringSession (Actions) или файловую (VPS)."""
+    session_str = os.getenv('TELEGRAM_SESSION', '').strip()
+    if session_str:
+        return StringSession(session_str)
+    return 'session_name'
+
+
+telegram_client = TelegramClient(build_session(), API_ID, API_HASH)
 GOOGLE_API_KEYS = load_google_api_keys()
 current_google_key_index = 0
 google_analysis_counter = 0
-
-# Валидация API ключа
-print(f"🔑 Проверка ключей Google AI Studio:")
-for idx, api_key in enumerate(GOOGLE_API_KEYS, 1):
-    print(f"   • Ключ {idx}: {mask_api_key(api_key)} (длина {len(api_key)} символов)")
-    try:
-        api_key.encode('ascii')
-        print("     ✅ API-ключ корректный (ASCII)")
-    except UnicodeEncodeError:
-        print("     ❌ ОШИБКА: API-ключ содержит недопустимые символы!")
-        print("     Проверьте файл private.txt на наличие невидимых символов")
-        exit(1)
-
-print(f"   🔁 Всего ключей: {len(GOOGLE_API_KEYS)}")
-print(f"   🔑 Стартовый активный ключ: {mask_api_key(GOOGLE_API_KEYS[0] if GOOGLE_API_KEYS else GOOGLE_API_KEY)}")
 
 # Создаём асинхронный HTTP-клиент с настройками таймаута и лимитов соединений
 http_client = httpx.AsyncClient(
@@ -2858,7 +2891,9 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                 f"❌ За указанный период не найдено сообщений в чате '{chat_name}'",
                 reply_to=topic_id
             )
-            return
+            # Штатная ситуация, а не сбой: задание «отработано» (отчёт уже отправлен),
+            # повтор в пределах окна бессмыслен. True разрешает дедупликацию в run_once.py.
+            return True
 
         if use_ai and GOOGLE_API_KEYS:
             select_google_api_key_for_new_analysis()
@@ -2918,7 +2953,8 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                 f"Загружено: {len(messages_data)}, все отфильтрованы.",
                 reply_to=topic_id
             )
-            return
+            # Штатная ситуация: slot отработан (отчёт отправлен), повторять не нужно.
+            return True
         
         # Ветвление: с AI или без
         if use_ai:
@@ -2933,7 +2969,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                     f"{summary}\n\n⚠️ Анализ прерван. Попробуйте позже или уменьшите количество сообщений.",
                     reply_to=topic_id
                 )
-                return
+                return False
             
             summary = enrich_summary_with_timestamps(summary, optimized_messages)
             
@@ -3287,7 +3323,6 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                         )
             
             print("✅ Анализ с AI успешно завершён")
-        
         else:
             processed_label = build_processed_label(
                 len(optimized_messages),
@@ -3348,7 +3383,9 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             os.remove(filename)
             
             print(f"✅ Экспорт завершен: {len(optimized_messages)} сообщений")
-        
+
+        return True
+
     except Exception as e:
         error_msg = f"❌ Ошибка при выполнении анализа: {e}"
         print(error_msg)
@@ -3360,6 +3397,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             await telegram_client.send_message(RESULTS_DESTINATION, error_msg, reply_to=topic_id)
         except:
             await telegram_client.send_message(RESULTS_DESTINATION, error_msg)
+        return False
 
 
 async def process_chat_command(event, use_ai=True):
@@ -3613,7 +3651,7 @@ async def scheduled_analysis_job(chat_id, period, post_to_source, post_as_telegr
         chat_name = chat_entity.title if hasattr(chat_entity, 'title') else f"чат {chat_id}"
     except Exception as e:
         print(f"❌ Не удалось получить информацию о чате {chat_id}: {e}")
-        return
+        return False
 
     hours = None
     days = None
@@ -3625,7 +3663,7 @@ async def scheduled_analysis_job(chat_id, period, post_to_source, post_as_telegr
     else:
         days = 1
 
-    await run_analysis(
+    return await run_analysis(
         chat_id=chat_id,
         chat_name=chat_name,
         hours=hours,
@@ -4301,6 +4339,7 @@ async def handle_unsch_command(event):
 
 async def main():
     """Основная функция запуска"""
+    load_env_config()
     print("🚀 Запуск Telegram бота для анализа чатов...")
     print("=" * 60)
     

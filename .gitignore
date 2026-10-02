@@ -211,6 +211,9 @@ __marimo__/
 private.txt
 *.code-workspace
 
+# GitHub Actions state (ветка state, локально не хранится)
+state.json
+
 # analysis results
 analysis_*.json
 

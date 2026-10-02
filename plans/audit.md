@@ -1,134 +1,128 @@
-# Аудит: plans/GitHubActions.md
+# Аудит: реализация плана plans/GitHubActions.md (вариант B)
 
-Дата аудита: 2026-10-01.
-Аудируемый документ: `plans/GitHubActions.md` (359 строк, неизменяемая копия на момент аудита — файл в git не трекается, `git status` показывает `plans/` как untracked).
+Объект проверки: handoff-описание («Изменённые/Новые файлы») + артефакты `main.py`, `run_once.py`, `gen_session.py`, `.github/workflows/summarize.yml`, `test_run_once.py`, `requirements.txt`, `README.md`, `.gitignore` против плана `plans/GitHubActions.md`.
 
-Проверяемые артефакты: `main.py`, `requirements.txt`, `.gitignore`, `README.md`, `CONFIG_MANAGEMENT.md`, `SCHEDULE.txt`, `private.txt.example`, `telegram-bot.service.example`, `start_bot.sh`, `test_bot.py`, внешние доки GitHub Actions (billing + events-that-trigger-workflows).
-
----
-
-## Критично
-
-### К1. `import main` упадёт на раннере: `apscheduler` отсутствует в `requirements.txt`
-
-- Место: план — Фаза 5 (`pip install -r requirements.txt`, строка 236), Фаза 1 «Критерий готовности» (строки 82–83), Фаза 3.2 шаг 4, «Файлы: без изменений: requirements.txt» (строки 357–358).
-- Суть: `run_once.py` импортирует `main`; `main.py` на верхнем уровне выполняет `from apscheduler.schedulers.asyncio import AsyncIOScheduler` (`main.py:16-17`). В `requirements.txt` apscheduler нет: `telethon==1.34.0`, `openai>=1.40.0`, `python-dotenv==1.0.0`, `httpx>=0.24.0`, `telegraph>=1.5.0` (`requirements.txt:1-5`). После `pip install -r requirements.txt` на чистом раннере `python -c "import main"` и `python run_once.py --due` дадут `ModuleNotFoundError: No module named 'apscheduler'`. Весь план падает на первом же прогоне.
-- Доказательство: `grep -n apscheduler main.py` → строки 16, 17; `grep apscheduler requirements.txt` → пусто; `cat requirements.txt` (5 строк). Косвенно: `README.md:588` («requirements.txt сейчас соответствует коду») — ошибочное утверждение README, воспроизведённое планом косвенно через доверие к requirements.
-- Почему важно: блокирует реализацию всего варианта B; критерий готовности Фазы 1 недостижим без изменения requirements или без защиты импорта apscheduler.
-- Рекомендация: добавить `apscheduler` в `requirements.txt` ИЛИ убрать импорт в ветку VPS (отложить `from apscheduler...` внутрь `main()`/обёртки, импортируемой только на VPS). В плане исправить строку «без изменений: requirements.txt» и в Фазе 1 явно указать способ. Проверочная команда для acceptance-критерия: `pip install -r requirements.txt && python -c "import main"` в чистом venv.
-
-### К2. «Красный run» при ошибках анализа недостижим: `run_analysis` глотает все исключения
-
-- Место: план — Фаза 3.2 шаг 10 (строка 146): «Код возврата: 0 — успех; не 0 — если были ошибки (чтобы видеть красный run)»; Фаза 7.4–7.5 полагаются на этот сигнал.
-- Суть: `run_analysis` обёрнут в `try/except Exception` без ре-райза: `except Exception as e: ... print(error_msg); traceback.print_exc(); ... send_message(...)` (`main.py:3352-3362`) — функция возвращает `None` при провале. `scheduled_analysis_job`, который план предлагает вызывать напрямую (Фазы 3.3, 150–152), тоже не пробрасывает ошибку: при сбое `get_entity` делает `return` (`main.py:3609-3617`). Значит `run_once.py --due` завершится кодом 0 даже если все саммари упали — «красный run» никогда не покраснеет, дедуп-логика шага 8 (записать факт выполнения) зафиксирует провалившуюся задачу как выполненную, и она не повторится до следующего дня.
-- Доказательство: `main.py:3352-3362` (нет `raise`), `main.py:3612-3617` (silent return). Тестов, проверяющих коды возврата прогона, в репозитории нет (`test_bot.py` — интерактивный скрипт, не pytest).
-- Почему важно: сбой Gemini/Telegraph/Telegram молча «съедает» дневное саммари и блокирует ретрай в тот же день — противоречит декларируемой «устойчивости к пропускам» (строки 10–11).
-- Рекомендация: в плане заменить шаг 10 на явный сбор статуса: либо `run_analysis` возвращает bool/raises (рефакторинг с сохранением VPS-поведения через try в местах вызова), либо `run_once.py` вызывает внутренний код и сам ловит/считает ошибки и делает `sys.exit(1)`. Фиксировать state только для реально успешных задач.
+Окружение проверки: локальная машина (Linux), git 2.53, venv `/tmp/opencode/cs-venv` (Telethon 1.34.0, APScheduler 3.11.3, httpx 0.28.1, openai 3.23.0, python 3.14.4; workflow таргетит 3.11 — расхождение noted ниже). Все git-сценарии воспроизведены на bare-репозиториях в `/tmp/opencode/wf*`, `git-sim*`.
 
 ---
 
-## Важно
+## 1. Итог по критериям
 
-### В1. Фаза 1 неполна: на импорте остаются side effects (печать и `exit(1)`), критерий «не делает никакой работы» нарушен
+**Локальная корректность.** Большинство утверждений handoff и плана подтверждены кодом и командами. Реализация соответствует плану по структуре: `load_env_config`/`_config_errors_or_exit` (main.py:166,194), `build_session` со StringSession (main.py:703–711), возвраты `bool` из `run_analysis`/`scheduled_analysis_job`, `run_once.py` с `--due/--list/--chat-id`, тесты окна/дедупа/полночи/prune, workflow с cron `*/5` + workflow_dispatch + concurrency + `$RUNNER_TEMP` + `read-tree --empty` + rebase-ретраем. `apscheduler>=3.10.0` добавлен в `requirements.txt`. Модульные тесты `test_run_once.py` проходят все 8 кейсов (запуск ниже).
 
-- Место: план — строки 44–51 (список side effects), 82–83 (критерий готовности), 77–80 (1.2).
-- Суть: план перечисляет side effects на строках 156, 159, 162–181, 3606+, 4409 — нумерация верна (см. сверку ниже). Но пропущены: (а) печать проверки ключей `🔑 Проверка ключей Google AI Studio` и `exit(1)` при недопустимых символах ключа (`main.py:669-678`); (б) создание `httpx.AsyncClient` на импорте (`main.py:683-690`); (в) чтение `EXCLUDED_USERS/PRIORITY_USERS/PROMPT/MODEL_CONFIG` (`main.py:655-658`) — безвредно, но это «работа» на импорте. После изменений 1.1 импорт по-прежнему печатает блок 669–681 и может `exit(1)` — критерий 82–3 «не делает никакой работы» не выполняется.
-- Доказательство: `main.py:669-681`, `main.py:683`, `main.py:655-658` (чтение файлов сразу при импорте).
-- Почему важно: раннер Actions парсит stdout; лишняя печать и потенциальный `exit(1)` на валидации ключей — часть «общего ядра», которую план обещает не трогать; при некорректном секрете импорт умрёт до внятной диагностики из 7.7.
-- Рекомендация: дополнить 1.1 переносом блока 669–681 в функцию (или в `load_env_config()`); отметить `http_client` как допускаемый side effect (или ленивое создание). Уточнить формулировку критерия.
+Однако найдены **две критические ошибки в workflow-логикеPersist/Fetch** и **один критический сбой приёмочной команды**, а также несколько «важных» несоответствий плану — см. раздел 2.
 
-### В2. В Actions не передаются `GEMINI_TEMPERATURE`, `GEMINI_REASONING_EFFORT`, `GEMINI_CHUNK_MAX_CHARS` — поведение VPS и Actions разойдётся
+**Целостность.** Ядро варианта B (дедуп по `chat_id|HH:MM|period` с МСК-датой, запись state после каждого задания, код возврата) реализовано согласованно; `compute_due` даёт ровно одно срабатывание при пересечении полуночи (тест подтверждает), `task_key` совпадает с форматом 4.1 (с оговоркой — см. 2.6).
 
-- Место: план — Фаза 5 env-блок workflow (245–253) и таблица секретов (279–289); «Поведение VPS-версии не меняется» (20–21) + «один код» (15).
-- Суть: `main.py` читает их с верхнего уровня на импорте: `GEMINI_REASONING_EFFORT` (`main.py:202`), `GEMINI_CHUNK_MAX_CHARS` (`main.py:203`), `GEMINI_TEMPERATURE` с дефолтом `0` (`main.py:204-209`); `GEMINI_CHUNK_MAX_CHARS=''` затем даёт fallback `DEFAULT_CHUNK_MAX_CHARS=60000` (`main.py:227-229`). В private.txt.example они заданы (`private.txt.example`, строки `GEMINI_TEMPERATURE=0`, `GEMINI_REASONING_EFFORT=none`, `GEMINI_CHUNK_MAX_CHARS=60000`). Workflow план передаёт только `GEMINI_MODEL` через vars; остальные три — нет. Если у пользователя `GEMINI_TEMPERATURE` или `REASONING_EFFORT` отличаются от дефолтов, Actions-саммари будет другим, чем VPS, при «одном коде».
-- Доказательство: `main.py:202-209`, `private.txt.example` (комментарии с этими переменными), отсутствие переменных в env-блоке плана (245–253) и таблице (279–289).
-- Почему важно: нарушает декларируемое равенство площадок; тихий дрейф качества саммари.
-- Рекомендация: добавить в 5.1 строки (Vars или Secrets) `GEMINI_TEMPERATURE`, `GEMINI_REASONING_EFFORT`, `GEMINI_CHUNK_MAX_CHARS` и передать их в env, либо явно задокументировать, что в Actions используются дефолты.
-
-### В3. `MODEL_CONFIG.txt` указан как коммитимый конфиг, но файла нет в репозитории
-
-- Место: план — диаграмма архитектуры (строки 30–31), 5.2 (293–295), «Файлы» (358–359).
-- Суть: план говорит «git читает ... MODEL_CONFIG.txt ... из репозитория» и перечисляет его среди коммитимых. Фактически `MODEL_CONFIG.txt` отсутствует и в рабочем дереве, и в git-индексе; `.gitignore` его не игнорирует — он просто никогда не коммитился.
-- Доказательство: `git ls-files` → нет `MODEL_CONFIG.txt`; `ls MODEL_CONFIG.txt` → "No such file"; `README.md:403` («если MODEL_CONFIG.txt отсутствует, бот использует дефолтный экспорт в HTML»); `load_model_config` корректно обрабатывает отсутствие файла (`main.py:584-588`, дефолт `use_html_export=True`, строка 582).
-- Почему важно: при переносе на Actions конфиг модели будет всегда дефолтным; «правится через git» (5.2) для nonexistent-файла — ложное обещание. Это скорее уточнение, но влияет на корректность 5.2 и архитектуры.
-- Рекомендация: либо коммитнуть `MODEL_CONFIG.txt` как часть плана (добавить в «Файлы: новые/изменяются»), либо убрать из списка и опираться на env `GEMINI_*` (см. В2). Отметить дефолт USE_HTML_EXPORT=true.
-
-### В4. Непоследовательность: архитектура (шаг 4) зовёт `run_analysis`, Фаза 3.3 зовёт `scheduled_analysis_job`
-
-- Место: план — строка 34 (`main.run_analysis(..., use_ai=True, scheduled=True)`) против строк 150–152 («вызвать main.scheduled_analysis_job(...) напрямую — он уже делает всё нужное»).
-- Суть: два разных описания одного шага. `run_analysis` требует `chat_name` (резолвится только в `scheduled_analysis_job` через `get_entity`, `main.py:3609-3617`), поэтому 3.3 — правильная версия; строка 34 в диаграмме некорректна как первичная: у вызова не откуда взять `chat_name`.
-- Доказательство: сигнатура `run_analysis` (`main.py:2821-2823`, обязательный позиционный `chat_name`), `scheduled_analysis_job` (`main.py:3609`).
-- Почему важно: при реализации по диаграмме придётся заново дублировать резолв имени — против принципа «минимизировать дублирование» (152).
-- Рекомендация: унифицировать: везде `scheduled_analysis_job`, в 3.2 шаги 4/7 переписать через него.
-
-### В5. Псевдокод persist-state битый: `git checkout --orphan` оставляет всё дерево репозитория в ветке `state`
-
-- Место: план — Фаза 5, шаг "Persist state" (262–269).
-- Суть: при первом запуске (ветки `state` нет) `git checkout --orphan state` не очищает рабочее дерево — в него попадут `main.py`, секретоносители нет, но весь код репозитория; коммит «только state.json» без `git rm`/`git read-tree --empty` закоммитит всё дерево в orphan-ветку, противореча 4.2 «Ветка state содержит только state.json» (184). Также `cp state.json "$RUNNER_TEMP/..."` копирует не туда (state.json лежит в root), а реального push в скетче нет.
-- Доказательство: поведение `git checkout --orphan` (документировано: сбрасывает HEAD, сохраняет индекс/дерево); текст самого плана 184 vs 262–269. Сам план снимает с себя ответственность («точную реализацию ... на этапе реализации», 271–273), но при этом 4.2 подаёт «ветка state» как принятое решение (193).
-- Почему важно: решение принято, а единственный его эскиз в документе нерабочий; риск утечки дерева/мусора в ветку state и нечитаемого diff.
-- Рекомендация: в скетче добавить `git read-tree --empty`, `git add state.json`, либо хранить state через отдельный checkout (`actions/checkout@v4 with: ref: state, path: state-dir`). Упомянуть, что push идёт `GITHUB_TOKEN` с `contents: write` (это ок), и что push ботом не должен ре-триггерить workflow (для schedule это не проблема).
+**Обоснованность подхода.** Выбор ветки `state` + `$RUNNER_TEMP`, `override=False` для dotenv, импорт-тайм валидация только для VPS — аргументированы в плане и корректны сами по себе. Риск «одна сессия одновременно» отражён в README и плане.
 
 ---
 
-## Улучшения / мелкие неточности
+## 2. Замечания
 
-### У1. Ссылка «session в .gitignore — строки 209–211»
+### 2.1. КРИТИЧНО. Workflow: `git fetch origin state` не создаёт `origin/state` при default `fetch-depth` checkout@v4 → Persist на 2+ запуске падает.
 
-- Фактически `*.session` — `.gitignore:209`, `*.session-journal` — 210, а 211 — это `private.txt` (`sed -n '200,217p' .gitignore`). Суть утверждения верна, границы строки сдвинуты на 1 лишнюю. Поправить на 209–210.
+Место: `.github/workflows/summarize.yml:36` («Fetch state») и `:78–83` («Persist state»); plan `GitHubActions.md:249` и раздел «Почему state.json вне дерева».
 
-### У2. Числа риска лимитов верны, но опечатка в интерпретации
+Суть: `actions/checkout@v4` по умолчанию делает `fetch-depth: 1` и настраивает `remote.origin.fetch` **только** на ref целевой ветки (`+refs/heads/main:refs/remotes/origin/main`) — это подтверждено в исходниках экшена (`src/ref-helper.ts:91–96` `getRefSpec` для `refs/heads/` возвращает `[+${ref}:refs/remotes/origin/${branch}]`, без wildcard). Локальная реплика ровно этих настроек (`/tmp/opencode/wf2/work5`, config `remote.origin.fetch='+refs/heads/main:refs/remotes/origin/main'`, `fetch --depth=1`): `git fetch origin state` завершился exit=0, создал **только `FETCH_HEAD`**, `git show-ref | grep state` пуст, а `git show origin/state:state.json` → `fatal: invalid object name 'origin/state'`.
 
-- `*/5` → 12×24×30 = 8640 прогонов/мес — совпадает с планом (331–332). Free private = 2000 мин/мес подтверждено (GitHub docs, billing: таблица «Free use», GitHub Free 2,000 min). Прогон 1–3 мин → 8640–25920 мин ≫ 2000 — вывод плана верен. Публичные репо: стандартные hosted-раннеры бесплатны (подтверждено docs). Замечание: план пишет «превысит лимит private» и «public — бесплатно без лимита минут» — корректно; стоит добавить, что public-вариант делает secrets и историю коммитов state видими всем (см. В3-вопрос ниже и У3).
+Следствия по workflow:
+- «Fetch state»: `git show origin/state:state.json 2>/dev/null || echo '{}'` всегда берёт ветку `{}` → **dedup не работает между запусками** (state каждый раз пустой, задачи повторяются каждые 5 минут). Это прямо противоречит цели варианта B.
+- «Persist state»: `if git fetch origin state 2>/dev/null` истинен (fetch проходит в FETCH_HEAD), затем `git checkout -B state origin/state` → fatal (ref не существует) → шаг падает, state не пушится никогда. Симуляция второго запуска подтвердила отсутствие `refs/remotes/origin/state`.
+- Первый запуск «повезёт» (fetch fail → orphan + push OK), что маскирует баг: первый run зелёный.
 
-### У3. Не указан вопрос видимости репозитория
+Доказательство: вывод симуляции в 1-м bash-блоке; поведение git-2.53 с `git fetch origin state` при single-branch refspec; документация actions/checkout v4 README («Only a single commit is fetched by default… Set `fetch-depth: 0` to fetch all history for all branches and tags»).
 
-- План рассуждает «public vs private», но visibility конкретного `Hohlas/ChatSum` нигде не зафиксирована. Проверить не удалось: `gh` недоступен, API вернул `rate limit exceeded` — подтверждённых данных нет, это неподтверждённое допущение плана. Рекомендация: добавить в 5.2/риски строку «проверить visibility репо; если private — лимит минут актуален» — это факт, влияющий на выбор варианта.
+Почему важно: ломает центральный механизм (дедупликацию) и персист состояния; в репозитории уже есть ветка `state` (`git ls-remote origin state` → SHA есть), т.е. каждый плановый run после первого будет падать в Persist.
 
-### У4. Утверждение «Telegram отклонит второе подключение/разлогинит» при одновременной одной сессии (109–110)
+Рекомендация (минимальный дифф): в «Fetch state» использовать `git fetch --depth=1 origin refs/heads/state:refs/remotes/origin/state` (явный refspec создаёт remote-tracking ref), либо `git fetch origin +refs/heads/state:refs/remotes/origin/state`. Аналогично в Persist (`if git fetch --quiet origin refs/heads/state:refs/remotes/origin/state; then …`). Альтернатива: `actions/checkout@v4 with: fetch-depth: 0` (тяжело для public-cron */5). Оба варианта легко проверить локальной симуляцией (моя `work5` воспроизводит баг, `wf2/work` с wildcard-refspec — отсутствие бага).
 
-- Направление верное ( одновременное использование одной StringSession не поддерживается и рискованно), но «отклонит/разлогинит» — не подтверждённая первичным источником формулировка (нет ссылки на docs Telegram/Telethon). Классифицирую как неподтверждённую гипотезу; безопасная формулировка: «одновременная работа двух процессов с одной сессией не поддерживается; возможны рассинхрон update state и разрыв авторизации».
+### 2.2. КРИТИЧНО. Приёмочная команда плана не проходит: `TELEGRAM_SESSION=x python -c "import main"` → ValueError.
 
-### У5. Edge-case полуночи в окне `--due`
+Место: `GitHubActions.md:567` («Обязательные проверки») и `run_once.py:140–148`; реализация `main.py:703–711`.
 
-- Фаза 3.2 (133–138) считает «ближайшее прошедшее наступление в пределах суток» и ключ с МСК-датой; для слотов около 00:00 МСК окно `[now−15min, now]` пересекает полночь и дата «ближайшего наступления» — предыдущие сутки. Алгоритм в таком виде может пропустить/некорректно пометить задание (гипотеза — нет кода `run_once.py` для проверки, текущие слоты 06:00–07:15 МСК edge не задевают). Стоит зафиксировать поведение в плане (тест на полночь в Фазу 7).
+Суть: `build_session()` вызывает `StringSession('x')`, Telethon кидает `ValueError: Not a valid string`. Прогон (venv): `TELEGRAM_SESSION=x TELEGRAM_API_ID=1 TELEGRAM_API_HASH=h python -c "import main"` → падает именно на импорте. То есть критерий приёмки «`import main` безопасен при `TELEGRAM_SESSION=x`» **не выполнен** — план сам задаёт недопустимое значение («x» не валидная StringSession; у Telethon кодирование требует корректной структуры, пустая `StringSession().save()` == `''`).
 
-### У6. Мелочь: env `TELEGRAM_PHONE` при валидном `TELEGRAM_SESSION`
+Замечание двустороннее:
+- Если цель теста — «импорт не падает на Actions», нужен валидный токен. `run_once.py` это учитывает (`preflight_import_env` конструирует StringSession до импорта и exit(2) при битом токене; подтверждено: `TELEGRAM_SESSION=garbage run_once.py --list` → понятный exit=2, без интерактива). Для голого `import main` без обходного пути — тест плана невалиден.
+- На VPS-маршруте (session=='session_name') проблемы нет —Telethon сам создаёт файловую сессию.
 
-- `client.start(phone=PHONE)` (140) при авторизованной StringSession обычно не запрашивает телефон/код, но если секрет не задан, `PHONE=None` (main.py:186) может привести к зависанию/EOFError на неинтерактивном раннере до понятной ошибки (частично покрыто тестом 7.7). Рекомендовать явую pré-check: пустой TELEGRAM_SESSION → exit с сообщением, не доходя до `start()`.
+Рекомендация: в плане заменить фиктивное `TELEGRAM_SESSION=x` на «валидный StringSession из `gen_session.py`» или на `TELEGRAM_SESSION=`(пусто) с оговоркой, что пусто ⇒ VPS-маршрут (см. 2.3), либо тестировать безопасность импорта через `run_once.py --list` (что и делается в README). Иначе приёмка формально провалится.
+
+### 2.3. ВАЖНО. Пустой секрет TELEGRAM_SESSION переводит раннер на VPS-маршрут: создаётся private.txt из шаблона и (в ранней фазе) возможна интерактивная авторизация.
+
+Место: `main.py:158–160,220–221` (условие `if not os.getenv('TELEGRAM_SESSION')`), `run_once.py:140–149,152–164`.
+
+Суть: в Actions при незаполненном/отсутствующем секрете `${{ secrets.TELEGRAM_SESSION }}` раскрывается в **пустую строку**, `os.getenv` даёт `''` → falsy. Тогда на импорте отрабатывает `ensure_private_file()` (симуляция: `TELEGRAM_SESSION= run_once.py --due` вывело «✅ Создан файл private.txt из шаблона») и импорт-тайм `_config_errors_or_exit()`; дальше `preflight_import_env` пропускает пустую сессию (только непустую валидирует), `preflight_actions_env` ловит `TELEGRAM_SESSION` и exit(2) — хорошо, но **exit происходит после создания private.txt в рабочем дереве**. В плане 1.1 «при TELEGRAM_SESSION в env ensure_private_file() можно пропустить» реализовано как проверка `if not os.getenv(...)`, что корректно для непустого значения и некорректно для пустого.
+
+Это не ломает dedup-логику, но: (а) на раннере появляется мусор-файл private.txt (в git не попадёт: `.gitignore:211` его игнорит — проверено diff), (б) в гипотетическом прогоне с заполненными GOOGLE/TELEGRAM секретами, но пустой сессией, `telegram_client.start()` может уйти в интерактив (план Фазы 3 шаг 6 «без интерактива» нарушен бы, но `preflight_actions_env` стоит до `start()` в обоих путях — run_once.py:308,317–319 — так что интерактив блокируется; зафиксировано).
+
+Рекомендация: в preflight различать «пустой секрет» и «не задан» (`if 'TELEGRAM_SESSION' not in os.environ` — в Actions env всегда определён, просто пуст) и выдавать `❌ TELEGRAM_SESSION пуст (секрет не заполнен)` до импорта main; в `preflight_import_env` проверять непустоту сессии так же строго, как и API_ID.
+
+### 2.4. ВАЖНО. `run_analysis` возвращает False для штатных «нет сообщений»/«всё отфильтровано»/«ошибка Gemini» — такие слоты никогда не помечаются выполненными → бесконечные повторы каждые 5 мин до конца окна LAG_MAX.
+
+Место: `main.py:2894,2954,2969` (early `return False`), `run_once.py:236–238` (не пишет state при not True), plan `GitHubActions.md:198–199` (код возврата «не 0 — если хотя бы одна упала»).
+
+Суть: контракт К2 в плане (4.4) трактует True как «после успешной публикации», False — «любое перехваченное исключение» («Сигнал достоверен: … False — при любом перехваченном исключении», строки 282–283). Реализация возвращает False **не только** при исключениях: при отсутствии сообщений за период, при полной фильтрации и при получении `❌`-summary из `create_summary` (`main.py:2964–2969`) — это штатные ситуации, а не crash. В Actions: чат без сообщений ⇒ задача «проваливается» ⇒ красный run + повтор на каждом cron-тике в течение окна, затем, когда окно пройдёт (15 мин), слот считается пропущенным до завтра.
+
+Это противоречит заявлению в плане (False == только перехваченное исключение). Строка плана «сейчас их [ранних return] нет» (`GitHubActions.md:274`) фактически опровергнута диффом: `git show HEAD:main.py` содержит три `return` (без значения) на строках 2861, 2921, 2936 старого файла, и они преобразованы в `return False` — т.е. ранние выходы были и до рефакторинга.
+
+Рекомендация: либо различать статусы (например, возвращать `'ok'/'empty'/'error'` или пару `(published: bool, hard_error: bool)`) и писать state при `empty` (слот «отработал», повторять нечего — код возврата run остаётся 0), либо явно документировать в плане, что пустые периоды не дедупицируются и требуют ручной реакции. Текущее поведение — вероятный источник ежедневного шума и красных RUN для чатов с редкими сообщениями. (Неподтверждённая часть: частота пустых периодов в реальных чатах — гипотеза; сам код-путь подтверждён.)
+
+### 2.5. УЛУЧШЕНИЕ. `prune_state` несовместим с МСК-датами високосного/конца месяца? Нет; но сравнение строк ISO OK. Реальная проблема: prune удаляет «старые» дедуп-записи ровно на пороге 3 суток — безвредно, но тест `prune` проверяет only 4-дневную метку. Место: `run_once.py:79–85`, `test_run_once.py:87–93`. Существенного багa нет — фиксирую как мелкое улучшение покрытия.
+
+### 2.6. УЛУЧШЕНИЕ. Формат ключа в плане vs реализация.
+
+Место: `GitHubActions.md:240` (`period{suffixes}`) vs `run_once.py:88–95` (суффиксы `+`/`-` конкатенируются в порядке `+` затем `-`). `SCHEDULE.txt` и `load_schedule._parse_suffixes` допускают `1d+-`. Ключ `chat|HH:MM|1d+-` уникален и стабилен — противоречия нет; уточнить в плане порядок суффиксов не требуется.
+
+### 2.7. УЛУЧШЕНИЕ. Python 3.11 vs локальная проверка 3.14.
+
+Место: `.github/workflows/summarize.yml:29` (`python-version: '3.11'`). Все прогоны аудита сделаны на python 3.14.4 (единственная версия в venv, `pip -r requirements.txt` встал успешно; `py_compile` OK). Риск расхождения минимален (код не использует 3.12+ синтаксис), но формально приёмка на 3.11 не выполнена. Не подтверждено как баг — вопрос/замечание.
+
+### 2.8. ВОПРОС/УЛУЧШЕНИЕ. `--chat-id` отрицательные значения и argparse.
+
+Место: `run_once.py:40` (`type=int`). CLI-пример плана `--chat-id -100...`: argparse трактует `-100…` как параметр только если он выглядит как отрицательное число (после Python 3.12 с `allow_abbrev` поведение стабильно для int-типов). Проверено локально: `parse_args(['--chat-id','-1001369370434','--period','1d'])` → `chat_id=-1001369370434`. OK, но в workflow ручной прогон идёт через env `CHAT_ID` (summarize.yml:62–63) — корректно.
+
+### 2.9. ФАКТ/ПОДТВЕРЖДЕНИЕ ключевых утверждений плана (проверено, без замечаний):
+
+- Импорт-безопасность VPS-маршрута: без TELEGRAM_SESSION валидация на импорте сохранена (fail-fast как раньше) — симуляция с плейсхолдерами из репозитория даёт `exit(1)`+инструкцию, дифф main.py:156–221 это реализует; приActions-маршруте (непустой TELEGRAM_SESSION) импорт не валидирует (main.py:220–221), и run_once.py дергает `load_env_config()` перед задачами (run_once.py:311–315). Утверждение handoff «поведение VPS не изменилось» — подтверждено структурно (тот же текст ошибок/exit 1; `exit(1)`→`SystemExit(1)` эквивалентны на уровне модуля).
+- `override=False` — main.py:163, run_once.py:26; секреты Actions не затираются.
+- К2-возвраты: `return False/False/False/True/False` и `return await run_analysis(...)` присутствуют (main.py:2894,2954,2969,3384,3397,3651,3663); VPS-вызовы 3543 и 3680(add_job) возвратами не пользуются — подтверждено grep (в старом файле это были строки 3508/3628 из плана).
+- Дедуп-окно и полночь: `test_run_once.py` 8/8 PASS (вывод в окружении с заглушенными ключами, `ALL TESTS PASSED`), включая date_key='2026-01-01' для слота 23:58 при now=00:03.
+- Workflow-скелет синтаксически валиден (yaml.safe_load OK; `on:` → `workflow_dispatch.inputs` корректно вложен).
+- `persist with if: ${{ !cancelled() }}` — добавлено сверх плана (план: push один раз в конце; реализация — даже при провале шага задач, что лучше соответствует §9 Фазы 3).
+- `.gitignore` содержит `state.json` (строка 214+), `*.session`, `private.txt` — как в плане (209–211).
+- README добавлен раздел «Запуск на GitHub Actions» + предупреждение о единственной сессии (diff +78 строк) — Фаза 6 выполнена.
+- requirements: `apscheduler>=3.10.0` (К1) — Файлы/Порядок п.1 выполнен.
+- Утверждение 5.3 проверено: `gh repo view Hohlas/ChatSum --json visibility,isPrivate` → `{"isPrivate":false,"visibility":"PUBLIC"}`; `gh auth status` → protocol ssh, scopes без `workflow`; remote `git@github.com:Hohlas/ChatSum.git` — всё совпадает с планом.
+- Утверждение «не передавать inputs через интерполяцию в shell» выполнено (env CHAT_ID/PERIOD, кавычки в строках).
+- `gen_session.py` соответствует 2.2: `TelegramClient(StringSession(), …).start(phone=PHONE)` + печать `session.save()`; сессия в repo не коммитится (проверено `git ls-files`, пустой приватный файл не в индексе).
+- Ручной режим: `_parse_suffixes` + валидация `\d+[hd]`, exit 2 при неверном периоде (run_once.py:252–258) — соответствует 3.1.
+- Коды возврата: 0 — успех/нет задач/все дедуплены; 1 — падение connect или ≥1 упавшей задачи; 2 — preflight/config — соответствует §11 Фазы 3 и handoff-списку.
+
+### 2.10. УЛУЧШЕНИЕ/ВОПРОС. `workflow_dispatch` с заполненным `chat_id` пишет результат, но **не трогает state** (run_manual не читает state) — соответствует назначению «ручной прогон» (3.1), но plan §Порядок не оговаривает; замечания нет.
+
+### 2.11. Улучшение (гигиена). `GOOGLE_API_KEY2/3` переданы в env workflow (summarize.yml:49–50), хотя таблица 5.1 требует `GOOGLE_API_KEY1..N` опционально; при отсутствии секретов → пустые env, `validate_config` фильтрует пустые (`value.strip()` в main.py:72) — безопасно. Уточнить в плане список секретов не нужно.
 
 ---
 
-## Сверка ссылок плана на код (выборочно, все проверены grep/чтением)
+## 3. Команды верификации (воспроизводимость)
 
-| Утверждение плана | Факт | Вердикт |
-|---|---|---|
-| 47: `ensure_private_file()` — строка 156 | `main.py:156` вызов | ✓ |
-| 48: `load_dotenv('private.txt')` — 159 | `main.py:159` | ✓ |
-| 49: validate+print+exit — 162–181 | `main.py:162-181` (exit на 181) | ✓ |
-| 50: `AsyncIOScheduler()` — 3606+ | `main.py:3606`; handlers `main.py:3655-4258` | ✓ (регистр. обработчиков не на 3606, но «+» ок) |
-| 51: `if __name__` — 4409 | `main.py:4409` | ✓ |
-| 67: `main()` — 4302 | `main.py:4302` | ✓ |
-| 69: env-чтение 184–204 | `main.py:184-204` | ✓ |
-| 75: `load_model_config` — 658 | `main.py:658` (функция с 570; читает существующий/отсутствующий файл, `main.py:584`) | ✓ |
-| 77, 91: `TelegramClient(...)` — 663 | `main.py:663`, имя `'session_name'` | ✓ (session-файл `session_name.session`, README:546) |
-| 133: `MSK=UTC+3` main.py:28 | `main.py:28` | ✓ (UTC+3 без DST — верно для РФ) |
-| 136: `load_schedule` — 3546 | `main.py:3546`, формат `chat_id|HH:MM|период+/-` подтверждён (`SCHEDULE.txt`) | ✓ |
-| 143: сигнатура run_analysis — 2821 | `main.py:2821-2823` (`use_ai`, `post_to_source`, `post_as_telegram`, `scheduled`) | ✓ (но см. К2) |
-| 150: scheduled_analysis_job — 3609 | `main.py:3609` | ✓ |
-| 117: .gitignore 209–211 | см. У1 | ≈ |
-| 211: cron `*/5` «UTC» | GitHub schedule интерпретирует cron в UTC | ✓ (docs) |
-| 329–330: 60 дней без активности в public | docs: events-that-trigger-workflows, `schedule` NOTE | ✓ |
-| 284: TELEGRAM_SESSION «обязателен» | по логике 2.1 — да для Actions | ✓ |
-| 235: python 3.11 | `asyncio.Lock()` на импорте (`main.py:25`) в 3.10+ легален | ✓ |
+1. `python -m venv /tmp/opencode/cs-venv && /tmp/opencode/cs-venv/bin/pip install -r requirements.txt` — успех (APScheduler 3.11.3).
+2. `PYTHONPATH=. TELEGRAM_API_ID=12345 TELEGRAM_API_HASH=x TELEGRAM_PHONE=+1 GOOGLE_API_KEY=x ./cs-venv/bin/python test_run_once.py` → ALL TESTS PASSED.
+3. `TELEGRAM_SESSION=x TELEGRAM_API_ID=1 TELEGRAM_API_HASH=h ./cs-venv/bin/python -c "import main"` → `ValueError: Not a valid string` (замечание 2.2).
+4. `TELEGRAM_SESSION=garbage … run_once.py --list` → понятный exit 2 (защита run_once подтверждена).
+5. `TELEGRAM_SESSION= … run_once.py --due` (isolated dir) → создан private.txt из шаблона, затем exit 2 от preflight (замечание 2.3).
+6. Симуляция single-branch shallow clone + `git fetch origin state` → `origin/state` НЕ появляется; `git checkout -B state origin/state` fatal; push первой orphan-ветки OK (замечание 2.1). Симуляция wildcard-refspec (`+refs/heads/*:refs/remotes/origin/*`) → `origin/state` создаётся, цикл Fetch→Persist→RUN2 работает (рецепт исправления валидирован).
+7. `python -m py_compile main.py run_once.py gen_session.py test_run_once.py` — OK.
+8. YAML-parsing summarize.yml — OK; `gh repo view`/`gh auth status` — совпадают с §5.3.
 
-## Общий вердикт
+---
 
-- Локальная корректность: большинство номерных ссылок точны; найдены 2 критичных дефекта реализуемости (К1, К2) и внутренние противоречия (В4, В5).
-- Целостность: «один код — две точки входа» достижимо, но требует доп. рефакторинга (К1 через requirements или изоляцию импорта; В1 — перенос печати/exit; В2 — env-конфиг; В4 — унификация точки вызова).
-- Обоснованность подхода: вариант B (cron-опрос + дедуп) корректен по смыслу (задержки schedule подтверждены docs); риски в целом названы верно; расчёт лимитов верен; не хватает анализа «красного» кода возврата (К2) и видимости репо (У3).
-- Статус по образцу methodology-стиля: `FAIL` до исправления К1–К2 (блокирующие), `UNKNOWN` по У3/У4/У5 (нет первичных данных).
+## 4. Резюме вердиктов
 
-## Порядок работ (предложение к плану)
-
-Вставить перед текущим шагом 1: «0. Исправить requirements/импорты (К1); решить договор об error-propagation (К2)». Шаги 1–8 плана оставить, дополнив 1, 3.2 (шаг 10), 5 (env + persist) по замечаниям В1–В5.
+- Реализация в целом faithful к плану, но **не готова к первому же второму cron-запуску**: workflow-дедуп неработоспособен из-за refspec-ловушки checkout@v4 (2.1) — критично.
+- Формальная приёмка плана невыполнима из-за некорректного значения `TELEGRAM_SESSION=x` (2.2) — критично для checklist (исправить тест, не код).
+- Семантика bool-возврата шире, чем заявлено в плане, что даёт шум/повторы для пустых периодов (2.4) — важно; требует либо правки контракта, либо дедуп-записи по «empty».
+- Пустой секрет TELEGRAM_SESSION = VPS-ветка (2.3) — важно (мусор-файл, риск интерактива при обходе preflight).
+- Остальное — улучшения/вопросы; VPS-поведение, тесты чистой логики, README, requirements, ключи дедупа, exit-коды, gitignore — подтверждены.
