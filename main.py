@@ -153,10 +153,22 @@ def mask_api_key(api_key):
     return f"{api_key[:8]}...{api_key[-6:]}"
 
 
+def _is_actions_mode():
+    """True, если сессия приходит из окружения (GitHub Actions).
+
+    Важно отличать «TELEGRAM_SESSION не задан» (VPS → файловая сессия) от
+    «задан пустым» (незаполненный секрет Actions → ошибка конфигурации,
+    которую ловит preflight в run_once.py). os.getenv() для этого не годится:
+    пустой секрет раскрывается в '', и он тоже falsy. Поэтому проверяем
+    наличие переменной в окружении.
+    """
+    return 'TELEGRAM_SESSION' in os.environ
+
+
 # Создаем private.txt из шаблона, если его нет (только для VPS; на Actions
-# при заданном TELEGRAM_SESSION private.txt не нужен и не создаётся).
+# private.txt не нужен и не создаётся — сессия приходит из секрета).
 file_just_created = False
-if not os.getenv('TELEGRAM_SESSION'):
+if not _is_actions_mode():
     file_just_created = ensure_private_file()
 
 # Загрузка переменных окружения (env из секретов Actions не затирается)
@@ -215,9 +227,9 @@ def _check_google_key_chars():
 
 
 # VPS-поведение как раньше: валидация на импорте (fail-fast при невалидной
-# конфигурации, до int(API_ID) ниже). На Actions (TELEGRAM_SESSION задан)
-# валидацию выполняет run_once.py — здесь она пропускается.
-if not os.getenv('TELEGRAM_SESSION'):
+# конфигурации, до int(API_ID) ниже). В Actions (TELEGRAM_SESSION присутствует
+# в окружении) валидацию выполняет run_once.py — здесь она пропускается.
+if not _is_actions_mode():
     _config_errors_or_exit()
 
 # Конфигурация Telegram
@@ -701,10 +713,14 @@ if GEMINI_DEFAULT_MODEL:
 
 # Инициализация клиентов
 def build_session():
-    """Возвращает сессию Telethon: StringSession (Actions) или файловую (VPS)."""
-    session_str = os.getenv('TELEGRAM_SESSION', '').strip()
-    if session_str:
-        return StringSession(session_str)
+    """Возвращает сессию Telethon: StringSession (Actions) или файловую (VPS).
+
+    Маршрут определяется наличием TELEGRAM_SESSION в окружении, а не его
+    непустотой: незаполненный секрет Actions не должен молча уводить на
+    файловую сессию (это ловит preflight в run_once.py как ошибку).
+    """
+    if _is_actions_mode():
+        return StringSession(os.environ['TELEGRAM_SESSION'].strip())
     return 'session_name'
 
 

@@ -296,10 +296,10 @@ def run(argv):
     if not preflight_import_env():
         return 2
 
-    # main.py на верхнем уровне создаёт TelegramClient, которому нужен
-    # текущий event loop (Telethon читает asyncio.get_event_loop()).
-    # На Python 3.10+ цикл в main-потоке не создаётся автоматически —
-    # создаём явно до импорта main.
+    # main.py на уровне модуля создаёт TelegramClient. Telethon 1.34 при
+    # конструировании обращается к текущему event loop (свойство loop →
+    # get_running_loop()), поэтому на Python 3.11+ без запущенного цикла
+    # импорт падает с RuntimeError. Создаём цикл явно до импорта main.
     try:
         asyncio.get_running_loop()
     except RuntimeError:

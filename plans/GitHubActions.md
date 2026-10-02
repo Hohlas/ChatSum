@@ -59,7 +59,12 @@ GitHub Actions (cron */5, workflow_dispatch)
 
 ```python
 # --- на уровне модуля (импорт), ДО чтения env на строках 184-209 ---
-if not os.getenv('TELEGRAM_SESSION'):       # на Actions private.txt не нужен
+def _is_actions_mode():
+    # 'не задан' (VPS) != 'задан пустым' (незаполненный секрет Actions):
+    # os.getenv() для пустого секрета тоже falsy, поэтому проверяем наличие ключа.
+    return 'TELEGRAM_SESSION' in os.environ
+
+if not _is_actions_mode():
     file_just_created = ensure_private_file()
 load_dotenv('private.txt', override=False)  # env из секретов Actions не затирается
 
@@ -135,16 +140,18 @@ def load_env_config():
 from telethon.sessions import StringSession
 
 def build_session():
-    session_str = os.getenv('TELEGRAM_SESSION', '').strip()
-    if session_str:
-        return StringSession(session_str)      # GitHub Actions
-    return 'session_name'                       # VPS, файловая сессия
+    # Маршрут — по наличию TELEGRAM_SESSION в окружении, а не по непустоте:
+    # незаполненный секрет Actions не должен молча уводить на файловую сессию.
+    if _is_actions_mode():
+        return StringSession(os.environ['TELEGRAM_SESSION'].strip())  # GitHub Actions
+    return 'session_name'                                             # VPS, файловая сессия
 
 telegram_client = TelegramClient(build_session(), API_ID, API_HASH)
 ```
 
-- `TELEGRAM_SESSION` задан → **Actions**, состояние в секрете, ФС не нужна.
+- `TELEGRAM_SESSION` присутствует в окружении → **Actions**, состояние в секрете, ФС не нужна.
 - `TELEGRAM_SESSION` не задан → **VPS**, поведение как сейчас, `session_name.session`.
+- `_is_actions_mode()` определена в 1.1 (различает «не задан» и «задан пустым»).
 - Импорт `StringSession` добавить в блок импортов.
 
 > Важно: **нельзя** одновременно запускать VPS- и Actions-версию с одной сессией —
@@ -376,7 +383,11 @@ jobs:
           cp "$RUNNER_TEMP/state.json" state.json
           git add -f state.json
           git commit -m "state: $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
-          git push origin state
+          git push origin state || {
+            echo "non-fast-forward (гонка) — rebase и повторный push"
+            git pull --rebase origin state || true
+            git push origin state || true
+          }
 ```
 
 > **Почему state.json вне дерева:** если писать его в корень репозитория, то
