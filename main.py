@@ -3416,36 +3416,167 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
         return False
 
 
+def parse_chat_command_args(text):
+    """Чистый парсер команд sum/copy (общий для VPS-хендлеров и inbox-опроса run_once.py).
+
+    Принимает текст с ведущим '/' или без ('/sum 100', 'sum100-800', 'copy1d-',
+    голая 'sum'/'copy' = дефолт 24h). Возвращает dict с ключами use_ai,
+    hours/days/limit/range_start/range_end/time_range_start/time_range_end,
+    post_to_source/post_as_telegram — либо None, если это не команда sum/copy.
+    """
+    parts = text.split()
+    if not parts:
+        return None
+
+    # Параметры прикреплены к команде без пробела (например /sum2d+, sum100-800).
+    # Остаток обязан начинаться с цифры/+/- — иначе это обычное слово
+    # ('summary', 'summer', 'copycat' — не команды).
+    if len(parts) == 1:
+        m = re.match(r'^(/?(?:sum|copy))([\d+\-].*)$', parts[0], re.IGNORECASE)
+        if m:
+            parts = [m.group(1), m.group(2)]
+
+    head = parts[0].lower()
+    if head.startswith('/'):
+        head = head[1:]
+    if head not in ('sum', 'copy'):
+        return None
+    use_ai = (head == 'sum')
+
+    post_to_source = False
+    post_as_telegram = False
+    filtered_params = []
+    for p in parts[1:]:
+        clean, plus, minus = _parse_suffixes(p)
+        post_to_source = post_to_source or plus
+        post_as_telegram = post_as_telegram or minus
+        if clean:
+            filtered_params.append(clean)
+    params = filtered_params
+
+    hours = None
+    days = None
+    limit = None
+    range_start = None
+    range_end = None
+    time_range_start = None
+    time_range_end = None
+
+    # Форматы: 3h, 2d, 100, 1d 6h, 600-800, 2d-3d, 3-5d, 2-4h
+    for param in params:
+        param_clean = param.lower().strip()
+
+        time_range_match = re.fullmatch(r'(\d+)([hd])\s*-\s*(\d+)([hd])', param_clean)
+        time_range_match2 = re.fullmatch(r'(\d+)\s*-\s*(\d+)([hd])', param_clean)
+        range_match = re.fullmatch(r'(\d+)\s*-\s*(\d+)', param_clean)
+        if time_range_match:
+            start_val = int(time_range_match.group(1))
+            start_unit = time_range_match.group(2)
+            end_val = int(time_range_match.group(3))
+            end_unit = time_range_match.group(4)
+
+            start_delta = timedelta(days=start_val) if start_unit == 'd' else timedelta(hours=start_val)
+            end_delta = timedelta(days=end_val) if end_unit == 'd' else timedelta(hours=end_val)
+
+            if start_delta > timedelta(0) and end_delta > start_delta:
+                time_range_start = start_delta
+                time_range_end = end_delta
+                range_start = None
+                range_end = None
+                limit = None
+                hours = None
+                days = None
+        elif time_range_match2:
+            start_val = int(time_range_match2.group(1))
+            end_val = int(time_range_match2.group(2))
+            unit = time_range_match2.group(3)
+
+            start_delta = timedelta(days=start_val) if unit == 'd' else timedelta(hours=start_val)
+            end_delta = timedelta(days=end_val) if unit == 'd' else timedelta(hours=end_val)
+
+            if start_delta > timedelta(0) and end_delta > start_delta:
+                time_range_start = start_delta
+                time_range_end = end_delta
+                range_start = None
+                range_end = None
+                limit = None
+                hours = None
+                days = None
+        elif range_match:
+            start_val = int(range_match.group(1))
+            end_val = int(range_match.group(2))
+            if start_val > 0 and end_val >= start_val:
+                range_start = start_val
+                range_end = end_val
+                time_range_start = None
+                time_range_end = None
+                limit = None
+                hours = None
+                days = None
+        elif param_clean.endswith('h') and range_start is None and time_range_start is None:
+            # Параметр часов
+            hours_val = int(param_clean.replace('h', ''))
+            if hours_val > 0:
+                hours = hours_val
+        elif param_clean.endswith('d') and range_start is None and time_range_start is None:
+            # Параметр дней
+            days_val = int(param_clean.replace('d', ''))
+            if days_val > 0:
+                days = days_val
+        elif param_clean.isdigit() and range_start is None and time_range_start is None:
+            # Это количество сообщений
+            limit = int(param_clean)
+
+    # Если ничего не указано, по умолчанию 24 часа
+    if hours is None and days is None and limit is None and range_start is None and time_range_start is None:
+        hours = 24
+
+    return {
+        'use_ai': use_ai,
+        'hours': hours,
+        'days': days,
+        'limit': limit,
+        'range_start': range_start,
+        'range_end': range_end,
+        'time_range_start': time_range_start,
+        'time_range_end': time_range_end,
+        'post_to_source': post_to_source,
+        'post_as_telegram': post_as_telegram,
+    }
+
+
 async def process_chat_command(event, use_ai=True):
     """
     Универсальная функция обработки команд /sum и /copy
-    
+
     Args:
         event: Событие Telegram
         use_ai: True для /sum (с AI анализом), False для /copy (только экспорт)
     """
     try:
-        # Парсим параметры команды
+        # Парсим параметры команды (общий парсер с inbox-режимом run_once.py)
         message_text = event.raw_text
-        parts = message_text.split()
+        parsed = parse_chat_command_args(message_text)
+        if parsed is None:
+            return
+        # use_ai определяется маршрутизатором событий; парсер — authoritative
+        # для текста, расхождение возможно лишь на вырожденных входах.
+        post_to_source = parsed['post_to_source']
+        post_as_telegram = parsed['post_as_telegram']
+        hours = parsed['hours']
+        days = parsed['days']
+        limit = parsed['limit']
+        range_start = parsed['range_start']
+        range_end = parsed['range_end']
+        time_range_start = parsed['time_range_start']
+        time_range_end = parsed['time_range_end']
 
-        # Если параметры прикреплены к команде без пробела (например /sum2d+)
+        # parts нужен только для строки логирования ниже
+        parts = message_text.split()
         if len(parts) == 1:
             m = re.match(r'^(/(?:sum|copy))(.+)$', parts[0], re.IGNORECASE)
             if m:
                 parts = [m.group(1), m.group(2)]
-
-        post_to_source = False
-        post_as_telegram = False
-        filtered_params = []
-        for p in parts[1:]:
-            clean, plus, minus = _parse_suffixes(p)
-            post_to_source = post_to_source or plus
-            post_as_telegram = post_as_telegram or minus
-            if clean:
-                filtered_params.append(clean)
-        if filtered_params != parts[1:]:
-            parts = [parts[0]] + filtered_params
 
         # Получаем чат один раз и используем для логирования и далее
         chat = await event.get_chat()
@@ -3455,87 +3586,7 @@ async def process_chat_command(event, use_ai=True):
         command_name = "/sum" if use_ai else "/copy"
         params = " ".join(parts[1:]) if len(parts) > 1 else "(по умолчанию 24h)"
         print(f"\n📥 Команда: {command_name} {params} | Чат: {chat_name_log}")
-        
-        hours = None
-        days = None
-        limit = None
-        range_start = None
-        range_end = None
-        time_range_start = None
-        time_range_end = None
-        
-        # Обрабатываем параметры
-        # Поддерживаем форматы: /sum 3h, /sum 2d, /sum 100, /sum 1d 6h, /sum 600-800, /sum 2d-3d, /sum 3-5d, /sum 2-4h
-        if len(parts) > 1:
-            # Обрабатываем все параметры (может быть несколько, напр. "1d 6h")
-            for param in parts[1:]:
-                param_clean = param.lower().strip()
-                
-                time_range_match = re.fullmatch(r'(\d+)([hd])\s*-\s*(\d+)([hd])', param_clean)
-                time_range_match2 = re.fullmatch(r'(\d+)\s*-\s*(\d+)([hd])', param_clean)
-                range_match = re.fullmatch(r'(\d+)\s*-\s*(\d+)', param_clean)
-                if time_range_match:
-                    start_val = int(time_range_match.group(1))
-                    start_unit = time_range_match.group(2)
-                    end_val = int(time_range_match.group(3))
-                    end_unit = time_range_match.group(4)
 
-                    start_delta = timedelta(days=start_val) if start_unit == 'd' else timedelta(hours=start_val)
-                    end_delta = timedelta(days=end_val) if end_unit == 'd' else timedelta(hours=end_val)
-
-                    if start_delta > timedelta(0) and end_delta > start_delta:
-                        time_range_start = start_delta
-                        time_range_end = end_delta
-                        range_start = None
-                        range_end = None
-                        limit = None
-                        hours = None
-                        days = None
-                elif time_range_match2:
-                    start_val = int(time_range_match2.group(1))
-                    end_val = int(time_range_match2.group(2))
-                    unit = time_range_match2.group(3)
-
-                    start_delta = timedelta(days=start_val) if unit == 'd' else timedelta(hours=start_val)
-                    end_delta = timedelta(days=end_val) if unit == 'd' else timedelta(hours=end_val)
-
-                    if start_delta > timedelta(0) and end_delta > start_delta:
-                        time_range_start = start_delta
-                        time_range_end = end_delta
-                        range_start = None
-                        range_end = None
-                        limit = None
-                        hours = None
-                        days = None
-                elif range_match:
-                    start_val = int(range_match.group(1))
-                    end_val = int(range_match.group(2))
-                    if start_val > 0 and end_val >= start_val:
-                        range_start = start_val
-                        range_end = end_val
-                        time_range_start = None
-                        time_range_end = None
-                        limit = None
-                        hours = None
-                        days = None
-                elif param_clean.endswith('h') and range_start is None and time_range_start is None:
-                    # Параметр часов
-                    hours_val = int(param_clean.replace('h', ''))
-                    if hours_val > 0:
-                        hours = hours_val
-                elif param_clean.endswith('d') and range_start is None and time_range_start is None:
-                    # Параметр дней
-                    days_val = int(param_clean.replace('d', ''))
-                    if days_val > 0:
-                        days = days_val
-                elif param_clean.isdigit() and range_start is None and time_range_start is None:
-                    # Это количество сообщений
-                    limit = int(param_clean)
-        
-        # Если ничего не указано, по умолчанию 24 часа
-        if hours is None and days is None and limit is None and range_start is None and time_range_start is None:
-            hours = 24
-        
         # Удаляем команду из чата (для приватности)
         await event.delete()
         

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Однократный запуск срочных заданий — точка входа для GitHub Actions (вариант B).
 
-Запускается по cron каждого 5 минут, определяет, какие задания из SCHEDULE.txt
+Запускается по cron каждые 10 минут, определяет, какие задания из SCHEDULE.txt
 попали в окно [now - LAG_MAX, now] (время МСК), выполняет их через общее ядро
 main.scheduled_analysis_job и дедуплицирует через state.json (ветка `state`).
+В режиме --watch дополнительно опрашивает inbox (тема General канала
+результатов): форвард + команда sum/copy → выполнение через main.run_analysis.
 
 Режимы:
   python run_once.py --due                              # всё, что в окне
+  python run_once.py --watch [--watch-seconds 480] [--poll-interval 60]
   python run_once.py --chat-id -100... --period 1d [--post-source] [--post-tg]
   python run_once.py --list                             # напечатать расписание
 """
@@ -17,6 +20,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
@@ -36,16 +40,22 @@ def parse_args(argv):
     g = p.add_mutually_exclusive_group()
     g.add_argument('--due', action='store_true',
                    help='Выполнить все задания из SCHEDULE.txt, попавшие в текущее окно')
+    g.add_argument('--watch', action='store_true',
+                   help='Цикл ~watch-seconds: due-задачи + опрос inbox (форвард + sum/copy)')
     g.add_argument('--list', action='store_true', help='Напечатать расписание и выйти')
     g.add_argument('--chat-id', type=int, help='Chat ID для ручного прогона')
+    p.add_argument('--watch-seconds', type=int, default=480,
+                   help='Длительность цикла --watch, секунд (по умолчанию 480)')
+    p.add_argument('--poll-interval', type=int, default=60,
+                   help='Пауза между итерациями --watch, секунд (по умолчанию 60)')
     p.add_argument('--period', default='1d', help='Период анализа (1d, 12h)')
     p.add_argument('--post-source', action='store_true', help='Публиковать результат в исходном чате')
     p.add_argument('--post-tg', action='store_true', help='Отправлять как сообщение Telegram вместо Telegraph')
     p.add_argument('--lag-max', type=int, default=LAG_MAX_DEFAULT,
                    help=f'Допуск опозданий окна, минут (по умолчанию {LAG_MAX_DEFAULT})')
     args = p.parse_args(argv)
-    if not (args.due or args.list or args.chat_id is not None):
-        p.error('Укажите --due, --list или --chat-id')
+    if not (args.due or args.list or args.watch or args.chat_id is not None):
+        p.error('Укажите --due, --watch, --list или --chat-id')
     return args
 
 
@@ -189,7 +199,12 @@ def cmd_list(main):
     return 0
 
 
-async def run_due(main, args):
+async def run_due_once(main, args, state, path):
+    """Одна итерация due-задач: compute → dedup → выполнение → save.
+
+    Соединение уже установлено вызывателем (run_due / run_watch).
+    Возвращает число невыполненных задач (0 = всё хорошо).
+    """
     now_msk = datetime.now(MSK)
     now_naive = now_msk.replace(second=0, microsecond=0)
     entries = main.load_schedule(main.SCHEDULE_FILE)
@@ -198,8 +213,6 @@ async def run_due(main, args):
         print(f"[{now_msk.strftime('%Y-%m-%d %H:%M:%S')} МСК] Нет заданий в окне (lag_max={args.lag_max} мин).")
         return 0
 
-    path = state_path()
-    state = load_state(path)
     completed = state['completed']
 
     pending = []
@@ -214,6 +227,35 @@ async def run_due(main, args):
         print("Все должные задания уже выполнены (dedup).")
         return 0
 
+    failed = 0
+    for entry, occurrence, key, date_key in pending:
+        print(f"▶️  Выполняю: {key} (слот {occurrence} МСК)")
+        try:
+            ok = await main.scheduled_analysis_job(
+                entry['chat_id'],
+                entry['period'],
+                entry['post_to_source'],
+                entry.get('post_as_telegram', False),
+            )
+        except Exception as e:
+            ok = False
+            print(f"❌ Исключение при выполнении {key}: {e}")
+        if ok is True:
+            completed[key] = date_key
+            state['last_run_utc'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            prune_state(state)
+            save_state(path, state)
+            print(f"✅ {key} выполнено, записано в state")
+        else:
+            failed += 1
+            print(f"❌ {key} НЕ выполнено — в state не записываю (будет повторено)")
+    return failed
+
+
+async def run_due(main, args):
+    path = state_path()
+    state = load_state(path)
+
     try:
         await main.telegram_client.start(phone=main.PHONE)
     except Exception as e:
@@ -221,29 +263,8 @@ async def run_due(main, args):
         print("   Проверьте TELEGRAM_SESSION / TELEGRAM_API_ID / TELEGRAM_API_HASH.")
         return 1
 
-    failed = 0
     try:
-        for entry, occurrence, key, date_key in pending:
-            print(f"▶️  Выполняю: {key} (слот {occurrence} МСК)")
-            try:
-                ok = await main.scheduled_analysis_job(
-                    entry['chat_id'],
-                    entry['period'],
-                    entry['post_to_source'],
-                    entry.get('post_as_telegram', False),
-                )
-            except Exception as e:
-                ok = False
-                print(f"❌ Исключение при выполнении {key}: {e}")
-            if ok is True:
-                completed[key] = date_key
-                state['last_run_utc'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                prune_state(state)
-                save_state(path, state)
-                print(f"✅ {key} выполнено, записано в state")
-            else:
-                failed += 1
-                print(f"❌ {key} НЕ выполнено — в state не записываю (будет повторено)")
+        failed = await run_due_once(main, args, state, path)
     finally:
         try:
             await main.telegram_client.disconnect()
@@ -255,6 +276,181 @@ async def run_due(main, args):
             print(f"⚠️ Ошибка при закрытии http_client: {e}")
 
     return 1 if failed else 0
+
+
+# ──────────────────────────────────────────────
+# Inbox: форвард + команда sum/copy в General канала результатов
+# ──────────────────────────────────────────────
+
+INBOX_INITIAL_LIMIT = 100  # глубина первого опроса (покрывает межрановый зазор)
+
+
+def resolve_inbox_source(msg):
+    """Источник команды по строгому порядку (§2 плана).
+
+    1. fwd_from.from_id (PeerChannel/PeerChat) самого сообщения.
+    2. Иначе reply-родитель с fwd_from.from_id.
+    Возвращает (source_chat_id | None, parent_msg | None).
+    PeerUser-форварды и отсутствие форварда → (None, ...) = не команда.
+    """
+    from telethon.tl.types import PeerChannel, PeerChat
+    from telethon.utils import get_peer_id
+
+    fwd = getattr(msg, 'fwd_from', None)
+    peer = getattr(fwd, 'from_id', None) if fwd else None
+    if isinstance(peer, (PeerChannel, PeerChat)):
+        return get_peer_id(peer), None
+
+    reply_id = getattr(msg, 'reply_to_msg_id', None)
+    if reply_id:
+        return None, reply_id  # родителя догрузит вызыватель (нужен async)
+    return None, None
+
+
+async def poll_inbox_once(main, last_seen):
+    """Один опрос inbox. Возвращает (new_last_seen, failed_count).
+
+    last_seen=None → первый опрос: берём до INBOX_INITIAL_LIMIT свежих
+    (покрывает команды из межранового зазора), обрабатываем по возрастанию id.
+    Дальше — только id > last_seen. last_seen растёт всегда (in-memory, за ран),
+    обработанные команды удаляются (дедуп персистить не надо).
+    """
+    dest = main.RESULTS_DESTINATION
+    if last_seen is None:
+        batch = [m async for m in main.telegram_client.iter_messages(dest, limit=INBOX_INITIAL_LIMIT)]
+        batch = [m for m in batch if getattr(m, 'id', 0)]
+        batch.sort(key=lambda m: m.id)
+    else:
+        batch = [m async for m in main.telegram_client.iter_messages(dest, min_id=last_seen)]
+        batch.sort(key=lambda m: m.id)
+
+    if not batch:
+        return last_seen, 0
+    new_last_seen = max(m.id for m in batch)
+
+    failed = 0
+    for msg in batch:
+        if last_seen is not None and msg.id <= last_seen:
+            continue
+        text = (getattr(msg, 'text', None) or '').strip()
+        if not text:
+            continue
+        try:
+            parsed = main.parse_chat_command_args(text)
+        except Exception as e:
+            # Битый параметр ('sum abh'): не команда и не провал анализа —
+            # пропускаем, не удаляем, опрос не отравляем.
+            print(f"⚠️  Inbox {msg.id}: не удалось распарсить {text!r}: {e} — пропускаю")
+            continue
+        if parsed is None:
+            continue  # не команда — не трогаем
+
+        source_id, need_parent = resolve_inbox_source(msg)
+        if need_parent is not None:
+            try:
+                parent = await main.telegram_client.get_messages(dest, ids=need_parent)
+                if isinstance(parent, list):
+                    parent = parent[0] if parent else None
+                if parent is not None:
+                    source_id, _ = resolve_inbox_source(parent)
+            except Exception as e:
+                print(f"⚠️ Inbox {msg.id}: не удалось получить родителя {need_parent}: {e}")
+                failed += 1
+                continue
+        if source_id is None:
+            print(f"⏭️  Inbox {msg.id}: команда без форварда источника — пропущена (не удаляю)")
+            continue
+
+        try:
+            chat_entity = await main.telegram_client.get_entity(source_id)
+            chat_name = chat_entity.title if hasattr(chat_entity, 'title') else f"чат {source_id}"
+        except Exception as e:
+            print(f"❌ Inbox {msg.id}: нет доступа к чату {source_id}: {e} (повторю следующим опросом)")
+            failed += 1
+            continue
+
+        use_ai = parsed['use_ai']
+        print(f"▶️  Inbox {msg.id}: {'sum' if use_ai else 'copy'} из '{chat_name}' ({source_id})")
+        try:
+            topic_id = await main.get_or_create_topic(chat_name)
+            action = "анализ" if use_ai else "экспорт"
+            await main.telegram_client.send_message(
+                dest, f"🔄 Начинаю {action} по команде из inbox, чат '{chat_name}'...",
+                reply_to=topic_id)
+            ok = await main.run_analysis(
+                chat_id=source_id,
+                chat_name=chat_name,
+                hours=parsed['hours'],
+                days=parsed['days'],
+                limit=parsed['limit'],
+                range_start=parsed['range_start'],
+                range_end=parsed['range_end'],
+                time_range_start=parsed['time_range_start'],
+                time_range_end=parsed['time_range_end'],
+                use_ai=use_ai,
+                post_to_source=parsed['post_to_source'],
+                post_as_telegram=parsed['post_as_telegram'],
+                scheduled=False,
+            )
+        except Exception as e:
+            ok = False
+            print(f"❌ Inbox {msg.id}: исключение при выполнении: {e}")
+
+        if ok is True:
+            try:
+                await main.telegram_client.delete_messages(dest, [msg.id])
+                print(f"✅ Inbox {msg.id}: выполнено, команда удалена")
+            except Exception as e:
+                print(f"⚠️ Inbox {msg.id}: выполнено, но удалить команду не удалось: {e}")
+        else:
+            failed += 1
+            print(f"❌ Inbox {msg.id}: НЕ выполнено — сообщение оставляю (будет повторено)")
+
+    return new_last_seen, failed
+
+
+async def run_watch(main, args):
+    """Цикл §1 плана: due-задачи + опрос inbox до дедлайна, disconnect один раз."""
+    path = state_path()
+    state = load_state(path)
+
+    try:
+        await main.telegram_client.start(phone=main.PHONE)
+    except Exception as e:
+        print(f"❌ Не удалось подключиться к Telegram: {e}")
+        print("   Проверьте TELEGRAM_SESSION / TELEGRAM_API_ID / TELEGRAM_API_HASH.")
+        return 1
+
+    failed_total = 0
+    last_seen = None
+    try:
+        deadline = time.monotonic() + args.watch_seconds
+        iteration = 0
+        while True:
+            iteration += 1
+            print(f"─── Итерация {iteration} ───")
+            failed_total += await run_due_once(main, args, state, path)
+            try:
+                last_seen, inbox_failed = await poll_inbox_once(main, last_seen)
+                failed_total += inbox_failed
+            except Exception as e:
+                print(f"⚠️ Ошибка опроса inbox (итерация {iteration}): {e}")
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            await asyncio.sleep(min(args.poll_interval, deadline - now))
+    finally:
+        try:
+            await main.telegram_client.disconnect()
+        except Exception as e:
+            print(f"⚠️ Ошибка при disconnect: {e}")
+        try:
+            await main.http_client.aclose()
+        except Exception as e:
+            print(f"⚠️ Ошибка при закрытии http_client: {e}")
+
+    print(f"🏁 Watch завершён ({iteration} итераций, неуспехов: {failed_total}).")
+    return 1 if failed_total else 0
 
 
 async def run_manual(main, args):
@@ -324,6 +520,8 @@ def run(argv):
 
     if args.due:
         return asyncio.run(run_due(main, args))
+    if args.watch:
+        return asyncio.run(run_watch(main, args))
     return asyncio.run(run_manual(main, args))
 
 

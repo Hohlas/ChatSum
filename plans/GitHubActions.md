@@ -37,7 +37,7 @@ UX: пользователь пересылает **любое** сообщен�
 sum100 | sum100-800 | sum12h | sum1d | copy100 | copy1d ... [+/-]
 ```
 
-Грамматика команды (строгая): `^(sum|copy)\s*(\d+\s*-\s*\d+|\d+\s*[hd]?|\d+\s+\S+)?\s*([+-])?\s*$`, регистр — нижний после strip. Примеры: `sum100-`, `sum 12h`, `copy1d`. Суффиксы `+`/`-` — существующая семантика (`_parse_suffixes`: `+` = пост в исходный чат, `-` = TG-сообщением вместо Telegraph).
+Грамматика команды = грамматика VPS-команд `/sum|/copy` один в один (включая голую команду без аргументов = дефолт 24h, мультипараметры `1d 6h`, формы `3-5d`, суффиксы `+`/`-` с пробелом или без). Отдельной inbox-грамматики нет: парсинг один, общий (см. п.2).
 
 Резолв источника (порядок строгий):
 
@@ -47,10 +47,10 @@ sum100 | sum100-800 | sum12h | sum1d | copy100 | copy1d ... [+/-]
 
 Обработка команды:
 
-1. Распарсить период/диапазон существующими парсерами `main.py` (те же, что для `/sum`).
-2. Выполнить через существующее ядро `scheduled_analysis_job(source_chat_id, period, post_to_source, post_as_telegram)` — новую аналитику не писать.
-3. Результат постится по действующим правилам (`RESULTS_DESTINATION`, топик источника через `get_or_create_topic` — без изменений).
-4. После успеха — **удалить командное сообщение** (`delete_messages`, best-effort: неуспех удаления не роняет ран). При неуспехе анализа — сообщение НЕ удалять (будет повторено следующим опросом), в топик источника — короткое сообщение об ошибке (существующий error-path).
+1. Распарсить текст той же логикой, что VPS-обработчик `process_chat_command` (`main.py:3419`): `use_ai` (sum=True/copy=False), `hours/days/limit/range_start/range_end/time_range_start/time_range_end`, `post_to_source/post_as_telegram`. Для этого вынести парсинг из `process_chat_command` в чистую функцию `parse_chat_command_args(text) -> (...)` и использовать её в обоих местах (VPS-хендлеры `handle_sum_command`/`handle_copy_command` переключить на неё же, поведение не менять).
+2. Ядро выполнения — **`run_analysis`** (`main.py:2870`), НЕ `scheduled_analysis_job`: только `run_analysis` принимает `limit/range/time_range` и `use_ai=False` для copy. `scheduled_analysis_job` (`main.py:3663`) понимает лишь период `\d+[hd]` и всегда `use_ai=True` — остаётся только для due-задач (§1). Вызов: резолв `chat_name` через `get_entity(source_chat_id)` (как в `scheduled_analysis_job`), затем `run_analysis(source_chat_id, chat_name, hours=..., days=..., limit=..., range_start=..., range_end=..., time_range_start=..., time_range_end=..., use_ai=..., post_to_source=..., post_as_telegram=..., scheduled=False)`.
+3. Результат постится по действующим правилам (`RESULTS_DESTINATION`, топик источника через `get_or_create_topic` — без изменений; `run_analysis` это уже делает сам).
+4. После успеха — **удалить командное сообщение** (`delete_messages`, best-effort: неуспех удаления не роняет ран). При неуспехе анализа — сообщение НЕ удалять (будет повторено следующим опросом), в топик источника — короткое сообщение об ошибке (существующий error-path `run_analysis`).
 5. Опрос = `iter_messages(RESULTS_DESTINATION, min_id=last_seen)` где `last_seen` — in-memory максимум за ран (персистить не надо: неудалённые = необработанные).
 
 ## 3. Изменения workflow (`summarize.yml`)
