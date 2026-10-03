@@ -11,6 +11,14 @@ on:
       period:
         description: 'Период (1d, 12h)'
         required: false
+      poll_interval:
+        description: 'Пауза между опросами inbox в режиме --watch, сек (по умолч. 60)'
+        required: false
+        default: '60'
+      watch_seconds:
+        description: 'Длительность цикла --watch, сек (по умолч. 480)'
+        required: false
+        default: '480'
 
 permissions:
   contents: write
@@ -62,13 +70,18 @@ jobs:
           # (защита от quoting/инъекций; пустой period → дефолт 1d)
           CHAT_ID: ${{ github.event.inputs.chat_id }}
           PERIOD:  ${{ github.event.inputs.period }}
+          POLL_INTERVAL:  ${{ github.event.inputs.poll_interval }}
+          WATCH_SECONDS:  ${{ github.event.inputs.watch_seconds }}
           # run_once.py читает/пишет state по этому пути (вне рабочего дерева)
           STATE_PATH: ${{ runner.temp }}/state.json
         run: |
           if [ -n "$CHAT_ID" ]; then
             python run_once.py --chat-id "$CHAT_ID" --period "${PERIOD:-1d}"
           else
-            python run_once.py --watch
+            # только цифры, иначе дефолты run_once.py (защита от инъекций)
+            case "${POLL_INTERVAL:-60}" in ''|*[!0-9]*) POLL_INTERVAL=60 ;; esac
+            case "${WATCH_SECONDS:-480}" in ''|*[!0-9]*) WATCH_SECONDS=480 ;; esac
+            python run_once.py --watch --poll-interval "$POLL_INTERVAL" --watch-seconds "$WATCH_SECONDS"
           fi
 
       # state.json должен попасть в ветку state даже при частичном провале:
