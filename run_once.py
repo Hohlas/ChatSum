@@ -285,6 +285,51 @@ async def run_due(main, args):
 # ──────────────────────────────────────────────
 
 INBOX_INITIAL_LIMIT = 100  # глубина первого опроса (покрывает межрановый зазор)
+INBOX_PAIR_MAX_ID_DIST = 10   # спаривание: форвард не дальше N сообщений от команды
+INBOX_PAIR_MAX_SECONDS = 600  # ...и не дальше 10 минут по времени
+INBOX_PENDING_MAX = 20        # сколько неспаренных команд/форвардов помним внутри рана
+INBOX_PENDING_MAX_AGE = 3600  # старше часа — забываем
+
+
+def forward_source_id(msg):
+    """ID исходного чата из собственного форварда msg (PeerChannel/PeerChat) или None."""
+    from telethon.tl.types import PeerChannel, PeerChat
+    from telethon.utils import get_peer_id
+
+    fwd = getattr(msg, 'fwd_from', None)
+    peer = getattr(fwd, 'from_id', None) if fwd else None
+    if isinstance(peer, (PeerChannel, PeerChat)):
+        return get_peer_id(peer)
+    return None
+
+
+def find_pair_forward(cmd, forwards, consumed,
+                      max_id_dist=INBOX_PAIR_MAX_ID_DIST,
+                      max_seconds=INBOX_PAIR_MAX_SECONDS):
+    """Спаривание (§2 п.3 плана): команда, а следующим сообщением — форвард.
+
+    Порядок фиксированный: форвард строго НОВЕЕ команды (твой флоу: сначала
+    пишешь команду, потом пересылаешь цитату). forwards — форварды-кандидаты
+    (без своей команды); consumed — id уже использованных в этом ране.
+    Побеждает ближайший сверху; возврат — сообщение-форвард или None.
+    """
+    best = None
+    best_dist = None
+    for fwd in forwards:
+        if getattr(fwd, 'id', None) in consumed:
+            continue
+        if getattr(fwd, 'id', 0) <= cmd.id:
+            continue  # форвард должен идти ПОСЛЕ команды, не до неё
+        try:
+            dist = fwd.id - cmd.id
+            skew = abs((fwd.date - cmd.date).total_seconds())
+        except Exception:
+            continue
+        if dist > max_id_dist or skew > max_seconds:
+            continue
+        if best is None or dist < best_dist:
+            best, best_dist = fwd, dist
+    return best
 
 
 def resolve_inbox_source(msg):
@@ -295,13 +340,9 @@ def resolve_inbox_source(msg):
     Возвращает (source_chat_id | None, parent_msg | None).
     PeerUser-форварды и отсутствие форварда → (None, ...) = не команда.
     """
-    from telethon.tl.types import PeerChannel, PeerChat
-    from telethon.utils import get_peer_id
-
-    fwd = getattr(msg, 'fwd_from', None)
-    peer = getattr(fwd, 'from_id', None) if fwd else None
-    if isinstance(peer, (PeerChannel, PeerChat)):
-        return get_peer_id(peer), None
+    source = forward_source_id(msg)
+    if source is not None:
+        return source, None
 
     reply_id = getattr(msg, 'reply_to_msg_id', None)
     if reply_id:
@@ -309,13 +350,23 @@ def resolve_inbox_source(msg):
     return None, None
 
 
-async def poll_inbox_once(main, last_seen):
+def new_inbox_mem():
+    """Память inbox внутри одного рана: неспаренные команды/форварды + съеденные форварды."""
+    return {'cmds': {}, 'fwds': {}, 'consumed': set()}
+
+
+async def poll_inbox_once(main, last_seen, mem):
     """Один опрос inbox. Возвращает (new_last_seen, failed_count).
 
     last_seen=None → первый опрос: берём до INBOX_INITIAL_LIMIT свежих
-    (покрывает команды из межранового зазора), обрабатываем по возрастанию id.
-    Дальше — только id > last_seen. last_seen растёт всегда (in-memory, за ран),
-    обработанные команды удаляются (дедуп персистить не надо).
+    (покрывает команды из межранового зазора). Дальше — только id > last_seen.
+    last_seen растёт всегда (in-memory, за ран), обработанные команды удаляются
+    (дедуп персистить не надо).
+
+    mem (из new_inbox_mem) помнит неспаренные команды/форварды между опросами:
+    команда и форвард могут прийти в разные опросы (твой флоу: сначала команда,
+    следующим сообщением — цитата). Успешная пара удаляется целиком, повторное
+    использование форварда исключено (consumed + удаление).
     """
     dest = main.RESULTS_DESTINATION
     if last_seen is None:
@@ -326,29 +377,70 @@ async def poll_inbox_once(main, last_seen):
         batch = [m async for m in main.telegram_client.iter_messages(dest, min_id=last_seen)]
         batch.sort(key=lambda m: m.id)
 
-    if not batch:
+    if not batch and not mem['cmds'] and not mem['fwds']:
         return last_seen, 0
-    new_last_seen = max(m.id for m in batch)
+    new_last_seen = last_seen
+    if batch:
+        new_last_seen = max([m.id for m in batch] + ([last_seen] if last_seen else []))
+    fresh_ids = {m.id for m in batch}
+
+    now = datetime.now(timezone.utc)
+
+    def _fresh(m):
+        try:
+            d = m.date
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            return (now - d).total_seconds() <= INBOX_PENDING_MAX_AGE
+        except Exception:
+            return True
+
+    # Чистим память: протухшее и сверх лимита (старое — первым).
+    for store in (mem['cmds'], mem['fwds']):
+        for mid in [k for k, m in store.items() if not _fresh(m)]:
+            del store[mid]
+        while len(store) > INBOX_PENDING_MAX:
+            store.pop(next(iter(store)))
+
+    parsed_cache = {}
+
+    def _parsed(m):
+        if m.id not in parsed_cache:
+            text = (getattr(m, 'text', None) or '').strip()
+            try:
+                parsed_cache[m.id] = main.parse_chat_command_args(text) if text else None
+            except Exception as e:
+                # Битый параметр ('sum abh'): не команда и не провал анализа —
+                # пропускаем, не удаляем, опрос не отравляем (лог — раз на опрос).
+                if m.id in fresh_ids:
+                    print(f"⚠️  Inbox {m.id}: не удалось распарсить {text!r}: {e} — пропускаю")
+                parsed_cache[m.id] = None
+        return parsed_cache[m.id]
+
+    # Запоминаем свежие кандидаты (команды — всегда; форварды — без своей команды).
+    for m in batch:
+        if not _fresh(m):
+            continue
+        if _parsed(m) is not None:
+            mem['cmds'].setdefault(m.id, m)
+        elif forward_source_id(m) is not None:
+            mem['fwds'].setdefault(m.id, m)
+
+    forwards_pool = sorted(mem['fwds'].values(), key=lambda m: m.id)
 
     failed = 0
-    for msg in batch:
-        if last_seen is not None and msg.id <= last_seen:
-            continue
-        text = (getattr(msg, 'text', None) or '').strip()
-        if not text:
-            continue
-        try:
-            parsed = main.parse_chat_command_args(text)
-        except Exception as e:
-            # Битый параметр ('sum abh'): не команда и не провал анализа —
-            # пропускаем, не удаляем, опрос не отравляем.
-            print(f"⚠️  Inbox {msg.id}: не удалось распарсить {text!r}: {e} — пропускаю")
-            continue
+    for cmd_id in sorted(mem['cmds']):
+        msg = mem['cmds'][cmd_id]
+        parsed = _parsed(msg)
         if parsed is None:
-            continue  # не команда — не трогаем
+            mem['cmds'].pop(cmd_id, None)
+            continue
 
+        paired_fwd = None
+        parent_id = None
         source_id, need_parent = resolve_inbox_source(msg)
         if need_parent is not None:
+            parent_id = need_parent
             try:
                 parent = await main.telegram_client.get_messages(dest, ids=need_parent)
                 if isinstance(parent, list):
@@ -360,12 +452,19 @@ async def poll_inbox_once(main, last_seen):
                 failed += 1
                 continue
         if source_id is None:
-            if need_parent is not None:
-                print(f"⏭️  Inbox {msg.id}: команда без форварда источника "
-                      f"(ответ на {need_parent}, у родителя нет форварда) — пропущена (не удаляю)")
-            else:
-                print(f"⏭️  Inbox {msg.id}: команда без форварда источника — пропущена (не удаляю)")
-            continue
+            # п.3 плана: команда выше, форвард — следующим сообщением.
+            paired_fwd = find_pair_forward(
+                msg, forwards_pool, mem['consumed'])
+            if paired_fwd is not None:
+                source_id = forward_source_id(paired_fwd)
+        if source_id is None:
+            if msg.id in fresh_ids:
+                if need_parent is not None:
+                    print(f"⏭️  Inbox {msg.id}: команда без форварда источника "
+                          f"(ответ на {need_parent}, у родителя нет форварда) — жду пару")
+                else:
+                    print(f"⏭️  Inbox {msg.id}: команда без форварда источника — жду пару")
+            continue  # остаётся в памяти до следующего опроса
 
         try:
             chat_entity = await main.telegram_client.get_entity(source_id)
@@ -376,7 +475,8 @@ async def poll_inbox_once(main, last_seen):
             continue
 
         use_ai = parsed['use_ai']
-        print(f"▶️  Inbox {msg.id}: {'sum' if use_ai else 'copy'} из '{chat_name}' ({source_id})")
+        via = f" (пара с форвардом {paired_fwd.id})" if paired_fwd is not None else ""
+        print(f"▶️  Inbox {msg.id}: {'sum' if use_ai else 'copy'} из '{chat_name}' ({source_id}){via}")
         try:
             topic_id = await main.get_or_create_topic(chat_name)
             action = "анализ" if use_ai else "экспорт"
@@ -403,11 +503,20 @@ async def poll_inbox_once(main, last_seen):
             print(f"❌ Inbox {msg.id}: исключение при выполнении: {e}")
 
         if ok is True:
+            to_delete = [msg.id] + ([paired_fwd.id] if paired_fwd is not None else [])
             try:
-                await main.telegram_client.delete_messages(dest, [msg.id])
-                print(f"✅ Inbox {msg.id}: выполнено, команда удалена")
+                await main.telegram_client.delete_messages(dest, to_delete)
+                print(f"✅ Inbox {msg.id}: выполнено, удалено сообщений: {len(to_delete)}")
             except Exception as e:
-                print(f"⚠️ Inbox {msg.id}: выполнено, но удалить команду не удалось: {e}")
+                print(f"⚠️ Inbox {msg.id}: выполнено, но удалить не удалось: {e}")
+            mem['cmds'].pop(cmd_id, None)
+            if paired_fwd is not None:
+                mem['fwds'].pop(paired_fwd.id, None)
+                mem['consumed'].add(paired_fwd.id)
+            if parent_id is not None:
+                # Родитель-форвард уже отработал как источник — в пары не отдаём.
+                mem['fwds'].pop(parent_id, None)
+                mem['consumed'].add(parent_id)
         else:
             failed += 1
             print(f"❌ Inbox {msg.id}: НЕ выполнено — сообщение оставляю (будет повторено)")
@@ -429,6 +538,7 @@ async def run_watch(main, args):
 
     failed_total = 0
     last_seen = None
+    inbox_mem = new_inbox_mem()
     try:
         deadline = time.monotonic() + args.watch_seconds
         iteration = 0
@@ -437,7 +547,7 @@ async def run_watch(main, args):
             print(f"─── Итерация {iteration} ───")
             failed_total += await run_due_once(main, args, state, path)
             try:
-                last_seen, inbox_failed = await poll_inbox_once(main, last_seen)
+                last_seen, inbox_failed = await poll_inbox_once(main, last_seen, inbox_mem)
                 failed_total += inbox_failed
             except Exception as e:
                 print(f"⚠️ Ошибка опроса inbox (итерация {iteration}): {e}")

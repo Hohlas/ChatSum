@@ -106,6 +106,8 @@ def main():
     test_resolve_source()
     test_watch_args()
     test_inbox_no_poison()
+    test_find_pair_forward()
+    test_pair_flow()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")
@@ -278,13 +280,148 @@ def test_inbox_no_poison():
     client = FakeClient(msgs)
     fake = FakeMain(client)
     new_last_seen, failed = asyncio.get_event_loop().run_until_complete(
-        run_once.poll_inbox_once(fake, None))
+        run_once.poll_inbox_once(fake, None, run_once.new_inbox_mem()))
     check('inbox poison: batch consumed', new_last_seen == 4 and failed == 0,
           (new_last_seen, failed))
     check('inbox poison: only valid cmd ran',
           len(fake.ran) == 1 and fake.ran[0]['limit'] == 10 and fake.ran[0]['use_ai'] is True,
           fake.ran)
     check('inbox poison: only valid cmd deleted', client.deleted == [4], client.deleted)
+
+
+def test_find_pair_forward():
+    """Спаривание строго вперёд: команда → форвард следующим сообщением."""
+    from datetime import timezone
+    from telethon.tl.types import PeerChannel
+
+    class Fwd:
+        def __init__(self, from_id):
+            self.from_id = from_id
+
+    class M:
+        def __init__(self, id, dt, fwd=None):
+            self.id = id
+            self.date = dt
+            self.fwd_from = Fwd(fwd) if fwd else None
+
+    base = datetime(2026, 10, 3, 19, 0, tzinfo=timezone.utc)
+
+    def mins(n):
+        return base + timedelta(minutes=n)
+
+    cmd = M(100, mins(0))
+    f1 = M(101, mins(1), PeerChannel(channel_id=1))
+    f2 = M(103, mins(1), PeerChannel(channel_id=2))
+    got = run_once.find_pair_forward(cmd, [f1, f2], set())
+    check('pair: ближайший сверху', got is f1, getattr(got, 'id', None))
+
+    old = M(99, mins(-1), PeerChannel(channel_id=3))
+    got = run_once.find_pair_forward(cmd, [old], set())
+    check('pair: форвард ДО команды игнорируется', got is None, got)
+
+    got = run_once.find_pair_forward(cmd, [f1], {101})
+    check('pair: использованный исключается', got is None, got)
+
+    far = M(120, mins(2), PeerChannel(channel_id=4))
+    got = run_once.find_pair_forward(cmd, [far], set())
+    check('pair: дальний по id исключается', got is None, got)
+
+    late = M(102, mins(30), PeerChannel(channel_id=5))
+    got = run_once.find_pair_forward(cmd, [late], set())
+    check('pair: старый по времени исключается', got is None, got)
+
+    got = run_once.find_pair_forward(cmd, [], set())
+    check('pair: пустой пул', got is None, got)
+
+
+def test_pair_flow():
+    """Команда и форвард в РАЗНЫХ опросах: poll1 запоминает команду,
+    poll2 спаривает с форвардом — один анализ, удалены оба сообщения."""
+    from datetime import timezone
+    from telethon.tl.types import PeerChannel
+
+    class Fwd:
+        def __init__(self, from_id):
+            self.from_id = from_id
+
+    class FakeMsg:
+        def __init__(self, id, text, dt, fwd_from=None):
+            self.id = id
+            self.text = text
+            self.date = dt
+            self.fwd_from = fwd_from
+            self.reply_to_msg_id = None
+
+    class FakeEntity:
+        title = 'PairChat'
+
+    class FakeClient:
+        def __init__(self, batches):
+            self.batches = batches
+            self.calls = 0
+            self.deleted = []
+
+        async def iter_messages(self, dest, limit=None, min_id=None):
+            batch = self.batches[min(self.calls, len(self.batches) - 1)]
+            self.calls += 1
+            for m in batch:
+                if min_id is not None and m.id <= min_id:
+                    continue
+                yield m
+
+        async def get_messages(self, dest, ids):
+            return None
+
+        async def get_entity(self, peer_id):
+            return FakeEntity()
+
+        async def send_message(self, dest, text, reply_to=None):
+            return None
+
+        async def delete_messages(self, dest, ids):
+            self.deleted.extend(ids)
+
+    class FakeMain:
+        RESULTS_DESTINATION = 'test-inbox'
+        parse_chat_command_args = staticmethod(bot.parse_chat_command_args)
+
+        def __init__(self, client):
+            self.telegram_client = client
+            self.ran = []
+
+        async def get_or_create_topic(self, name):
+            return 1
+
+        async def run_analysis(self, **kw):
+            self.ran.append(kw)
+            return True
+
+    t0 = datetime(2026, 10, 3, 19, 0, tzinfo=timezone.utc)
+    cmd = FakeMsg(50, 'sum20', t0)
+    fwd = FakeMsg(51, 'цитата', t0 + timedelta(minutes=1),
+                  fwd_from=Fwd(PeerChannel(channel_id=777)))
+    client = FakeClient([[cmd], [fwd]])
+    fake = FakeMain(client)
+    loop = asyncio.get_event_loop()
+    mem = run_once.new_inbox_mem()
+
+    ls1, failed1 = loop.run_until_complete(run_once.poll_inbox_once(fake, None, mem))
+    check('pair flow: poll1 только запоминает',
+          ls1 == 50 and failed1 == 0 and not fake.ran and 50 in mem['cmds'],
+          (ls1, failed1, fake.ran))
+
+    ls2, failed2 = loop.run_until_complete(run_once.poll_inbox_once(fake, ls1, mem))
+    check('pair flow: poll2 выполняет один анализ',
+          ls2 == 51 and failed2 == 0 and len(fake.ran) == 1
+          and fake.ran[0]['limit'] == 20 and fake.ran[0]['chat_id'] == -1000000000777,
+          (ls2, failed2, fake.ran))
+    check('pair flow: удалены оба сообщения', client.deleted == [50, 51], client.deleted)
+    check('pair flow: форвард помечен использованным', mem['consumed'] == {51}, mem['consumed'])
+
+    # Третий опрос: повторов нет (команда съедена, форвард удалён/помечен).
+    ls3, failed3 = loop.run_until_complete(run_once.poll_inbox_once(fake, ls2, mem))
+    check('pair flow: без повторов', ls3 == 51 and failed3 == 0 and len(fake.ran) == 1,
+          (ls3, failed3, len(fake.ran)))
 
 
 if __name__ == '__main__':
