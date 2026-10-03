@@ -292,13 +292,17 @@ INBOX_PENDING_MAX_AGE = 3600  # старше часа — забываем
 
 
 def forward_source_id(msg):
-    """ID исходного чата из собственного форварда msg (PeerChannel/PeerChat) или None."""
-    from telethon.tl.types import PeerChannel, PeerChat
+    """ID источника из собственного форварда msg (канал/чат/пользователь) или None.
+
+    PeerUser тоже годится: диалог анализируется как обычный чат.
+    Без атрибуции (копипаст, запрет указания авторства) → None.
+    """
+    from telethon.tl.types import PeerChannel, PeerChat, PeerUser
     from telethon.utils import get_peer_id
 
     fwd = getattr(msg, 'fwd_from', None)
     peer = getattr(fwd, 'from_id', None) if fwd else None
-    if isinstance(peer, (PeerChannel, PeerChat)):
+    if isinstance(peer, (PeerChannel, PeerChat, PeerUser)):
         return get_peer_id(peer)
     return None
 
@@ -335,10 +339,10 @@ def find_pair_forward(cmd, forwards, consumed,
 def resolve_inbox_source(msg):
     """Источник команды по строгому порядку (§2 плана).
 
-    1. fwd_from.from_id (PeerChannel/PeerChat) самого сообщения.
+    1. fwd_from.from_id (PeerChannel/PeerChat/PeerUser) самого сообщения.
     2. Иначе reply-родитель с fwd_from.from_id.
     Возвращает (source_chat_id | None, parent_msg | None).
-    PeerUser-форварды и отсутствие форварда → (None, ...) = не команда.
+    Отсутствие форварда → (None, ...) = не команда.
     """
     source = forward_source_id(msg)
     if source is not None:
@@ -468,7 +472,14 @@ async def poll_inbox_once(main, last_seen, mem):
 
         try:
             chat_entity = await main.telegram_client.get_entity(source_id)
-            chat_name = chat_entity.title if hasattr(chat_entity, 'title') else f"чат {source_id}"
+            if getattr(chat_entity, 'title', None):
+                chat_name = chat_entity.title
+            elif getattr(chat_entity, 'first_name', None):
+                chat_name = chat_entity.first_name
+                if getattr(chat_entity, 'last_name', None):
+                    chat_name += f" {chat_entity.last_name}"
+            else:
+                chat_name = f"чат {source_id}"
         except Exception as e:
             print(f"❌ Inbox {msg.id}: нет доступа к чату {source_id}: {e} (повторю следующим опросом)")
             failed += 1

@@ -203,7 +203,7 @@ def test_resolve_source():
     src, parent = run_once.resolve_inbox_source(Msg(Fwd(PeerChat(chat_id=456))))
     check('resolve fwd chat', src == -456 and parent is None, (src, parent))
     src, parent = run_once.resolve_inbox_source(Msg(Fwd(PeerUser(user_id=789))))
-    check('resolve fwd user -> skip', src is None and parent is None, (src, parent))
+    check('resolve fwd user -> user id', src == 789 and parent is None, (src, parent))
     src, parent = run_once.resolve_inbox_source(Msg(reply_to_msg_id=42))
     check('resolve reply -> parent id', src is None and parent == 42, (src, parent))
     src, parent = run_once.resolve_inbox_source(Msg())
