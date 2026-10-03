@@ -106,6 +106,46 @@ def task_key(entry):
     return f"{entry['chat_id']}|{entry['hour']:02d}:{entry['minute']:02d}|{period}"
 
 
+KEY_CURSOR_STATE_FIELD = 'google_key_cursor'
+
+
+def restore_key_cursor(main, state):
+    """Продолжить ротацию Google-ключей с места прошлого рана.
+
+    Без этого каждый ран стартует с ключа 1 (процесс эфемерный). Не роняет:
+    main без курсора (тестовые фейки) — молча пропускаем.
+    """
+    cursor = 0
+    try:
+        cursor = int((state or {}).get(KEY_CURSOR_STATE_FIELD, 0) or 0)
+    except (TypeError, ValueError):
+        cursor = 0
+    if cursor < 0:
+        cursor = 0
+    setter = getattr(main, 'set_google_key_cursor', None)
+    if callable(setter):
+        try:
+            setter(cursor)
+        except Exception:
+            pass
+    n = len(getattr(main, 'GOOGLE_API_KEYS', []) or [])
+    if n:
+        print(f"🔑 Курсор ключей из state: {cursor} → старт с ключа {cursor % n + 1}/{n}")
+    return cursor
+
+
+def store_key_cursor(main, state):
+    """Записать текущий счётчик ключей в state (продолжение ротации в след. ране)."""
+    getter = getattr(main, 'get_google_key_cursor', None)
+    if not callable(getter):
+        return state
+    try:
+        state[KEY_CURSOR_STATE_FIELD] = int(getter())
+    except Exception:
+        pass
+    return state
+
+
 # ──────────────────────────────────────────────
 # Окно и должные задания (чистая логика, тестируемая без Telegram)
 # ──────────────────────────────────────────────
@@ -258,6 +298,7 @@ async def run_due_once(main, args, state, path):
 async def run_due(main, args):
     path = state_path()
     state = load_state(path)
+    restore_key_cursor(main, state)
 
     try:
         await main.telegram_client.start(phone=main.PHONE)
@@ -269,6 +310,11 @@ async def run_due(main, args):
     try:
         failed = await run_due_once(main, args, state, path)
     finally:
+        store_key_cursor(main, state)
+        try:
+            save_state(path, state)
+        except Exception as e:
+            print(f"⚠️ Не удалось сохранить state: {e}")
         try:
             await main.telegram_client.disconnect()
         except Exception as e:
@@ -318,16 +364,29 @@ def extract_chat_link(text):
 
 
 async def fetch_forum_topics(main, dest):
-    """{topic_id: title} канала результатов (кэш за ран берёт вызыватель)."""
+    """Топики канала результатов: ({topic_id: title}, {topic_id: top_message}).
+
+    top_message нужен per-topic скану: опрос General (GetHistory без топика)
+    сообщений из топиков не видит, поэтому свежесть топиков отслеживаем сами.
+    """
     try:
         from telethon.tl.functions.channels import GetForumTopicsRequest
         result = await main.telegram_client(GetForumTopicsRequest(
             channel=dest, offset_date=0, offset_id=0, offset_topic=0, limit=100))
-        return {t.id: t.title for t in getattr(result, 'topics', [])
-                if getattr(t, 'id', None) and getattr(t, 'title', None)}
+        titles, tops = {}, {}
+        for t in getattr(result, 'topics', []):
+            tid = getattr(t, 'id', None)
+            if not tid:
+                continue
+            if getattr(t, 'title', None):
+                titles[tid] = t.title
+            top = getattr(t, 'top_message', None)
+            if isinstance(top, int) and top > 0:
+                tops[tid] = top
+        return titles, tops
     except Exception as e:
         print(f"⚠️ Inbox: не удалось получить список топиков: {e}")
-        return {}
+        return {}, {}
 
 
 async def fetch_dialog_names(main):
@@ -369,7 +428,8 @@ async def resolve_topic_source(main, mem, dest, top_id):
     if dest == 'me':
         return None
     if mem.get('topics') is None:
-        mem['topics'] = await fetch_forum_topics(main, dest)
+        titles, _tops = await fetch_forum_topics(main, dest)
+        mem['topics'] = titles
     title = mem['topics'].get(top_id)
     if not title:
         return None
@@ -384,7 +444,8 @@ async def resolve_topic_source(main, mem, dest, top_id):
 
 def new_inbox_mem():
     """Память inbox внутри одного рана: кэши топиков/диалогов + антиспам лога."""
-    return {'topics': None, 'dialogs': None, 'skip_logged': set()}
+    return {'topics': None, 'dialogs': None, 'skip_logged': set(),
+            'topics_seen': {}}
 
 
 def _log_once(mem, key, text):
@@ -394,20 +455,180 @@ def _log_once(mem, key, text):
         print(text)
 
 
-async def poll_inbox_once(main, last_seen, mem):
-    """Один опрос inbox. Возвращает (new_last_seen, failed_count).
+TOPIC_SCAN_DEPTH = 10  # сколько свежих id добираем при первом взгляде на топик
 
-    last_seen=None → первый опрос: берём до INBOX_INITIAL_LIMIT свежих
-    (покрывает команды из межранового зазора). Дальше — только id > last_seen.
-    last_seen растёт всегда (in-memory, за ран), обработанные команды удаляются
-    (дедуп персистить не надо).
 
-    Источник команды (строго по порядку): явная ссылка (`sum20 t.me/…`/`@…`/
-    `t.me/c/ID/…`) → топик (название топика = название чата среди диалогов).
-    Всё остальное — пропуск без удаления.
+async def _notify_inbox(main, dest, topic_id, text):
+    """Диагностика inbox: в топик (reply_to=top) или в General (без reply_to).
+
+    Best-effort: неуспех отправки ран не роняет.
+    """
+    try:
+        if topic_id and topic_id != 1:
+            await main.telegram_client.send_message(dest, text, reply_to=topic_id)
+        else:
+            await main.telegram_client.send_message(dest, text)
+    except Exception as e:
+        print(f"⚠️ Inbox: не удалось отправить диагностику: {e}")
+
+
+async def _drop_command(main, dest, msg, why):
+    """Удаление отработанной/проваленной команды. Best-effort, ран не роняет."""
+    try:
+        await main.telegram_client.delete_messages(dest, [msg.id])
+        print(f"🗑️ Inbox {msg.id}: команда удалена ({why})")
+        return True
+    except Exception as e:
+        print(f"⚠️ Inbox {msg.id}: не удалось удалить команду ({why}): {e}")
+        return False
+
+
+async def process_inbox_message(main, mem, dest, msg, topic_id=None):
+    """Обработка одного inbox-сообщения. Возвращает 'ok' | 'fail' | 'skip'.
+
+    topic_id: топик, из которого взято сообщение (per-topic скан; для General —
+    None, тогда топик берётся из reply_to_top_id сообщения).
+    Источник команды (строго по порядку): явная ссылка → топик.
+    Успех и провал — удаление команды; провал — плюс диагностика
+    (в топик источника, если известен, иначе туда, где лежала команда).
+    Не-команды не трогаем никогда.
     """
     from telethon.utils import get_peer_id
 
+    text = (getattr(msg, 'text', None) or '').strip()
+    if not text:
+        return 'skip'
+    try:
+        parsed = main.parse_chat_command_args(text)
+    except Exception as e:
+        # Битый параметр ('sum abh'): не команда и не провал анализа —
+        # пропускаем, не удаляем, опрос не отравляем.
+        print(f"⚠️  Inbox {msg.id}: не удалось распарсить {text!r}: {e} — пропускаю")
+        return 'skip'
+    if parsed is None:
+        return 'skip'  # не команда — не трогаем
+
+    # Куда слать диагностику, если источник так и не определится:
+    # туда, где лежала команда (топик) или General.
+    own_top = topic_id if topic_id not in (None, 1) \
+        else getattr(msg, 'reply_to_top_id', None)
+    home = own_top if own_top not in (None, 1) else None
+
+    async def fail(notice_topic, log_text, notice_text):
+        print(log_text)
+        if await _drop_command(main, dest, msg, 'провал'):
+            await _notify_inbox(main, dest, notice_topic, notice_text)
+        else:
+            _log_once(mem, f"dropfail:{msg.id}",
+                      f"⚠️ Inbox {msg.id}: команда не удалена — повторится следующим опросом")
+        return 'fail'
+
+    source_id = None
+    via = ""
+    link = extract_chat_link(text)
+    if link is not None:
+        kind, value = link
+        if kind == 'internal':
+            source_id = value
+            via = " (ссылка)"
+        else:
+            try:
+                entity = await main.telegram_client.get_entity(value)
+                source_id = get_peer_id(entity)
+                via = " (ссылка)"
+            except Exception as e:
+                return await fail(
+                    home,
+                    f"❌ Inbox {msg.id}: не резолвится ссылка {value!r}: {e}",
+                    f"❌ Inbox {msg.id}: не резолвится ссылка {value!r} — "
+                    f"команда удалена, повтора не будет.")
+    if source_id is None:
+        if own_top not in (None, 1):
+            source_id = await resolve_topic_source(main, mem, dest, own_top)
+            if source_id is None:
+                return await fail(
+                    home,
+                    f"❌ Inbox {msg.id}: топик {own_top} не сопоставлен ни с одним чатом",
+                    f"❌ Inbox {msg.id}: топик не сопоставлен ни с одним чатом — "
+                    f"команда удалена, повтора не будет.")
+            via = " (топик)"
+        else:
+            return await fail(
+                None,
+                f"❌ Inbox {msg.id}: команда в General без ссылки — не выполнена",
+                f"❌ Inbox {msg.id}: команда в General без ссылки "
+                f"(нужна ссылка t.me/…/@… или команда в топике чата) — "
+                f"удалена, ничего не выполнено.")
+
+    try:
+        chat_entity = await main.telegram_client.get_entity(source_id)
+        if getattr(chat_entity, 'title', None):
+            chat_name = chat_entity.title
+        elif getattr(chat_entity, 'first_name', None):
+            chat_name = chat_entity.first_name
+            if getattr(chat_entity, 'last_name', None):
+                chat_name += f" {chat_entity.last_name}"
+        else:
+            chat_name = f"чат {source_id}"
+    except Exception as e:
+        return await fail(
+            home,
+            f"❌ Inbox {msg.id}: нет доступа к чату {source_id}: {e}",
+            f"❌ Inbox {msg.id}: нет доступа к чату-источнику — "
+            f"команда удалена, повтора не будет.")
+
+    use_ai = parsed['use_ai']
+    print(f"▶️  Inbox {msg.id}: {'sum' if use_ai else 'copy'} из '{chat_name}' ({source_id}){via}")
+    notify_topic = home
+    try:
+        topic_out = await main.get_or_create_topic(chat_name)
+        notify_topic = topic_out
+        action = "анализ" if use_ai else "экспорт"
+        await main.telegram_client.send_message(
+            dest, f"🔄 Начинаю {action} по команде из inbox, чат '{chat_name}'...",
+            reply_to=topic_out)
+        ok = await main.run_analysis(
+            chat_id=source_id,
+            chat_name=chat_name,
+            hours=parsed['hours'],
+            days=parsed['days'],
+            limit=parsed['limit'],
+            range_start=parsed['range_start'],
+            range_end=parsed['range_end'],
+            time_range_start=parsed['time_range_start'],
+            time_range_end=parsed['time_range_end'],
+            use_ai=use_ai,
+            post_to_source=parsed['post_to_source'],
+            post_as_telegram=parsed['post_as_telegram'],
+            scheduled=False,
+        )
+    except Exception as e:
+        ok = False
+        print(f"❌ Inbox {msg.id}: исключение при выполнении: {e}")
+
+    if ok is True:
+        await _drop_command(main, dest, msg, 'выполнено')
+        print(f"✅ Inbox {msg.id}: выполнено")
+        return 'ok'
+    print(f"❌ Inbox {msg.id}: НЕ выполнено")
+    if await _drop_command(main, dest, msg, 'провал'):
+        # Детали провала анализа уже в топике (error-path run_analysis) —
+        # здесь однострочник, чтобы не ждали впустую.
+        await _notify_inbox(main, dest, notify_topic,
+                            f"⛔ Inbox {msg.id}: не выполнено — команда удалена, повтора не будет.")
+    else:
+        _log_once(mem, f"dropfail:{msg.id}",
+                  f"⚠️ Inbox {msg.id}: команда не удалена — повторится следующим опросом")
+    return 'fail'
+
+
+async def poll_inbox_once(main, last_seen, mem):
+    """Один опрос General inbox. Возвращает (new_last_seen, failed_count).
+
+    last_seen=None → первый опрос: берём до INBOX_INITIAL_LIMIT свежих
+    (покрывает команды из межранового зазора). Дальше — только id > last_seen.
+    last_seen растёт всегда (in-memory, за ран).
+    """
     dest = main.RESULTS_DESTINATION
     if last_seen is None:
         batch = [m async for m in main.telegram_client.iter_messages(dest, limit=INBOX_INITIAL_LIMIT)]
@@ -423,116 +644,59 @@ async def poll_inbox_once(main, last_seen, mem):
 
     failed = 0
     for msg in batch:
-        text = (getattr(msg, 'text', None) or '').strip()
-        if not text:
-            continue
-        try:
-            parsed = main.parse_chat_command_args(text)
-        except Exception as e:
-            # Битый параметр ('sum abh'): не команда и не провал анализа —
-            # пропускаем, не удаляем, опрос не отравляем.
-            print(f"⚠️  Inbox {msg.id}: не удалось распарсить {text!r}: {e} — пропускаю")
-            continue
-        if parsed is None:
-            continue  # не команда — не трогаем
-
-        source_id = None
-        via = ""
-        link = extract_chat_link(text)
-        if link is not None:
-            kind, value = link
-            if kind == 'internal':
-                source_id = value
-                via = " (ссылка)"
-            else:
-                try:
-                    entity = await main.telegram_client.get_entity(value)
-                    source_id = get_peer_id(entity)
-                    via = " (ссылка)"
-                except Exception as e:
-                    _log_once(mem, f"link:{msg.id}",
-                              f"❌ Inbox {msg.id}: не резолвится ссылка {value!r}: {e} "
-                              f"(сообщение оставляю)")
-                    failed += 1
-                    continue
-        if source_id is None:
-            top_id = getattr(msg, 'reply_to_top_id', None)
-            if top_id not in (None, 1):
-                source_id = await resolve_topic_source(main, mem, dest, top_id)
-                if source_id is None:
-                    _log_once(mem, f"topic:{top_id}",
-                              f"⏭️  Inbox {msg.id}: топик {top_id} не сопоставлен "
-                              f"ни с одним чатом — пропускаю (не удаляю)")
-                    continue
-                via = " (топик)"
-            else:
-                _log_once(mem, "general",
-                          f"⏭️  Inbox {msg.id}: команда в General без ссылки — пропускаю "
-                          f"(нужна ссылка t.me/…/@… или команда в топике чата; не удаляю)")
-                continue
-
-        try:
-            chat_entity = await main.telegram_client.get_entity(source_id)
-            if getattr(chat_entity, 'title', None):
-                chat_name = chat_entity.title
-            elif getattr(chat_entity, 'first_name', None):
-                chat_name = chat_entity.first_name
-                if getattr(chat_entity, 'last_name', None):
-                    chat_name += f" {chat_entity.last_name}"
-            else:
-                chat_name = f"чат {source_id}"
-        except Exception as e:
-            _log_once(mem, f"noaccess:{msg.id}",
-                      f"❌ Inbox {msg.id}: нет доступа к чату {source_id}: {e} "
-                      f"(сообщение оставляю)")
+        if await process_inbox_message(main, mem, dest, msg) == 'fail':
             failed += 1
-            continue
-
-        use_ai = parsed['use_ai']
-        print(f"▶️  Inbox {msg.id}: {'sum' if use_ai else 'copy'} из '{chat_name}' ({source_id}){via}")
-        try:
-            topic_id = await main.get_or_create_topic(chat_name)
-            action = "анализ" if use_ai else "экспорт"
-            await main.telegram_client.send_message(
-                dest, f"🔄 Начинаю {action} по команде из inbox, чат '{chat_name}'...",
-                reply_to=topic_id)
-            ok = await main.run_analysis(
-                chat_id=source_id,
-                chat_name=chat_name,
-                hours=parsed['hours'],
-                days=parsed['days'],
-                limit=parsed['limit'],
-                range_start=parsed['range_start'],
-                range_end=parsed['range_end'],
-                time_range_start=parsed['time_range_start'],
-                time_range_end=parsed['time_range_end'],
-                use_ai=use_ai,
-                post_to_source=parsed['post_to_source'],
-                post_as_telegram=parsed['post_as_telegram'],
-                scheduled=False,
-            )
-        except Exception as e:
-            ok = False
-            print(f"❌ Inbox {msg.id}: исключение при выполнении: {e}")
-
-        if ok is True:
-            try:
-                await main.telegram_client.delete_messages(dest, [msg.id])
-                print(f"✅ Inbox {msg.id}: выполнено, команда удалена")
-            except Exception as e:
-                print(f"⚠️ Inbox {msg.id}: выполнено, но удалить команду не удалось: {e}")
-        else:
-            failed += 1
-            _log_once(mem, f"fail:{msg.id}",
-                      f"❌ Inbox {msg.id}: НЕ выполнено — сообщение оставляю (будет повторено)")
 
     return new_last_seen, failed
+
+
+async def poll_topics_once(main, mem, dest):
+    """Скан команд в топиках. Возвращает число провалов.
+
+    Опрос General сообщений из топиков не видит (GetHistory без топика),
+    поэтому свежесть отслеживаем сами: {top_id: top_message} из GetForumTopics
+    против mem['topics_seen']. Новых кандидатов добираем через get_messages
+    по id (этот метод топики видит), кап TOPIC_SCAN_DEPTH. seen растёт всегда.
+    """
+    if dest == 'me':
+        return 0
+    titles, tops = await fetch_forum_topics(main, dest)
+    mem['topics'] = titles
+    seen = mem.setdefault('topics_seen', {})
+    failed = 0
+    for tid in sorted(tops):
+        if tid == 1:
+            continue  # General покрыт опросом inbox
+        top = tops[tid]
+        prev = seen.get(tid)
+        if prev is not None and top <= prev:
+            continue
+        ids = [top] if prev is None else \
+            list(range(max(prev + 1, top - TOPIC_SCAN_DEPTH + 1), top + 1))
+        try:
+            got = await main.telegram_client.get_messages(dest, ids=ids)
+        except Exception as e:
+            print(f"⚠️ Inbox: не удалось прочитать топик {tid}: {e}")
+            continue
+        msgs = [got] if not isinstance(got, list) else got
+        cand = sorted(
+            (m for m in msgs
+             if m is not None
+             and getattr(m, 'reply_to_top_id', None) == tid
+             and (getattr(m, 'text', None) or '').strip()),
+            key=lambda m: m.id)
+        for m in cand:
+            if await process_inbox_message(main, mem, dest, m, topic_id=tid) == 'fail':
+                failed += 1
+        seen[tid] = top
+    return failed
 
 
 async def run_watch(main, args):
     """Цикл §1 плана: due-задачи + опрос inbox до дедлайна, disconnect один раз."""
     path = state_path()
     state = load_state(path)
+    restore_key_cursor(main, state)
 
     try:
         await main.telegram_client.start(phone=main.PHONE)
@@ -556,11 +720,20 @@ async def run_watch(main, args):
                 failed_total += inbox_failed
             except Exception as e:
                 print(f"⚠️ Ошибка опроса inbox (итерация {iteration}): {e}")
+            try:
+                failed_total += await poll_topics_once(main, inbox_mem, main.RESULTS_DESTINATION)
+            except Exception as e:
+                print(f"⚠️ Ошибка скана топиков (итерация {iteration}): {e}")
             now = time.monotonic()
             if now >= deadline:
                 break
             await asyncio.sleep(min(args.poll_interval, deadline - now))
     finally:
+        store_key_cursor(main, state)
+        try:
+            save_state(path, state)
+        except Exception as e:
+            print(f"⚠️ Не удалось сохранить state: {e}")
         try:
             await main.telegram_client.disconnect()
         except Exception as e:
@@ -584,6 +757,9 @@ async def run_manual(main, args):
     print(f"▶️  Ручной прогон: chat {args.chat_id}, период {clean}"
           + (" (+в исходный чат)" if post_to_source else "")
           + (" (как TG-сообщение)" if post_as_telegram else ""))
+    path = state_path()
+    state = load_state(path)
+    restore_key_cursor(main, state)
     try:
         await main.telegram_client.start(phone=main.PHONE)
     except Exception as e:
@@ -596,6 +772,11 @@ async def run_manual(main, args):
     except Exception as e:
         print(f"❌ Исключение при выполнении: {e}")
     finally:
+        store_key_cursor(main, state)
+        try:
+            save_state(path, state)
+        except Exception as e:
+            print(f"⚠️ Не удалось сохранить state: {e}")
         try:
             await main.telegram_client.disconnect()
         except Exception as e:

@@ -429,6 +429,27 @@ def should_rotate_key_for_error(error_message):
     )
 
 
+def is_transient_server_error(error_str):
+    """Транзиентный сбой сервера (перегрузка/таймаут), а не квота/доступ.
+
+    Такие ошибки гасятся ретраями на том же ключе, а после их исчерпания —
+    ротацией на следующий ключ (другой бакет квоты/бэкенд). 429 сюда
+    намеренно НЕ входит: rate-limit обрабатывается штатным путём
+    (same-key ретраи → quota-stop в чанковом цикле).
+    """
+    if not error_str:
+        return False
+    if 'unavailable' in error_str.lower() or 'timeout' in error_str.lower():
+        return True
+    return re.search(r'\b(500|502|503|504)\b', error_str) is not None
+
+
+# Сколько раз за один Gemini-вызов можно уйти на следующий ключ
+# по транзиентной серверной ошибке (кап, чтобы не уйти в марафон
+# на 9 ключах внутри 12-минутного джоба).
+MAX_SERVER_ROTATIONS = 3
+
+
 async def execute_gemini_request(request_params):
     """
     Выполняет запрос к Gemini с retry при временных сбоях и ротацией ключей при ошибках квоты/доступа.
@@ -436,6 +457,7 @@ async def execute_gemini_request(request_params):
     last_error = None
     attempts = max(1, len(GOOGLE_API_KEYS))
     max_retries_per_key = 3
+    server_rotations = 0
 
     for attempt_idx in range(attempts):
         for retry in range(max_retries_per_key):
@@ -454,6 +476,15 @@ async def execute_gemini_request(request_params):
                     print(f"   ⚠️  Сервер перегружен/таймаут. Повтор через {delay}с (попытка {retry + 2}/{max_retries_per_key})...")
                     await asyncio.sleep(delay)
                     continue
+
+                # Ретраи на том же ключе исчерпаны, а сбой транзиентный
+                # (503/таймаут, НЕ квота) — пробуем следующий ключ.
+                if (is_transient_server_error(error_str)
+                        and attempt_idx < attempts - 1
+                        and server_rotations < MAX_SERVER_ROTATIONS):
+                    server_rotations += 1
+                    rotate_google_api_key("сервер перегружен/таймаут, пробуем следующий ключ")
+                    break  # выходим из retry-цикла, пробуем следующий ключ
 
                 # Ошибки аутентификации — ротация ключа
                 if isinstance(e, AuthenticationError):
@@ -799,6 +830,23 @@ def select_google_api_key_for_new_analysis():
     print("🔄 Выбор Google API key для нового анализа")
     print(f"   🔑 Активный ключ: {mask_api_key(active_key)} ({current_google_key_index + 1}/{len(GOOGLE_API_KEYS)})")
     return active_key
+
+
+def get_google_key_cursor():
+    """Монотонный счётчик выбора ключей — персистится между ранами (state)."""
+    return google_analysis_counter
+
+
+def set_google_key_cursor(value):
+    """Восстановить счётчик из state: следующий анализ возьмёт cursor % len."""
+    global google_analysis_counter
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return
+    if v < 0:
+        return
+    google_analysis_counter = v
 
 
 google_client = create_google_client(get_current_google_api_key())

@@ -107,6 +107,10 @@ def main():
     test_watch_args()
     test_inbox_no_poison()
     test_inbox_v2_flows()
+    test_topic_scan()
+    test_topic_scan_fail()
+    test_key_cursor()
+    test_503_rotates_key()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")
@@ -285,8 +289,14 @@ def test_inbox_no_poison():
     check('inbox poison: only valid cmd deleted', client.deleted == [4], client.deleted)
 
 
-def _make_v2_fakes():
-    """Фейки для inbox v2: батчи задаются через client.batches."""
+def _make_inbox_fakes(run_ok=True):
+    """Честные фейки inbox (видимость как в проде):
+
+    - iter_messages отдаёт ТОЛЬКО General (прод: GetHistory без топика);
+    - топики — через get_messages(ids=) и GetForumTopics(top_message);
+    - send_message пишет в client.sent для проверки диагностики.
+    """
+    from types import SimpleNamespace
 
     class FakeMsg:
         def __init__(self, id, text, reply_to_top_id=None):
@@ -300,23 +310,37 @@ def _make_v2_fakes():
 
     class FakeClient:
         def __init__(self):
-            self.batches = []
+            self.general = []   # [(id, text, top)] — только General
+            self.pool = {}      # id -> FakeMsg (для get_messages по топикам)
+            self.topics = []    # (topic_id, title, top_message)
             self.deleted = []
-            self.calls = 0
+            self.sent = []      # (dest, text, reply_to)
+
+        async def __call__(self, request):
+            # GetForumTopicsRequest → объект с .topics (id/title/top_message)
+            return SimpleNamespace(topics=[
+                SimpleNamespace(id=tid, title=title, top_message=top)
+                for tid, title, top in self.topics])
 
         async def iter_messages(self, dest, limit=None, min_id=None):
-            batch = self.batches[min(self.calls, len(self.batches) - 1)]
-            self.calls += 1
-            for m in batch:
-                if min_id is not None and m.id <= min_id:
-                    continue
+            msgs = sorted(self.general, key=lambda m: m.id)
+            if min_id is not None:
+                msgs = [m for m in msgs if m.id > min_id]
+            if limit is not None:
+                msgs = msgs[-int(limit):]
+            for m in msgs:
                 yield m
+
+        async def get_messages(self, dest, ids=None):
+            # Только id из запроса: топик-скан не подглядывает чужие сообщения
+            return [self.pool[i] for i in (ids or []) if i in self.pool]
 
         async def get_entity(self, peer):
             return FakeEntity({-1001892263845: 'LinkChat',
                                -100111: 'PairChat'}.get(peer, f'чат {peer}'))
 
         async def send_message(self, dest, text, reply_to=None):
+            self.sent.append((dest, text, reply_to))
             return None
 
         async def delete_messages(self, dest, ids):
@@ -326,33 +350,34 @@ def _make_v2_fakes():
         RESULTS_DESTINATION = 'test-inbox'
         parse_chat_command_args = staticmethod(bot.parse_chat_command_args)
 
-        def __init__(self, client):
+        def __init__(self, client, run_ok=True):
             self.telegram_client = client
             self.ran = []
+            self.run_ok = run_ok
 
         async def get_or_create_topic(self, name):
             return 1
 
         async def run_analysis(self, **kw):
             self.ran.append(kw)
-            return True
+            return self.run_ok
 
     client = FakeClient()
-    return FakeMsg, client, FakeMain(client)
+    return FakeMsg, client, FakeMain(client, run_ok=run_ok)
 
 
 def test_inbox_v2_flows():
     """v2: ссылка в General и команда в топике выполняются и удаляются;
-    неизвестный топик и команда без ссылки — пропуск без удаления."""
+    неизвестный топик и команда без ссылки — провал: удаление + диагностика."""
     import io
     import contextlib
-    FakeMsg, client, fake = _make_v2_fakes()
-    client.batches = [[
+    FakeMsg, client, fake = _make_inbox_fakes()
+    client.general = [
         FakeMsg(10, 'sum20 https://t.me/c/1892263845/50'),
         FakeMsg(11, 'sum10', reply_to_top_id=7),
         FakeMsg(12, 'sum5', reply_to_top_id=9),
         FakeMsg(13, 'sum5'),
-    ]]
+    ]
     mem = run_once.new_inbox_mem()
     # Предзаполняем кэши (fetch_* — тонкие обёртки Telethon, их гоняет E2E).
     mem['topics'] = {7: 'PairChat', 9: 'Mystery'}
@@ -362,18 +387,26 @@ def test_inbox_v2_flows():
     with contextlib.redirect_stdout(buf):
         ls, failed = loop.run_until_complete(run_once.poll_inbox_once(fake, None, mem))
     out = buf.getvalue()
-    check('v2: batch consumed', ls == 13 and failed == 0, (ls, failed))
-    check('v2: ссылка выполнена', len(fake.ran) == 2, fake.ran)
+    check('v2: batch consumed', ls == 13 and failed == 2, (ls, failed))
+    check('v2: ссылка+топик выполнены', len(fake.ran) == 2, fake.ran)
     by_chat = {kw['chat_id']: kw for kw in fake.ran}
     check('v2: ссылка даёт лимит+чат',
           by_chat.get(-1001892263845, {}).get('limit') == 20, by_chat)
     check('v2: топик даёт чат из диалогов',
           by_chat.get(-100111, {}).get('limit') == 10, by_chat)
-    check('v2: удалены только выполненные', client.deleted == [10, 11], client.deleted)
+    check('v2: удалены все командные (успех и провал)',
+          client.deleted == [10, 11, 12, 13], client.deleted)
     check('v2: неизвестный топик залогирован',
           out.count('топик 9 не сопоставлен') == 1, out)
     check('v2: команда без ссылки залогирована',
           out.count('без ссылки') == 1, out)
+    # Диагностика провалов: msg 12 → в топик 9 (reply_to=9), msg 13 → General
+    diag12 = [t for (_d, t, r) in client.sent if r == 9 and 'не сопоставлен' in t]
+    diag13 = [t for (_d, t, r) in client.sent if r is None and 'без ссылки' in t]
+    check('v2: диагностика нерезолвленного топика', len(diag12) == 1, client.sent)
+    check('v2: диагностика General без ссылки', len(diag13) == 1, client.sent)
+    check('v2: диагностика говорит про удаление',
+          diag12 and 'повтора не будет' in diag12[0], diag12)
 
     # _log_once: повторный прогон тех же причин — молчит.
     mem2 = run_once.new_inbox_mem()
@@ -384,6 +417,183 @@ def test_inbox_v2_flows():
     with contextlib.redirect_stdout(buf2):
         run_once._log_once(mem2, 'topic:9', 'LINE')
     check('v2: повторный лог подавлен', buf2.getvalue() == '', buf2.getvalue())
+
+
+def test_topic_scan():
+    """Пер-топик скан: General топики не видит, скан их ловит;
+    первый взгляд = top_message, рост топика = range-добор."""
+    import io
+    import contextlib
+    FakeMsg, client, fake = _make_inbox_fakes()
+    client.general = []  # General пуст — топик-сообщения в него не попадают
+    client.topics = [(7, 'PairChat', 100)]
+    client.pool = {
+        100: FakeMsg(100, 'sum10', reply_to_top_id=7),
+        101: FakeMsg(101, 'sum5', reply_to_top_id=7),
+        102: FakeMsg(102, 'hello', reply_to_top_id=7),
+        103: FakeMsg(103, 'sum99'),  # General-сообщение — топик-скан его не берёт
+    }
+    mem = run_once.new_inbox_mem()
+    mem['dialogs'] = {'PairChat': -100111}
+    loop = asyncio.get_event_loop()
+    with contextlib.redirect_stdout(io.StringIO()):
+        ls, gfailed = loop.run_until_complete(
+            run_once.poll_inbox_once(fake, None, mem))
+        f1 = loop.run_until_complete(
+            run_once.poll_topics_once(fake, mem, 'test-inbox'))
+    check('scan: опрос General топики не видит', ls is None and gfailed == 0,
+          (ls, gfailed))
+    check('scan: первый взгляд — только top_message',
+          [kw['limit'] for kw in fake.ran] == [10], fake.ran)
+    check('scan: топик → чат PairChat',
+          fake.ran and fake.ran[0]['chat_id'] == -100111, fake.ran)
+    check('scan: команда удалена', client.deleted == [100], client.deleted)
+    check('scan: seen закреплён', mem['topics_seen'].get(7) == 100,
+          mem['topics_seen'])
+
+    # Топик вырос: 101 (команда) и 102 (не команда) — range-добор от seen+1
+    client.topics = [(7, 'PairChat', 102)]
+    with contextlib.redirect_stdout(io.StringIO()):
+        loop.run_until_complete(run_once.poll_topics_once(fake, mem, 'test-inbox'))
+    limits = [kw['limit'] for kw in fake.ran]
+    check('scan: рост топика → range-добор', limits == [10, 5], limits)
+    check('scan: удалены обе команды', client.deleted == [100, 101],
+          client.deleted)
+    check('scan: seen обновлён', mem['topics_seen'][7] == 102,
+          mem['topics_seen'])
+
+    # Без изменений — пусто (никаких повторных выполнений)
+    with contextlib.redirect_stdout(io.StringIO()):
+        loop.run_until_complete(run_once.poll_topics_once(fake, mem, 'test-inbox'))
+    check('scan: без изменений — ничего', len(fake.ran) == 2, fake.ran)
+
+
+def test_topic_scan_fail():
+    """Провал в топике: команда удаляется, диагностика идёт в топик-источник."""
+    import io
+    import contextlib
+    FakeMsg, client, fake = _make_inbox_fakes(run_ok=False)
+    client.topics = [(7, 'PairChat', 200)]
+    client.pool = {200: FakeMsg(200, 'sum10', reply_to_top_id=7)}
+    mem = run_once.new_inbox_mem()
+    mem['dialogs'] = {'PairChat': -100111}
+    loop = asyncio.get_event_loop()
+    with contextlib.redirect_stdout(io.StringIO()):
+        failed = loop.run_until_complete(
+            run_once.poll_topics_once(fake, mem, 'test-inbox'))
+    check('scan-fail: провал посчитан', failed == 1, failed)
+    check('scan-fail: команда удалена', client.deleted == [200], client.deleted)
+    # Источник известен → диагностика в топик-результатов источника;
+    # фейк get_or_create_topic возвращает 1 = General (reply_to=None).
+    diag = [t for (_d, t, r) in client.sent if r is None and '⛔' in t]
+    check('scan-fail: диагностика в топик-результатов',
+          len(diag) == 1 and 'повтора не будет' in diag[0], client.sent)
+
+
+def test_key_cursor():
+    """Курсор ключей: переживает перезапуск через state, мусор → 0."""
+    saved = (bot.google_analysis_counter, bot.current_google_key_index,
+             list(bot.GOOGLE_API_KEYS), bot.google_client)
+    try:
+        bot.GOOGLE_API_KEYS = ['a', 'b', 'c']
+        bot.google_analysis_counter = 7
+        st = {'completed': {}}
+        run_once.store_key_cursor(bot, st)
+        check('cursor: записан в state',
+              st.get(run_once.KEY_CURSOR_STATE_FIELD) == 7, st)
+        bot.google_analysis_counter = 0
+        run_once.restore_key_cursor(bot, st)
+        check('cursor: восстановлен', bot.get_google_key_cursor() == 7,
+              bot.get_google_key_cursor())
+        # Продолжение ротации: 7 % 3 = 1 → ключ 2/3
+        bot.select_google_api_key_for_new_analysis()
+        check('cursor: следующий выбор — ключ 2/3',
+              bot.current_google_key_index == 1, bot.current_google_key_index)
+        # Мусор/отрицательное → 0, не падает
+        run_once.restore_key_cursor(bot, {'google_key_cursor': 'xx'})
+        check('cursor: мусор → 0', bot.get_google_key_cursor() == 0)
+        run_once.restore_key_cursor(bot, {'google_key_cursor': -5})
+        check('cursor: отрицательный → 0', bot.get_google_key_cursor() == 0)
+        # main без хелперов (старые фейки) — молча пропускаем
+        class NoCursor:
+            GOOGLE_API_KEYS = ['x']
+        run_once.restore_key_cursor(NoCursor(), {'google_key_cursor': 5})
+        check('cursor: main без хелперов не падает', True)
+    finally:
+        (bot.google_analysis_counter, bot.current_google_key_index,
+         bot.GOOGLE_API_KEYS, bot.google_client) = saved
+
+
+def test_503_rotates_key():
+    """503 после same-key ретраев уводит на следующий ключ; 429 — нет."""
+    saved = (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
+             bot.google_analysis_counter, bot.google_client, bot.asyncio.sleep)
+    saved_set_index = bot.set_google_api_key_index
+    sleeps = []
+    calls = {'n': 0}
+    err503 = {'raise': True}
+
+    async def fake_sleep(sec):
+        sleeps.append(sec)
+
+    class FakeCompletions:
+        async def create(self, **kw):
+            calls['n'] += 1
+            if err503['raise'] and calls['n'] <= 3:
+                raise Exception(
+                    "Error code: 503 - high demand, status UNAVAILABLE")
+            if not err503['raise']:
+                raise Exception("Error code: 429 - rate limit exceeded")
+            return 'OK'
+
+    class FakeClient:
+        chat = type('C', (), {'completions': FakeCompletions()})()
+
+    def fake_set_index(idx):
+        bot.current_google_key_index = idx % len(bot.GOOGLE_API_KEYS)
+
+    loop = asyncio.get_event_loop()
+    try:
+        bot.GOOGLE_API_KEYS = ['k1', 'k2', 'k3']
+        bot.current_google_key_index = 0
+        bot.google_analysis_counter = 0
+        bot.asyncio.sleep = fake_sleep
+        bot.google_client = FakeClient()
+        bot.set_google_api_key_index = fake_set_index
+
+        with _quiet():
+            result = loop.run_until_complete(bot.execute_gemini_request({}))
+        check('503: успех со второго ключа', result == 'OK', result)
+        check('503: ротация на ключ 2/3',
+              bot.current_google_key_index == 1, bot.current_google_key_index)
+        check('503: попыток 4 (3×503 + успех)', calls['n'] == 4, calls)
+        check('503: паузы same-key ретраев', sleeps == [10, 20], sleeps)
+
+        # 429: same-key ретраи, ротации НЕТ (все вызовы падают → raise)
+        calls['n'] = 0
+        sleeps.clear()
+        err503['raise'] = False
+        bot.current_google_key_index = 0
+        try:
+            with _quiet():
+                loop.run_until_complete(bot.execute_gemini_request({}))
+            check('429: должен был raise', False)
+        except Exception:
+            check('429: без ротации — raise после ретраев',
+                  bot.current_google_key_index == 0 and calls['n'] == 3,
+                  (bot.current_google_key_index, calls))
+    finally:
+        (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
+         bot.google_analysis_counter, bot.google_client,
+         bot.asyncio.sleep) = saved
+        bot.set_google_api_key_index = saved_set_index
+
+
+def _quiet():
+    """Контекстный менеджер: подавить stdout для тихих прогонов."""
+    import contextlib
+    import io
+    return contextlib.redirect_stdout(io.StringIO())
 
 
 if __name__ == '__main__':
