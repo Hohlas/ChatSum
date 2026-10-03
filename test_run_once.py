@@ -7,6 +7,7 @@
 
 import asyncio
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 
@@ -101,6 +102,7 @@ def main():
           s3['completed'])
 
     test_parser()
+    test_bundle_keys()
     test_resolve_source()
     test_watch_args()
     test_inbox_no_poison()
@@ -155,6 +157,31 @@ def test_parser():
     for txt in ['sum100', 'sum 100-800', 'sum12h', 'copy1d', 'sum1d+', 'sum', 'copy 50']:
         a, b = p(txt), p('/' + txt)
         check(f'parse slash-parity {txt!r}', a == b, (a, b))
+
+
+def test_bundle_keys():
+    """Сводный GOOGLE_API_KEYS: любое число ключей, разделители , ; пробел \n,
+    порядок primary → indexed(численно) → bundle, дубликаты режутся."""
+    saved = dict(os.environ)
+    try:
+        for k in list(os.environ):
+            if k == 'GOOGLE_API_KEY' or k == 'GOOGLE_API_KEYS' \
+                    or re.fullmatch(r'GOOGLE_API_KEY\d+', k):
+                del os.environ[k]
+        os.environ['GOOGLE_API_KEY'] = 'primary'
+        os.environ['GOOGLE_API_KEY10'] = 'k10'
+        os.environ['GOOGLE_API_KEY2'] = 'k2'
+        os.environ['GOOGLE_API_KEYS'] = 'b1,b2\nb3 ; b1'
+        keys = bot.load_google_api_keys()
+        check('bundle: порядок + дедуп',
+              keys == ['primary', 'k2', 'k10', 'b1', 'b2', 'b3'], keys)
+        os.environ['GOOGLE_API_KEYS'] = '  ,, \n '
+        keys2 = bot.load_google_api_keys()
+        check('bundle: пустой bundle игнорируется',
+              keys2 == ['primary', 'k2', 'k10'], keys2)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
 
 
 def test_resolve_source():

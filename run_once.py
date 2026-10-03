@@ -174,11 +174,13 @@ def preflight_actions_env():
         ('TELEGRAM_API_HASH', 'TELEGRAM_API_HASH'),
         ('TELEGRAM_PHONE', 'TELEGRAM_PHONE'),
         ('TELEGRAM_SESSION', 'TELEGRAM_SESSION (StringSession)'),
-        ('GOOGLE_API_KEY', 'GOOGLE_API_KEY'),
     ]:
         if not os.getenv(var, '').strip():
             print(f"❌ Не задан {label}. Проверьте Secrets в настройках репозитория.")
             ok = False
+    if not os.getenv('GOOGLE_API_KEY', '').strip() and not os.getenv('GOOGLE_API_KEYS', '').strip():
+        print("❌ Не задан GOOGLE_API_KEY (или сводный GOOGLE_API_KEYS). Проверьте Secrets в настройках репозитория.")
+        ok = False
     return ok
 
 

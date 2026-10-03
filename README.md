@@ -30,6 +30,10 @@ Telegram userbot для сбора сообщений из чата и созд�
 6. Запустите `python3 main.py`.
 7. В Telegram отправьте в нужный чат `/sum 12h`.
 
+Шаги 3–4 делает за вас `./setup.sh`.
+А если нужен бесплатный GitHub Actions вместо VPS — раздел
+«Запуск на GitHub Actions → Форк за 10 минут».
+
 Ниже все то же самое, но подробно.
 
 ## Установка для новичков
@@ -531,25 +535,62 @@ sudo systemctl status telegram-bot
 ## Запуск на GitHub Actions
 
 Тот же код может работать на GitHub Actions вместо VPS: ежедневные саммари из
-`SCHEDULE.txt` запускаются по cron (`*/5`, UTC), раннер сам определяет, какие
+`SCHEDULE.txt` запускаются по cron (`*/10`, UTC), раннер сам определяет, какие
 задания «должны» в МСК, и не повторяет уже выполненные (дедупликация через
-ветку `state`). Интерактивные команды (`/sum`, `/config` и т.п.) при этом
-недоступны — расписание меняется правкой `SCHEDULE.txt` и push.
+ветку `state`). Разовые команды тоже есть: пересланное сообщение + `sum50`
+в General канала результатов выполняется следующим раном (опрос inbox,
+без долгоживущего процесса).
+
+### Форк за 10 минут
+
+```bash
+# 1. Форк кнопкой Fork на GitHub, затем клонируйте СВОЙ форк:
+git clone https://github.com/<ВЫ>/ChatSum.git
+cd ChatSum
+# 2. Форк должен быть PUBLIC (Settings → General → Change visibility):
+#    на private-репо cron быстро съест бесплатные минуты Actions.
+./setup.sh                  # venv + зависимости + заготовка private.txt
+# ... заполните private.txt (ключи: my.telegram.org, aistudio.google.com)
+./venv/bin/python gen_session.py   # один раз: ввести код из Telegram
+gh auth login               # один раз: доступ gh к вашему форку
+./push_github_secrets.sh           # секреты и переменные — в ваш репозиторий
+```
+
+Что делают скрипты:
+
+- `setup.sh` — проверяет Python 3.10+, создаёт/чинит `venv`, ставит
+  `requirements.txt`, создаёт `private.txt` из примера, проверяет наличие `gh`.
+- `gen_session.py` — печатает StringSession **и** сохраняет её
+  в `telegram_session.txt` (gitignored) для следующего шага.
+- `push_github_secrets.sh` — читает `private.txt` и сессию, заливает Secrets
+  (`TELEGRAM_*`, `GOOGLE_API_KEY*`) и Variables (`GEMINI_*`) в репозиторий
+  из git remote (переопределить: `--repo OWNER/REPO`; предпросмотр:
+  `--dry-run`). Все `GOOGLE_API_KEY<N>` забираются сколько бы их ни было
+  (1 или 20+) + собирается сводный `GOOGLE_API_KEYS` без потолка.
+  Сессия берётся из `--session`, env `TELEGRAM_SESSION`,
+  `telegram_session.txt` или интерактивного ввода. Значения никогда не печатаются.
+
+Дальше: поправьте `SCHEDULE.txt`, запушьте в `main` и запустите вручную
+из `Actions → ChatSum scheduled summaries → Run workflow` (или дождитесь
+ближайшего cron-запуска). Проверка inbox: форвард + `sum50` в General канала
+результатов → саммари появляется, команда удаляется.
 
 ### Выбор площадки
 
 | | VPS | GitHub Actions |
 |---|---|---|
-| Точка входа | `python3 main.py` (долгоживущий процесс) | `run_once.py --due` (cron) |
+| Точка входа | `python3 main.py` (долгоживущий процесс) | `run_once.py --watch` (cron) |
 | Сессия | файловая `session_name.session` | StringSession в секрете `TELEGRAM_SESSION` |
-| Команды `/sum`, `/config` и т.п. | ✅ | ❌ |
+| Команды | `/sum`, `/copy`, `/config` вживую | `sum`/`copy` через inbox-форвард (опрос), `/config` нет |
 | Стоимость | сервер | бесплатно на public-репо |
 
 ⚠️ **Используйте одну площадку за раз.** Одновременная работа двух процессов
 с одной сессией Telegram не поддерживается: возможен рассинхрон состояния
 апдейтов и разрыв авторизации.
 
-### Настройка
+### Настройка вручную (без скриптов)
+
+Если `push_github_secrets.sh` не подходит:
 
 1. Проверьте visibility репозитория: для `schedule`-триггеров cron и
    бесплатных минут подходит **public**-репозиторий (`Settings → General →
@@ -561,7 +602,7 @@ sudo systemctl status telegram-bot
    - `TELEGRAM_PHONE` — номер аккаунта;
    - `TELEGRAM_SESSION` — сгенерируйте один раз локально:
      ```bash
-     python3 gen_session.py
+     ./venv/bin/python gen_session.py
      ```
      Скопируйте вывод (длинная строка) в секрет `TELEGRAM_SESSION`.
      Не коммитьте эту строку. Перевыпускается, если пароль/сессия были изменены.
@@ -581,12 +622,16 @@ sudo systemctl status telegram-bot
 ### Как это работает
 
 - `.github/workflows/summarize.yml` ставит env из Secrets/Variables и вызывает
-  `python run_once.py --due`.
+  `python run_once.py --watch` (цикл ~8 мин: due-задачи + опрос inbox).
 - `run_once.py` читает `SCHEDULE.txt`, `PROMPT.txt`, `EXCLUDED_USERS.txt`,
   `PRIORITY_USERS.txt` из репозитория; `MODEL_CONFIG.txt` в репозитории нет —
   при отсутствии используется HTML-экспорт по умолчанию, а модель берётся из
   `GEMINI_MODEL`. Если нужно управлять `USE_HTML_EXPORT` через git — добавьте
   `MODEL_CONFIG.txt` в репозиторий.
+- Inbox: сообщение вида `sum50`/`copy1d` с форвардом из чата-источника
+  (или ответом на форвард) в General канала результатов выполняется ближайшим
+  раном через то же ядро, что VPS-команды; обработанная команда удаляется.
+  Без форварда команда игнорируется и не удаляется.
 - Окно «должных» заданий: `[now(МСК) − LAG_MAX, now(МСК)]`, по умолчанию
   `LAG_MAX=15` минут. Задания не раньше этого окна не запускаются (защита от
   повторов после долгой паузы).

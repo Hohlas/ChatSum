@@ -71,6 +71,9 @@ def validate_config():
         for key, value in os.environ.items()
         if re.fullmatch(r'GOOGLE_API_KEY\d+', key) and value.strip()
     ]
+    bundle_google_keys = [
+        k for k in re.split(r'[\s,;]+', os.getenv('GOOGLE_API_KEYS', '')) if k.strip()
+    ]
     gemini_model = os.getenv('GEMINI_MODEL', '').strip()
     
     # Список заглушек, которые могут быть в шаблоне
@@ -102,9 +105,9 @@ def validate_config():
         errors.append("TELEGRAM_PHONE должен начинаться с '+' (например, +79001234567)")
     
     # Проверка GOOGLE_API_KEY
-    valid_google_keys = [k for k in ([google_key] + extra_google_keys) if k and k not in placeholders]
+    valid_google_keys = [k for k in ([google_key] + extra_google_keys + bundle_google_keys) if k and k not in placeholders]
     if not valid_google_keys:
-        errors.append("Не найден ни один валидный GOOGLE_API_KEY / GOOGLE_API_KEYN")
+        errors.append("Не найден ни один валидный GOOGLE_API_KEY / GOOGLE_API_KEYN / GOOGLE_API_KEYS")
     
     # Проверка GEMINI_MODEL
     if not gemini_model or gemini_model in placeholders:
@@ -117,6 +120,8 @@ def load_google_api_keys():
     """
     Загружает список Google API ключей из private.txt / environment.
     Поддерживает GOOGLE_API_KEY, GOOGLE_API_KEY1, GOOGLE_API_KEY2, ...
+    (любое количество) и сводный GOOGLE_API_KEYS — ключи через запятую,
+    точку с запятой, пробелы или переносы строк (им тоже нет потолка).
     """
     keys = []
 
@@ -133,6 +138,10 @@ def load_google_api_keys():
 
     indexed_keys.sort(key=lambda item: int(re.search(r'(\d+)$', item[0]).group(1)))
     keys.extend([value for _, value in indexed_keys])
+
+    bundle = os.getenv('GOOGLE_API_KEYS', '')
+    if bundle:
+        keys.extend([k for k in re.split(r'[\s,;]+', bundle) if k.strip()])
 
     # Убираем дубликаты с сохранением порядка
     unique_keys = []

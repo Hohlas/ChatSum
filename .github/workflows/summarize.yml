@@ -53,6 +53,7 @@ jobs:
           GOOGLE_API_KEY1:   ${{ secrets.GOOGLE_API_KEY1 }}
           GOOGLE_API_KEY2:   ${{ secrets.GOOGLE_API_KEY2 }}
           GOOGLE_API_KEY3:   ${{ secrets.GOOGLE_API_KEY3 }}
+          GOOGLE_API_KEYS:   ${{ secrets.GOOGLE_API_KEYS }}
           GEMINI_MODEL:      ${{ vars.GEMINI_MODEL }}
           GEMINI_TEMPERATURE:      ${{ vars.GEMINI_TEMPERATURE }}
           GEMINI_REASONING_EFFORT: ${{ vars.GEMINI_REASONING_EFFORT }}

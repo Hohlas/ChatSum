@@ -209,6 +209,7 @@ __marimo__/
 *.session
 *.session-journal
 private.txt
+telegram_session.txt
 *.code-workspace
 
 # GitHub Actions state (ветка state, локально не хранится)

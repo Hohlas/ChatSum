@@ -62,7 +62,7 @@ sum100 | sum100-800 | sum12h | sum1d | copy100 | copy1d ... [+/-]
 
 ## 4. Секреты и переменные (без изменений)
 
-Secrets: `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_PHONE`, `TELEGRAM_SESSION` (StringSession из `gen_session.py`), `GOOGLE_API_KEY` (+ опц. `GOOGLE_API_KEY1..3`), опц. `TELEGRAM_GROUP_ID`. Variables (публичные): `GEMINI_MODEL=gemini-2.5-flash`, `GEMINI_TEMPERATURE=0`, `GEMINI_REASONING_EFFORT=none`, `GEMINI_CHUNK_MAX_CHARS=60000`. Push в `state` — встроенным `GITHUB_TOKEN` (`permissions: contents: write`).
+Secrets: `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_PHONE`, `TELEGRAM_SESSION` (StringSession из `gen_session.py`), `GOOGLE_API_KEY` (+ опц. `GOOGLE_API_KEY1..N` — любое число, потолка нет; `push_github_secrets.sh` собирает их все в сводный `GOOGLE_API_KEYS`, workflow прокидывает оба варианта), опц. `TELEGRAM_GROUP_ID`. Variables (публичные): `GEMINI_MODEL=gemini-2.5-flash`, `GEMINI_TEMPERATURE=0`, `GEMINI_REASONING_EFFORT=none`, `GEMINI_CHUNK_MAX_CHARS=60000`. Push в `state` — встроенным `GITHUB_TOKEN` (`permissions: contents: write`).
 
 ## 5. Почему внутренний шаг 60 сек (не меньше)
 
@@ -99,7 +99,8 @@ gh secret set TELEGRAM_API_HASH  --repo Hohlas/ChatSum
 gh secret set TELEGRAM_PHONE     --repo Hohlas/ChatSum
 gh secret set TELEGRAM_SESSION   --repo Hohlas/ChatSum
 gh secret set GOOGLE_API_KEY     --repo Hohlas/ChatSum
-# опционально: GOOGLE_API_KEY1..3
+# опционально: GOOGLE_API_KEY1..N (сколько угодно) — или просто
+# ./push_github_secrets.sh: он запушит все найденные + сводный GOOGLE_API_KEYS
 
 # 3) Переменные (публичные)
 gh variable set GEMINI_MODEL            --body "gemini-2.5-flash" --repo Hohlas/ChatSum
