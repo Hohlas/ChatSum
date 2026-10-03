@@ -41,7 +41,21 @@ fi
 if [ -z "$REPO" ]; then
   REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
   if [ -z "$REPO" ]; then
-    echo "❌ Не удалось определить репозиторий. Укажите явно: $0 --repo OWNER/REPO"
+    # Fallback без API (переживает сбои сети): парсим origin локально.
+    origin_url="$(git remote get-url origin 2>/dev/null || true)"
+    REPO="$(printf '%s' "$origin_url" | sed -E -e 's#^https?://[^/]*@#https://#' -e 's#^(https?://github.com/|git@github.com:)##' -e 's#\.git$##')"
+    case "$REPO" in
+      *:*|*@*) REPO="" ;; # не github-remote — не годится
+      */*) ;; # похоже на OWNER/REPO — годится
+      *) REPO="" ;;
+    esac
+  fi
+  if [ -z "$REPO" ]; then
+    echo "❌ Не удалось определить репозиторий."
+    echo "--- вывод gh (причина): ---"
+    gh repo view --json nameWithOwner -q .nameWithOwner 2>&1 | head -3 || true
+    echo "---------------------------"
+    echo "Укажите явно: $0 --repo OWNER/REPO"
     exit 1
   fi
 fi
@@ -164,7 +178,7 @@ case "$GROUP_ID" in
 esac
 
 echo "--- Variables (публичные; секретные значения кладите в Secrets) ---"
-MODEL="$(get_var GEMINI_MODEL)";            [ -n "$MODEL" ] || MODEL="gemini-2.5-flash"
+MODEL="$(get_var GEMINI_MODEL)";            [ -n "$MODEL" ] || MODEL="gemini-3.6-flash"
 TEMP="$(get_var GEMINI_TEMPERATURE)";       [ -n "$TEMP" ] || TEMP="0"
 EFFORT="$(get_var GEMINI_REASONING_EFFORT)"; [ -n "$EFFORT" ] || EFFORT="none"
 CHUNK="$(get_var GEMINI_CHUNK_MAX_CHARS)";  [ -n "$CHUNK" ] || CHUNK="60000"

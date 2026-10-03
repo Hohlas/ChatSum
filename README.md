@@ -140,7 +140,7 @@ TELEGRAM_API_HASH=0123456789abcdef0123456789abcdef
 TELEGRAM_PHONE=+79991234567
 
 GOOGLE_API_KEY=AIzaSyExampleKey
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL=gemini-3.6-flash
 
 TELEGRAM_GROUP_ID=-1001234567890
 ```
@@ -159,7 +159,7 @@ GOOGLE_API_KEY1=AIzaSySecondKey
 GOOGLE_API_KEY2=AIzaSyThirdKey
 GOOGLE_API_KEY3=AIzaSyFourthKey
 
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL=gemini-3.6-flash
 GEMINI_REASONING_EFFORT=medium
 GEMINI_CHUNK_MAX_CHARS=70000
 ```
@@ -182,7 +182,7 @@ GEMINI_CHUNK_MAX_CHARS=70000
 Если не хотите разбираться:
 
 ```env
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL=gemini-3.6-flash
 GEMINI_REASONING_EFFORT=low
 GEMINI_CHUNK_MAX_CHARS=70000
 ```
@@ -328,7 +328,7 @@ python3 main.py
 ### Смена модели
 
 ```text
-/set_model gemini-2.5-flash
+/set_model gemini-3.6-flash
 ```
 
 Команда обновляет `GEMINI_MODEL` в `private.txt`.
@@ -395,7 +395,7 @@ Sergey (ICO Drops)
 Пример:
 
 ```txt
-MODEL=gemini-2.5-flash
+MODEL=gemini-3.6-flash
 USE_REASONING=false
 USE_HTML_EXPORT=true
 ```
