@@ -285,10 +285,7 @@ async def run_due(main, args):
 # ──────────────────────────────────────────────
 
 INBOX_INITIAL_LIMIT = 100  # глубина первого опроса (покрывает межрановый зазор)
-INBOX_PAIR_MAX_ID_DIST = 10   # спаривание: форвард не дальше N сообщений от команды
-INBOX_PAIR_MAX_SECONDS = 600  # ...и не дальше 10 минут по времени
-INBOX_PENDING_MAX = 20        # сколько неспаренных команд/форвардов помним внутри рана
-INBOX_PENDING_MAX_AGE = 3600  # старше часа — забываем
+INBOX_PENDING_MAX = 20  # сколько неспаренных команд/форвардов помним внутри рана
 
 
 def forward_source_id(msg):
@@ -307,14 +304,13 @@ def forward_source_id(msg):
     return None
 
 
-def find_pair_forward(cmd, forwards, consumed,
-                      max_id_dist=INBOX_PAIR_MAX_ID_DIST,
-                      max_seconds=INBOX_PAIR_MAX_SECONDS):
+def find_pair_forward(cmd, forwards, consumed):
     """Спаривание (§2 п.3 плана): команда, а следующим сообщением — форвард.
 
     Порядок фиксированный: форвард строго НОВЕЕ команды (твой флоу: сначала
     пишешь команду, потом пересылаешь цитату). forwards — форварды-кандидаты
     (без своей команды); consumed — id уже использованных в этом ране.
+    Давности нет: команда хоть месячной давности ждёт свой форвард.
     Побеждает ближайший сверху; возврат — сообщение-форвард или None.
     """
     best = None
@@ -326,10 +322,7 @@ def find_pair_forward(cmd, forwards, consumed,
             continue  # форвард должен идти ПОСЛЕ команды, не до неё
         try:
             dist = fwd.id - cmd.id
-            skew = abs((fwd.date - cmd.date).total_seconds())
         except Exception:
-            continue
-        if dist > max_id_dist or skew > max_seconds:
             continue
         if best is None or dist < best_dist:
             best, best_dist = fwd, dist
@@ -388,21 +381,9 @@ async def poll_inbox_once(main, last_seen, mem):
         new_last_seen = max([m.id for m in batch] + ([last_seen] if last_seen else []))
     fresh_ids = {m.id for m in batch}
 
-    now = datetime.now(timezone.utc)
-
-    def _fresh(m):
-        try:
-            d = m.date
-            if d.tzinfo is None:
-                d = d.replace(tzinfo=timezone.utc)
-            return (now - d).total_seconds() <= INBOX_PENDING_MAX_AGE
-        except Exception:
-            return True
-
-    # Чистим память: протухшее и сверх лимита (старое — первым).
+    # Чистим память: сверх лимита выкидываем давно лежащее (давности нет —
+    # команда хоть месячной давности ждёт свой форвард).
     for store in (mem['cmds'], mem['fwds']):
-        for mid in [k for k, m in store.items() if not _fresh(m)]:
-            del store[mid]
         while len(store) > INBOX_PENDING_MAX:
             store.pop(next(iter(store)))
 
@@ -423,8 +404,6 @@ async def poll_inbox_once(main, last_seen, mem):
 
     # Запоминаем свежие кандидаты (команды — всегда; форварды — без своей команды).
     for m in batch:
-        if not _fresh(m):
-            continue
         if _parsed(m) is not None:
             mem['cmds'].setdefault(m.id, m)
         elif forward_source_id(m) is not None:
@@ -433,7 +412,8 @@ async def poll_inbox_once(main, last_seen, mem):
     forwards_pool = sorted(mem['fwds'].values(), key=lambda m: m.id)
 
     failed = 0
-    for cmd_id in sorted(mem['cmds']):
+    # Новые команды первыми: свежее намерение побеждает при дележе форварда.
+    for cmd_id in sorted(mem['cmds'], reverse=True):
         msg = mem['cmds'][cmd_id]
         parsed = _parsed(msg)
         if parsed is None:

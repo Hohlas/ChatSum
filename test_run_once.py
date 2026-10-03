@@ -322,13 +322,9 @@ def test_find_pair_forward():
     got = run_once.find_pair_forward(cmd, [f1], {101})
     check('pair: использованный исключается', got is None, got)
 
-    far = M(120, mins(2), PeerChannel(channel_id=4))
+    far = M(1200, mins(60 * 24 * 30), PeerChannel(channel_id=4))
     got = run_once.find_pair_forward(cmd, [far], set())
-    check('pair: дальний по id исключается', got is None, got)
-
-    late = M(102, mins(30), PeerChannel(channel_id=5))
-    got = run_once.find_pair_forward(cmd, [late], set())
-    check('pair: старый по времени исключается', got is None, got)
+    check('pair: давности нет (месяц спустя — тоже пара)', got is far, getattr(got, 'id', None))
 
     got = run_once.find_pair_forward(cmd, [], set())
     check('pair: пустой пул', got is None, got)
