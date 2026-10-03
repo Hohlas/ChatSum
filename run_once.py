@@ -364,29 +364,16 @@ def extract_chat_link(text):
 
 
 async def fetch_forum_topics(main, dest):
-    """Топики канала результатов: ({topic_id: title}, {topic_id: top_message}).
-
-    top_message нужен per-topic скану: опрос General (GetHistory без топика)
-    сообщений из топиков не видит, поэтому свежесть топиков отслеживаем сами.
-    """
+    """{topic_id: title} канала результатов (кэш за ран берёт вызыватель)."""
     try:
         from telethon.tl.functions.channels import GetForumTopicsRequest
         result = await main.telegram_client(GetForumTopicsRequest(
             channel=dest, offset_date=0, offset_id=0, offset_topic=0, limit=100))
-        titles, tops = {}, {}
-        for t in getattr(result, 'topics', []):
-            tid = getattr(t, 'id', None)
-            if not tid:
-                continue
-            if getattr(t, 'title', None):
-                titles[tid] = t.title
-            top = getattr(t, 'top_message', None)
-            if isinstance(top, int) and top > 0:
-                tops[tid] = top
-        return titles, tops
+        return {t.id: t.title for t in getattr(result, 'topics', [])
+                if getattr(t, 'id', None) and getattr(t, 'title', None)}
     except Exception as e:
         print(f"⚠️ Inbox: не удалось получить список топиков: {e}")
-        return {}, {}
+        return {}
 
 
 async def fetch_dialog_names(main):
@@ -428,8 +415,7 @@ async def resolve_topic_source(main, mem, dest, top_id):
     if dest == 'me':
         return None
     if mem.get('topics') is None:
-        titles, _tops = await fetch_forum_topics(main, dest)
-        mem['topics'] = titles
+        mem['topics'] = await fetch_forum_topics(main, dest)
     title = mem['topics'].get(top_id)
     if not title:
         return None
@@ -442,10 +428,24 @@ async def resolve_topic_source(main, mem, dest, top_id):
     return src
 
 
+def msg_topic_id(msg):
+    """id топика из заголовка ответа Telethon или None (General/не топик).
+
+    У Telethon.Message НЕТ атрибута reply_to_top_id — только заголовок
+    reply_to: forum_topic + reply_to_msg_id (+ reply_to_top_id, если ответ
+    не на корень). id корня топика совпадает с id топика, поэтому
+    reply_to_msg_id — рабочая замена. Важно: опрос итерирует ВСЕ топики
+    канала, General отдельно не выделяется — топик определяем только так.
+    """
+    r = getattr(msg, 'reply_to', None)
+    if r is None or not getattr(r, 'forum_topic', False):
+        return None
+    return getattr(r, 'reply_to_top_id', None) or getattr(r, 'reply_to_msg_id', None)
+
+
 def new_inbox_mem():
     """Память inbox внутри одного рана: кэши топиков/диалогов + антиспам лога."""
-    return {'topics': None, 'dialogs': None, 'skip_logged': set(),
-            'topics_seen': {}}
+    return {'topics': None, 'dialogs': None, 'skip_logged': set()}
 
 
 def _log_once(mem, key, text):
@@ -453,9 +453,6 @@ def _log_once(mem, key, text):
     if key not in mem['skip_logged']:
         mem['skip_logged'].add(key)
         print(text)
-
-
-TOPIC_SCAN_DEPTH = 10  # сколько свежих id добираем при первом взгляде на топик
 
 
 async def _notify_inbox(main, dest, topic_id, text):
@@ -483,14 +480,15 @@ async def _drop_command(main, dest, msg, why):
         return False
 
 
-async def process_inbox_message(main, mem, dest, msg, topic_id=None):
+async def process_inbox_message(main, mem, dest, msg):
     """Обработка одного inbox-сообщения. Возвращает 'ok' | 'fail' | 'skip'.
 
-    topic_id: топик, из которого взято сообщение (per-topic скан; для General —
-    None, тогда топик берётся из reply_to_top_id сообщения).
-    Источник команды (строго по порядку): явная ссылка → топик.
-    Успех и провал — удаление команды; провал — плюс диагностика
-    (в топик источника, если известен, иначе туда, где лежала команда).
+    Источник команды (строго по порядку): явная ссылка → топик (только если
+    msg_topic_id указывает на известный топик канала результатов; заголовок
+    есть у сообщений ВСЕХ топиков — опрос их не разделяет). Всё остальное —
+    General: без ссылки = провал. Успех и провал — удаление команды;
+    провал — плюс диагностика с текстом команды (куда: топик источника,
+    если он определён, иначе туда, где лежала команда).
     Не-команды не трогаем никогда.
     """
     from telethon.utils import get_peer_id
@@ -508,16 +506,24 @@ async def process_inbox_message(main, mem, dest, msg, topic_id=None):
     if parsed is None:
         return 'skip'  # не команда — не трогаем
 
-    # Куда слать диагностику, если источник так и не определится:
-    # туда, где лежала команда (топик) или General.
-    own_top = topic_id if topic_id not in (None, 1) \
-        else getattr(msg, 'reply_to_top_id', None)
-    home = own_top if own_top not in (None, 1) else None
+    # Топик-команда: заголовок reply_to → id топика → он должен быть в
+    # списке топиков канала (иначе это ответ ВНУТРИ General на конкретное
+    # сообщение — трактуем как General, т.е. нужна ссылка).
+    top_id = msg_topic_id(msg)
+    is_topic = False
+    if top_id and top_id != 1 and dest != 'me':
+        if mem.get('topics') is None:
+            mem['topics'] = await fetch_forum_topics(main, dest)
+        is_topic = top_id in mem['topics']
+    home = top_id if is_topic else None  # куда слать диагностику при неудаче
+
+    snippet = text if len(text) <= 60 else text[:57] + '…'
 
     async def fail(notice_topic, log_text, notice_text):
-        print(log_text)
+        print(f"{log_text} | {snippet!r}")
         if await _drop_command(main, dest, msg, 'провал'):
-            await _notify_inbox(main, dest, notice_topic, notice_text)
+            await _notify_inbox(main, dest, notice_topic,
+                                f"{notice_text}\nКоманда: {snippet!r}")
         else:
             _log_once(mem, f"dropfail:{msg.id}",
                       f"⚠️ Inbox {msg.id}: команда не удалена — повторится следующим опросом")
@@ -543,22 +549,22 @@ async def process_inbox_message(main, mem, dest, msg, topic_id=None):
                     f"❌ Inbox {msg.id}: не резолвится ссылка {value!r} — "
                     f"команда удалена, повтора не будет.")
     if source_id is None:
-        if own_top not in (None, 1):
-            source_id = await resolve_topic_source(main, mem, dest, own_top)
+        if is_topic:
+            source_id = await resolve_topic_source(main, mem, dest, top_id)
             if source_id is None:
                 return await fail(
                     home,
-                    f"❌ Inbox {msg.id}: топик {own_top} не сопоставлен ни с одним чатом",
+                    f"❌ Inbox {msg.id}: топик {top_id} не сопоставлен ни с одним чатом",
                     f"❌ Inbox {msg.id}: топик не сопоставлен ни с одним чатом — "
                     f"команда удалена, повтора не будет.")
             via = " (топик)"
         else:
             return await fail(
                 None,
-                f"❌ Inbox {msg.id}: команда в General без ссылки — не выполнена",
-                f"❌ Inbox {msg.id}: команда в General без ссылки "
-                f"(нужна ссылка t.me/…/@… или команда в топике чата) — "
-                f"удалена, ничего не выполнено.")
+                f"❌ Inbox {msg.id}: команда без ссылки и вне топика — не выполнена",
+                f"❌ Inbox {msg.id}: команда вне топика чата — нужна ссылка "
+                f"t.me/.../@... либо напишите sum прямо в топике чата. "
+                f"Удалена, ничего не выполнено.")
 
     try:
         chat_entity = await main.telegram_client.get_entity(source_id)
@@ -615,7 +621,8 @@ async def process_inbox_message(main, mem, dest, msg, topic_id=None):
         # Детали провала анализа уже в топике (error-path run_analysis) —
         # здесь однострочник, чтобы не ждали впустую.
         await _notify_inbox(main, dest, notify_topic,
-                            f"⛔ Inbox {msg.id}: не выполнено — команда удалена, повтора не будет.")
+                            f"⛔ Inbox {msg.id}: не выполнено — команда удалена, "
+                            f"повтора не будет.\nКоманда: {snippet!r}")
     else:
         _log_once(mem, f"dropfail:{msg.id}",
                   f"⚠️ Inbox {msg.id}: команда не удалена — повторится следующим опросом")
@@ -623,8 +630,10 @@ async def process_inbox_message(main, mem, dest, msg, topic_id=None):
 
 
 async def poll_inbox_once(main, last_seen, mem):
-    """Один опрос General inbox. Возвращает (new_last_seen, failed_count).
+    """Один опрос inbox-канала. Возвращает (new_last_seen, failed_count).
 
+    Итерация отдаёт сообщения ВСЕХ топиков канала (не только General) —
+    топик каждой команды определяет process_inbox_message по reply_to.
     last_seen=None → первый опрос: берём до INBOX_INITIAL_LIMIT свежих
     (покрывает команды из межранового зазора). Дальше — только id > last_seen.
     last_seen растёт всегда (in-memory, за ран).
@@ -648,48 +657,6 @@ async def poll_inbox_once(main, last_seen, mem):
             failed += 1
 
     return new_last_seen, failed
-
-
-async def poll_topics_once(main, mem, dest):
-    """Скан команд в топиках. Возвращает число провалов.
-
-    Опрос General сообщений из топиков не видит (GetHistory без топика),
-    поэтому свежесть отслеживаем сами: {top_id: top_message} из GetForumTopics
-    против mem['topics_seen']. Новых кандидатов добираем через get_messages
-    по id (этот метод топики видит), кап TOPIC_SCAN_DEPTH. seen растёт всегда.
-    """
-    if dest == 'me':
-        return 0
-    titles, tops = await fetch_forum_topics(main, dest)
-    mem['topics'] = titles
-    seen = mem.setdefault('topics_seen', {})
-    failed = 0
-    for tid in sorted(tops):
-        if tid == 1:
-            continue  # General покрыт опросом inbox
-        top = tops[tid]
-        prev = seen.get(tid)
-        if prev is not None and top <= prev:
-            continue
-        ids = [top] if prev is None else \
-            list(range(max(prev + 1, top - TOPIC_SCAN_DEPTH + 1), top + 1))
-        try:
-            got = await main.telegram_client.get_messages(dest, ids=ids)
-        except Exception as e:
-            print(f"⚠️ Inbox: не удалось прочитать топик {tid}: {e}")
-            continue
-        msgs = [got] if not isinstance(got, list) else got
-        cand = sorted(
-            (m for m in msgs
-             if m is not None
-             and getattr(m, 'reply_to_top_id', None) == tid
-             and (getattr(m, 'text', None) or '').strip()),
-            key=lambda m: m.id)
-        for m in cand:
-            if await process_inbox_message(main, mem, dest, m, topic_id=tid) == 'fail':
-                failed += 1
-        seen[tid] = top
-    return failed
 
 
 async def run_watch(main, args):
@@ -720,10 +687,6 @@ async def run_watch(main, args):
                 failed_total += inbox_failed
             except Exception as e:
                 print(f"⚠️ Ошибка опроса inbox (итерация {iteration}): {e}")
-            try:
-                failed_total += await poll_topics_once(main, inbox_mem, main.RESULTS_DESTINATION)
-            except Exception as e:
-                print(f"⚠️ Ошибка скана топиков (итерация {iteration}): {e}")
             now = time.monotonic()
             if now >= deadline:
                 break

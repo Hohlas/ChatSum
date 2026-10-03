@@ -106,9 +106,8 @@ def main():
     test_extract_link()
     test_watch_args()
     test_inbox_no_poison()
+    test_msg_topic_id()
     test_inbox_v2_flows()
-    test_topic_scan()
-    test_topic_scan_fail()
     test_key_cursor()
     test_503_rotates_key()
 
@@ -227,10 +226,10 @@ def test_inbox_no_poison():
     """Битое 'sum abh' и слово 'summer' не отравляют опрос: валидная
     команда со ссылкой в том же батче выполняется и удаляется."""
     class FakeMsg:
-        def __init__(self, id, text, reply_to_top_id=None):
+        def __init__(self, id, text):
             self.id = id
             self.text = text
-            self.reply_to_top_id = reply_to_top_id
+            self.reply_to = None  # General: заголовка ответа нет
 
     class FakeEntity:
         title = 'SrcChat'
@@ -290,19 +289,27 @@ def test_inbox_no_poison():
 
 
 def _make_inbox_fakes(run_ok=True):
-    """Честные фейки inbox (видимость как в проде):
+    """Честные фейки inbox (видимость/атрибуты как в проде):
 
-    - iter_messages отдаёт ТОЛЬКО General (прод: GetHistory без топика);
-    - топики — через get_messages(ids=) и GetForumTopics(top_message);
+    - iter_messages отдаёт сообщения ВСЕХ топиков (прод: так и есть);
+    - заголовок ответа — reply_to (forum_topic/reply_to_msg_id/reply_to_top_id),
+      атрибута reply_to_top_id у сообщения НЕТ (как у продового Telethon);
+    - GetForumTopics — через вызов клиента;
     - send_message пишет в client.sent для проверки диагностики.
     """
     from types import SimpleNamespace
 
     class FakeMsg:
-        def __init__(self, id, text, reply_to_top_id=None):
+        def __init__(self, id, text, top=None, reply_top=None):
             self.id = id
             self.text = text
-            self.reply_to_top_id = reply_to_top_id
+            # top=7 → сообщение в топике 7; reply_top=7 → ответ НЕ на корень
+            # внутри топика 7 (reply_to_msg_id указывает на другое сообщение)
+            if top or reply_top:
+                self.reply_to = SimpleNamespace(
+                    forum_topic=True, reply_to_msg_id=top, reply_to_top_id=reply_top)
+            else:
+                self.reply_to = None
 
     class FakeEntity:
         def __init__(self, title):
@@ -310,30 +317,25 @@ def _make_inbox_fakes(run_ok=True):
 
     class FakeClient:
         def __init__(self):
-            self.general = []   # [(id, text, top)] — только General
-            self.pool = {}      # id -> FakeMsg (для get_messages по топикам)
-            self.topics = []    # (topic_id, title, top_message)
+            self.msgs = []      # все сообщения канала (iter_messages)
+            self.topics = []    # (topic_id, title) — GetForumTopics
             self.deleted = []
             self.sent = []      # (dest, text, reply_to)
 
         async def __call__(self, request):
-            # GetForumTopicsRequest → объект с .topics (id/title/top_message)
+            # GetForumTopicsRequest → объект с .topics (id/title)
             return SimpleNamespace(topics=[
-                SimpleNamespace(id=tid, title=title, top_message=top)
-                for tid, title, top in self.topics])
+                SimpleNamespace(id=tid, title=title)
+                for tid, title in self.topics])
 
         async def iter_messages(self, dest, limit=None, min_id=None):
-            msgs = sorted(self.general, key=lambda m: m.id)
+            msgs = sorted(self.msgs, key=lambda m: m.id)
             if min_id is not None:
                 msgs = [m for m in msgs if m.id > min_id]
             if limit is not None:
                 msgs = msgs[-int(limit):]
             for m in msgs:
                 yield m
-
-        async def get_messages(self, dest, ids=None):
-            # Только id из запроса: топик-скан не подглядывает чужие сообщения
-            return [self.pool[i] for i in (ids or []) if i in self.pool]
 
         async def get_entity(self, peer):
             return FakeEntity({-1001892263845: 'LinkChat',
@@ -366,17 +368,45 @@ def _make_inbox_fakes(run_ok=True):
     return FakeMsg, client, FakeMain(client, run_ok=run_ok)
 
 
+def test_msg_topic_id():
+    """msg_topic_id читает заголовок reply_to (у продового Message нет
+    атрибута reply_to_top_id — это и убивало топик-команды)."""
+    from types import SimpleNamespace as NS
+
+    class M:
+        pass
+
+    m = M()
+    m.reply_to = None
+    check('topic: нет reply_to → None', run_once.msg_topic_id(m) is None)
+    m.reply_to = NS(forum_topic=True, reply_to_msg_id=7, reply_to_top_id=None)
+    check('topic: корень топика → reply_to_msg_id', run_once.msg_topic_id(m) == 7,
+          run_once.msg_topic_id(m))
+    m.reply_to = NS(forum_topic=True, reply_to_msg_id=999, reply_to_top_id=7)
+    check('topic: ответ не на корень → reply_to_top_id',
+          run_once.msg_topic_id(m) == 7, run_once.msg_topic_id(m))
+    m.reply_to = NS(forum_topic=False, reply_to_msg_id=7, reply_to_top_id=None)
+    check('topic: forum_topic=False → None', run_once.msg_topic_id(m) is None)
+    # Честность против прода: у Telethon.Message действительно нет поля
+    from telethon.tl.custom.message import Message
+    check('topic: у продового Message нет reply_to_top_id',
+          not hasattr(Message, 'reply_to_top_id'))
+
+
 def test_inbox_v2_flows():
-    """v2: ссылка в General и команда в топике выполняются и удаляются;
-    неизвестный топик и команда без ссылки — провал: удаление + диагностика."""
+    """v2: ссылка в General и sum прямо в топике (включая ответ не на корень)
+    выполняются и удаляются; неизвестный топик/вне топика — провал:
+    удаление + диагностика с текстом команды."""
     import io
     import contextlib
     FakeMsg, client, fake = _make_inbox_fakes()
-    client.general = [
+    client.msgs = [
         FakeMsg(10, 'sum20 https://t.me/c/1892263845/50'),
-        FakeMsg(11, 'sum10', reply_to_top_id=7),
-        FakeMsg(12, 'sum5', reply_to_top_id=9),
-        FakeMsg(13, 'sum5'),
+        FakeMsg(11, 'sum10', top=7),              # sum прямо в топике 7
+        FakeMsg(12, 'sum5', top=9),               # топик есть, чата нет
+        FakeMsg(13, 'sum5'),                      # General без ссылки
+        FakeMsg(14, 'sum5', top=4033),            # ответ ВНУТРИ General (не топик)
+        FakeMsg(15, 'sum5', top=999, reply_top=7),  # ответ не на корень топика 7
     ]
     mem = run_once.new_inbox_mem()
     # Предзаполняем кэши (fetch_* — тонкие обёртки Telethon, их гоняет E2E).
@@ -387,24 +417,28 @@ def test_inbox_v2_flows():
     with contextlib.redirect_stdout(buf):
         ls, failed = loop.run_until_complete(run_once.poll_inbox_once(fake, None, mem))
     out = buf.getvalue()
-    check('v2: batch consumed', ls == 13 and failed == 2, (ls, failed))
-    check('v2: ссылка+топик выполнены', len(fake.ran) == 2, fake.ran)
+    check('v2: batch consumed', ls == 15 and failed == 3, (ls, failed))
+    check('v2: ссылка + 2 топик-команды выполнены', len(fake.ran) == 3, fake.ran)
     by_chat = {kw['chat_id']: kw for kw in fake.ran}
     check('v2: ссылка даёт лимит+чат',
           by_chat.get(-1001892263845, {}).get('limit') == 20, by_chat)
-    check('v2: топик даёт чат из диалогов',
-          by_chat.get(-100111, {}).get('limit') == 10, by_chat)
+    pair_limits = [kw['limit'] for kw in fake.ran if kw['chat_id'] == -100111]
+    check('v2: сум в топике → чат из диалогов (10 и 5)',
+          pair_limits == [10, 5], pair_limits)
     check('v2: удалены все командные (успех и провал)',
-          client.deleted == [10, 11, 12, 13], client.deleted)
+          client.deleted == [10, 11, 12, 13, 14, 15], client.deleted)
     check('v2: неизвестный топик залогирован',
           out.count('топик 9 не сопоставлен') == 1, out)
-    check('v2: команда без ссылки залогирована',
-          out.count('без ссылки') == 1, out)
-    # Диагностика провалов: msg 12 → в топик 9 (reply_to=9), msg 13 → General
+    check('v2: вне топика залогировано (13 и 14)',
+          out.count('без ссылки') == 2, out)
+    # Диагностика: msg12 → топик 9; msg13/14 → General; везде текст команды
     diag12 = [t for (_d, t, r) in client.sent if r == 9 and 'не сопоставлен' in t]
-    diag13 = [t for (_d, t, r) in client.sent if r is None and 'без ссылки' in t]
+    diag_gen = [t for (_d, t, r) in client.sent
+                if r is None and 'нужна ссылка' in t]
     check('v2: диагностика нерезолвленного топика', len(diag12) == 1, client.sent)
-    check('v2: диагностика General без ссылки', len(diag13) == 1, client.sent)
+    check('v2: диагностика вне топика (13 и 14)', len(diag_gen) == 2, client.sent)
+    check('v2: диагностика несёт текст команды',
+          diag12 and "Команда: 'sum5'" in diag12[0], diag12)
     check('v2: диагностика говорит про удаление',
           diag12 and 'повтора не будет' in diag12[0], diag12)
 
@@ -417,77 +451,6 @@ def test_inbox_v2_flows():
     with contextlib.redirect_stdout(buf2):
         run_once._log_once(mem2, 'topic:9', 'LINE')
     check('v2: повторный лог подавлен', buf2.getvalue() == '', buf2.getvalue())
-
-
-def test_topic_scan():
-    """Пер-топик скан: General топики не видит, скан их ловит;
-    первый взгляд = top_message, рост топика = range-добор."""
-    import io
-    import contextlib
-    FakeMsg, client, fake = _make_inbox_fakes()
-    client.general = []  # General пуст — топик-сообщения в него не попадают
-    client.topics = [(7, 'PairChat', 100)]
-    client.pool = {
-        100: FakeMsg(100, 'sum10', reply_to_top_id=7),
-        101: FakeMsg(101, 'sum5', reply_to_top_id=7),
-        102: FakeMsg(102, 'hello', reply_to_top_id=7),
-        103: FakeMsg(103, 'sum99'),  # General-сообщение — топик-скан его не берёт
-    }
-    mem = run_once.new_inbox_mem()
-    mem['dialogs'] = {'PairChat': -100111}
-    loop = asyncio.get_event_loop()
-    with contextlib.redirect_stdout(io.StringIO()):
-        ls, gfailed = loop.run_until_complete(
-            run_once.poll_inbox_once(fake, None, mem))
-        f1 = loop.run_until_complete(
-            run_once.poll_topics_once(fake, mem, 'test-inbox'))
-    check('scan: опрос General топики не видит', ls is None and gfailed == 0,
-          (ls, gfailed))
-    check('scan: первый взгляд — только top_message',
-          [kw['limit'] for kw in fake.ran] == [10], fake.ran)
-    check('scan: топик → чат PairChat',
-          fake.ran and fake.ran[0]['chat_id'] == -100111, fake.ran)
-    check('scan: команда удалена', client.deleted == [100], client.deleted)
-    check('scan: seen закреплён', mem['topics_seen'].get(7) == 100,
-          mem['topics_seen'])
-
-    # Топик вырос: 101 (команда) и 102 (не команда) — range-добор от seen+1
-    client.topics = [(7, 'PairChat', 102)]
-    with contextlib.redirect_stdout(io.StringIO()):
-        loop.run_until_complete(run_once.poll_topics_once(fake, mem, 'test-inbox'))
-    limits = [kw['limit'] for kw in fake.ran]
-    check('scan: рост топика → range-добор', limits == [10, 5], limits)
-    check('scan: удалены обе команды', client.deleted == [100, 101],
-          client.deleted)
-    check('scan: seen обновлён', mem['topics_seen'][7] == 102,
-          mem['topics_seen'])
-
-    # Без изменений — пусто (никаких повторных выполнений)
-    with contextlib.redirect_stdout(io.StringIO()):
-        loop.run_until_complete(run_once.poll_topics_once(fake, mem, 'test-inbox'))
-    check('scan: без изменений — ничего', len(fake.ran) == 2, fake.ran)
-
-
-def test_topic_scan_fail():
-    """Провал в топике: команда удаляется, диагностика идёт в топик-источник."""
-    import io
-    import contextlib
-    FakeMsg, client, fake = _make_inbox_fakes(run_ok=False)
-    client.topics = [(7, 'PairChat', 200)]
-    client.pool = {200: FakeMsg(200, 'sum10', reply_to_top_id=7)}
-    mem = run_once.new_inbox_mem()
-    mem['dialogs'] = {'PairChat': -100111}
-    loop = asyncio.get_event_loop()
-    with contextlib.redirect_stdout(io.StringIO()):
-        failed = loop.run_until_complete(
-            run_once.poll_topics_once(fake, mem, 'test-inbox'))
-    check('scan-fail: провал посчитан', failed == 1, failed)
-    check('scan-fail: команда удалена', client.deleted == [200], client.deleted)
-    # Источник известен → диагностика в топик-результатов источника;
-    # фейк get_or_create_topic возвращает 1 = General (reply_to=None).
-    diag = [t for (_d, t, r) in client.sent if r is None and '⛔' in t]
-    check('scan-fail: диагностика в топик-результатов',
-          len(diag) == 1 and 'повтора не будет' in diag[0], client.sent)
 
 
 def test_key_cursor():
