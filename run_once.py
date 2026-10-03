@@ -360,7 +360,11 @@ async def poll_inbox_once(main, last_seen):
                 failed += 1
                 continue
         if source_id is None:
-            print(f"⏭️  Inbox {msg.id}: команда без форварда источника — пропущена (не удаляю)")
+            if need_parent is not None:
+                print(f"⏭️  Inbox {msg.id}: команда без форварда источника "
+                      f"(ответ на {need_parent}, у родителя нет форварда) — пропущена (не удаляю)")
+            else:
+                print(f"⏭️  Inbox {msg.id}: команда без форварда источника — пропущена (не удаляю)")
             continue
 
         try:
