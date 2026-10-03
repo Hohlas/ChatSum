@@ -108,6 +108,7 @@ def main():
     test_inbox_no_poison()
     test_msg_topic_id()
     test_inbox_v2_flows()
+    test_sched_flows()
     test_key_cursor()
     test_503_rotates_key()
 
@@ -351,11 +352,17 @@ def _make_inbox_fakes(run_ok=True):
     class FakeMain:
         RESULTS_DESTINATION = 'test-inbox'
         parse_chat_command_args = staticmethod(bot.parse_chat_command_args)
+        load_schedule = staticmethod(bot.load_schedule)
+        save_schedule = staticmethod(bot.save_schedule)
+        schedule_period_from_parsed = staticmethod(bot.schedule_period_from_parsed)
+        schedule_free_slot = staticmethod(bot.schedule_free_slot)
+        _parse_suffixes = staticmethod(bot._parse_suffixes)
 
-        def __init__(self, client, run_ok=True):
+        def __init__(self, client, run_ok=True, sched_path=None):
             self.telegram_client = client
             self.ran = []
             self.run_ok = run_ok
+            self.SCHEDULE_FILE = sched_path or '/tmp/opencode/test_sched.txt'
 
         async def get_or_create_topic(self, name):
             return 1
@@ -363,6 +370,9 @@ def _make_inbox_fakes(run_ok=True):
         async def run_analysis(self, **kw):
             self.ran.append(kw)
             return self.run_ok
+
+        async def schedule_listing_text(self):
+            return f"LISTING({len(bot.load_schedule(self.SCHEDULE_FILE))})"
 
     client = FakeClient()
     return FakeMsg, client, FakeMain(client, run_ok=run_ok)
@@ -451,6 +461,120 @@ def test_inbox_v2_flows():
     with contextlib.redirect_stdout(buf2):
         run_once._log_once(mem2, 'topic:9', 'LINE')
     check('v2: повторный лог подавлен', buf2.getvalue() == '', buf2.getvalue())
+
+
+def test_sched_flows():
+    """Расписание из General: add (сдвиг занятого слота, дубль, git push),
+    sch (публикация), unsch (снятие), битые варианты → провал+удаление."""
+    import io
+    import contextlib
+    FakeMsg, client, fake = _make_inbox_fakes()
+    fake.SCHEDULE_FILE = '/tmp/opencode/test_sched_flows.txt'
+    pushes = []
+    saved_push = run_once.git_push_schedule
+    run_once.git_push_schedule = lambda msg: (pushes.append(msg), True)[1]
+    loop = asyncio.get_event_loop()
+    try:
+        def seed(rows):
+            bot.save_schedule(fake.SCHEDULE_FILE, rows)
+
+        def row(cid, h, m, period, plus=False):
+            return {'chat_id': cid, 'hour': h, 'minute': m, 'period': period,
+                    'post_to_source': plus, 'post_as_telegram': False}
+
+        # add: слот свободен → запись + пуш + удаление + подтверждение со списком
+        seed([row(-100111, 6, 0, '1d')])
+        client.msgs = [FakeMsg(50, '22:33 sum1d t.me/c/1892263845/50')]
+        mem = run_once.new_inbox_mem()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ls, failed = loop.run_until_complete(
+                run_once.poll_inbox_once(fake, None, mem))
+        entries = bot.load_schedule(fake.SCHEDULE_FILE)
+        check('sched: запись добавлена',
+              len(entries) == 2 and entries[-1]['chat_id'] == -1001892263845
+              and entries[-1]['hour'] == 22 and entries[-1]['minute'] == 33
+              and entries[-1]['period'] == '1d', entries)
+        check('sched: запушен', len(pushes) == 1, pushes)
+        check('sched: команда удалена', client.deleted == [50], client.deleted)
+        confirm = [t for (_d, t, _r) in client.sent if '✅' in t]
+        check('sched: подтверждение + список',
+              len(confirm) == 1 and 'LISTING(2)' in confirm[0], client.sent)
+
+        # занятый слот → +5 минут; сумма-limit-период тоже принимается
+        client.msgs = [FakeMsg(51, '22:33 sum20 https://t.me/c/1892263845/50')]
+        client.sent.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            loop.run_until_complete(run_once.poll_inbox_once(fake, None, mem))
+        entries = bot.load_schedule(fake.SCHEDULE_FILE)
+        check('sched: занятый слот сдвинут на +5',
+              len(entries) == 3 and entries[-1]['minute'] == 38
+              and entries[-1]['period'] == '20', entries)
+        confirm = [t for (_d, t, _r) in client.sent if '✅' in t]
+        check('sched: сдвиг показан в подтверждении',
+              confirm and '22:33→22:38' in confirm[0], confirm)
+
+        # точный дубль → без записи, инфо-сообщение
+        n_before = len(bot.load_schedule(fake.SCHEDULE_FILE))
+        client.msgs = [FakeMsg(52, '22:38 sum20 t.me/c/1892263845/50')]
+        client.sent.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            loop.run_until_complete(run_once.poll_inbox_once(fake, None, mem))
+        check('sched: дубль не добавлен',
+              len(bot.load_schedule(fake.SCHEDULE_FILE)) == n_before
+              and any('уже есть' in t for (_d, t, _r) in client.sent),
+              client.sent)
+        check('sched: дубль удалён без пуша', 52 in client.deleted,
+              client.deleted)
+
+        # sch → публикация списка, команда удалена, без пуша
+        n_push = len(pushes)
+        client.msgs = [FakeMsg(53, 'sch')]
+        client.sent.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            loop.run_until_complete(run_once.poll_inbox_once(fake, None, mem))
+        check('sch: список опубликован',
+              any('LISTING' in t for (_d, t, _r) in client.sent)
+              and 53 in client.deleted and len(pushes) == n_push, client.sent)
+
+        # unsch по ссылке → чат убран, пуш
+        client.msgs = [FakeMsg(54, 'unsch t.me/c/1892263845/50')]
+        client.sent.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            loop.run_until_complete(run_once.poll_inbox_once(fake, None, mem))
+        entries = bot.load_schedule(fake.SCHEDULE_FILE)
+        check('unsch: чат убран из расписания',
+              all(e['chat_id'] != -1001892263845 for e in entries), entries)
+        check('unsch: запушен', len(pushes) == n_push + 1, pushes)
+
+        # битые: copy в расписании / без ссылки в General → провал, удалены
+        client.msgs = [FakeMsg(55, '22:00 copy1d t.me/c/1892263845/50'),
+                       FakeMsg(56, '22:00 sum1d'),
+                       FakeMsg(57, '99:00 sum1d t.me/c/1892263845/50')]
+        client.sent.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            ls, failed = loop.run_until_complete(
+                run_once.poll_inbox_once(fake, None, mem))
+        check('sched: битые → fail и удалены',
+              failed == 3 and all(i in client.deleted for i in (55, 56, 57)),
+              (failed, client.deleted))
+
+        # git push провалился → откат файла + fail
+        run_once.git_push_schedule = lambda msg: False
+        n_before = len(bot.load_schedule(fake.SCHEDULE_FILE))
+        client.msgs = [FakeMsg(58, '07:07 sum1d t.me/c/1892263845/50')]
+        client.sent.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            ls, failed = loop.run_until_complete(
+                run_once.poll_inbox_once(fake, None, mem))
+        check('sched: push-fail → откат и fail',
+              failed == 1 and 58 in client.deleted
+              and len(bot.load_schedule(fake.SCHEDULE_FILE)) == n_before,
+              (failed, client.deleted))
+    finally:
+        run_once.git_push_schedule = saved_push
+        if os.path.exists(fake.SCHEDULE_FILE):
+            os.remove(fake.SCHEDULE_FILE)
 
 
 def test_key_cursor():

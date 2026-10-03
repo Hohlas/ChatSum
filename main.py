@@ -3742,7 +3742,8 @@ def load_schedule(filename):
                 if hour < 0 or hour > 23 or minute < 0 or minute > 59:
                     continue
                 clean_period, post_to_source, post_as_telegram = _parse_suffixes(period_str)
-                if not re.fullmatch(r'\d+[hd]', clean_period):
+                # Период: Nd / Nh / голый лимит сообщений (например 20 = sum20)
+                if not re.fullmatch(r'\d+[hd]|\d+', clean_period):
                     continue
                 entries.append({
                     'chat_id': chat_id, 'hour': hour, 'minute': minute,
@@ -3775,6 +3776,78 @@ def save_schedule(filename, entries):
         return False
 
 
+def schedule_period_from_parsed(parsed):
+    """Период для SCHEDULE.txt из parse_chat_command_args → '1d'/'12h'/'20'.
+
+    Суффиксы +/- переносятся. None — если команда не сводится к одному
+    периоду (диапазоны, time_range, mix дней+часов, copy — в расписании
+    только sum, scheduled_analysis_job всегда use_ai).
+    """
+    if not parsed or not parsed.get('use_ai'):
+        return None
+    if (parsed.get('range_start') is not None or parsed.get('range_end') is not None
+            or parsed.get('time_range_start') is not None
+            or parsed.get('time_range_end') is not None):
+        return None
+    if parsed.get('days') and parsed.get('hours'):
+        return None  # 'sum1d 6h' в расписание не переносится
+    if parsed.get('days'):
+        period = f"{int(parsed['days'])}d"
+    elif parsed.get('hours'):
+        period = f"{int(parsed['hours'])}h"
+    elif parsed.get('limit'):
+        period = str(int(parsed['limit']))
+    else:
+        period = '24h'  # голая 'sum'
+    if parsed.get('post_to_source'):
+        period += '+'
+    if parsed.get('post_as_telegram'):
+        period += '-'
+    return period
+
+
+def schedule_free_slot(entries, hour, minute, step=5, max_slots=None):
+    """Ближайший свободный HH:MM, шаг step минут, переход через полночь.
+
+    Занятым считается слот ЛЮБОГО чата. None — если за max_slots
+    (по умолч. сутки/step) свободного не нашлось.
+    """
+    taken = {(e['hour'], e['minute']) for e in entries}
+    if max_slots is None:
+        max_slots = (24 * 60) // step
+    h, m = hour, minute
+    for _ in range(max_slots):
+        if (h, m) not in taken:
+            return h, m
+        m += step
+        if m >= 60:
+            h = (h + m // 60) % 24
+            m %= 60
+    return None
+
+
+async def schedule_listing_text():
+    """Полное расписание одной строкой-сообщением (SCHEDULE.txt, имена чатов)."""
+    entries = load_schedule(SCHEDULE_FILE)
+    if not entries:
+        return "📅 Расписание пусто."
+    lines = ["📅 Расписание:"]
+    for i, entry in enumerate(entries, 1):
+        try:
+            chat_entity = await telegram_client.get_entity(entry['chat_id'])
+            name = getattr(chat_entity, 'title', None) \
+                or f"чат {entry['chat_id']}"
+        except Exception:
+            name = f"чат {entry['chat_id']}"
+        period = entry['period']
+        if entry['post_to_source']:
+            period += '+'
+        if entry.get('post_as_telegram'):
+            period += '-'
+        lines.append(f"{i}. {name} — {entry['hour']:02d}:{entry['minute']:02d}, {period}")
+    return "\n".join(lines)
+
+
 scheduler = AsyncIOScheduler()
 
 
@@ -3789,11 +3862,14 @@ async def scheduled_analysis_job(chat_id, period, post_to_source, post_as_telegr
 
     hours = None
     days = None
+    limit = None
     period_clean = period.lower().strip()
     if period_clean.endswith('h'):
         hours = int(period_clean[:-1])
     elif period_clean.endswith('d'):
         days = int(period_clean[:-1])
+    elif period_clean.isdigit():
+        limit = int(period_clean)  # голый лимит: 20 = последние 20 сообщений
     else:
         days = 1
 
@@ -3802,6 +3878,7 @@ async def scheduled_analysis_job(chat_id, period, post_to_source, post_as_telegr
         chat_name=chat_name,
         hours=hours,
         days=days,
+        limit=limit,
         post_to_source=post_to_source,
         post_as_telegram=post_as_telegram,
         use_ai=True,
@@ -4278,6 +4355,8 @@ async def handle_help_command(event):
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/sch\s+\d'))
 async def handle_sch_command(event):
     """Добавляет текущий чат в расписание: /sch 09:00 1d или /sch 09:00 1d+"""
+    if _is_actions_mode():
+        return  # в Actions расписание пишется инбокс-командой 'HH:MM sum...' + git push
     chat = await event.get_chat()
     chat_name = chat.title if hasattr(chat, 'title') else "Private"
     chat_name_display = chat.title if hasattr(chat, 'title') else "чата"
@@ -4324,12 +4403,12 @@ async def handle_sch_command(event):
 
     period, post_to_source, post_as_telegram = _parse_suffixes(period_raw)
 
-    if not re.fullmatch(r'\d+[hd]', period):
+    if not re.fullmatch(r'\d+[hd]|\d+', period):
         await event.delete()
         topic_id = await get_or_create_topic(chat_name)
         await telegram_client.send_message(
             RESULTS_DESTINATION,
-            f"⚠️ Неверный формат периода: `{period_raw}`. Используйте `1d`, `12h`, `2d` и т.д.\n"
+            f"⚠️ Неверный формат периода: `{period_raw}`. Используйте `1d`, `12h`, `2d` или лимит `20`.\n"
             f"`+` после периода — публикация в исходном чате.\n"
             f"`-` после периода — вместо Telegraph — сообщение в канал.",
             reply_to=topic_id
@@ -4430,6 +4509,8 @@ async def handle_sch_list_command(event):
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/unsch$'))
 async def handle_unsch_command(event):
     """Удаляет текущий чат из расписания."""
+    if _is_actions_mode():
+        return  # в Actions расписание пишется инбокс-командой 'unsch ...' + git push
     chat = await event.get_chat()
     chat_name = chat.title if hasattr(chat, 'title') else "Private"
     chat_name_display = chat.title if hasattr(chat, 'title') else "чата"

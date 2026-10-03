@@ -146,6 +146,50 @@ def store_key_cursor(main, state):
     return state
 
 
+def git_push_schedule(message):
+    """Коммитит SCHEDULE.txt и пушит в origin main (rebase-retry при гонке).
+
+    Возвращает True/False. Вызывается только когда расписание уже сохранено
+    в файл; при False файл локально изменён, но в GitHub ничего не ушло.
+    """
+    import subprocess
+
+    def run(args):
+        return subprocess.run(['git', *args], capture_output=True, text=True)
+
+    if run(['add', '--', 'SCHEDULE.txt']).returncode != 0:
+        print("⚠️ git add SCHEDULE.txt не прошёл")
+        return False
+    r = run(['-c', 'user.name=chatsum-bot',
+             '-c', 'user.email=chatsum-bot@users.noreply.github.com',
+             'commit', '-m', message])
+    if r.returncode != 0:
+        out = (r.stdout or '') + (r.stderr or '')
+        if 'nothing to commit' in out:
+            return True  # содержимое уже закоммичено
+        print(f"⚠️ git commit не прошёл: {out.strip()}")
+        return False
+    for attempt in range(1, 4):
+        # HEAD:main — работает и на detached HEAD (так чекаутит checkout@v4)
+        r = run(['push', 'origin', 'HEAD:main'])
+        if r.returncode == 0:
+            return True
+        print(f"⚠️ git push отклонён (попытка {attempt}/3): "
+              f"{(r.stderr or r.stdout).strip()}")
+        # Гонка с чужим пушем: подтянуть историю (shallow → unshallow) и rebase.
+        run(['fetch', '--unshallow', 'origin'])  # не shallow → ошибка, неважно
+        f = run(['fetch', 'origin', 'main'])
+        if f.returncode != 0:
+            print(f"⚠️ git fetch не прошёл: {(f.stderr or f.stdout).strip()}")
+            return False
+        p = run(['rebase', 'origin/main'])
+        if p.returncode != 0:
+            print(f"⚠️ rebase не удался: {(p.stderr or p.stdout).strip()}")
+            run(['rebase', '--abort'])
+            return False
+    return False
+
+
 # ──────────────────────────────────────────────
 # Окно и должные задания (чистая логика, тестируемая без Telegram)
 # ──────────────────────────────────────────────
@@ -341,6 +385,13 @@ AT_RE = re.compile(r'(?<![\w@/])@([A-Za-z0-9_]{5,})')
 LINK_RESERVED = {'joinchat', 'iv', 'share', 'socks', 'proxy', 'addstickers',
                  'addemoji', 'boost', 'setlanguage', 'c'}
 
+# Команда расписания: [sch HH:MM] <команда|период>. Время обязательно.
+#   22:33 sum1d t.me/Чат   22:33 sum20      /sch 09:00 1d      22:33 1d+
+# sum/copy — c digit-guard как в parse_chat_command_args ('summary' не команда).
+SCHED_RE = re.compile(
+    r'^(?:/?sch\s+)?(\d{1,2}):(\d{2})\s+'
+    r'(/?(?:sum|copy)(?=[\d+\-]|\s).*|\d+[hd][+-]*|\d+[+-]*)$', re.IGNORECASE)
+
 
 def extract_chat_link(text):
     """Ссылка на чат из текста команды или None.
@@ -480,6 +531,199 @@ async def _drop_command(main, dest, msg, why):
         return False
 
 
+async def _sched_list(main, mem, dest, msg):
+    """'sch' → публикация полного расписания. Команда удаляется."""
+    top_id = msg_topic_id(msg)
+    home = top_id if top_id and top_id != 1 else None
+    text = await main.schedule_listing_text()
+    await _drop_command(main, dest, msg, 'выполнено')
+    await _notify_inbox(main, dest, home, text)
+    print(f"📋 Inbox {msg.id}: sch — расписание опубликовано")
+    return 'ok'
+
+
+async def _sched_unsch(main, mem, dest, msg, text):
+    """'unsch [ссылка]' → убрать чат из расписания (источник: ссылка/топик)."""
+    from telethon.utils import get_peer_id
+    snippet = text if len(text) <= 60 else text[:57] + '...'
+    top_id = msg_topic_id(msg)
+    home = top_id if top_id and top_id != 1 else None
+
+    async def fail(log_text, notice_text):
+        print(f"{log_text} | {snippet!r}")
+        if await _drop_command(main, dest, msg, 'провал'):
+            await _notify_inbox(main, dest, home,
+                                f"{notice_text}\nКоманда: {snippet!r}")
+        return 'fail'
+
+    source_id = None
+    link = extract_chat_link(text)
+    if link is not None:
+        kind, value = link
+        if kind == 'internal':
+            source_id = value
+        else:
+            try:
+                entity = await main.telegram_client.get_entity(value)
+                source_id = get_peer_id(entity)
+            except Exception as e:
+                return await fail(
+                    f"❌ Inbox {msg.id}: unsch — не резолвится {value!r}: {e}",
+                    f"❌ Inbox {msg.id}: не резолвится ссылка — команда удалена.")
+    if source_id is None:
+        if home and home != 1:
+            source_id = await resolve_topic_source(main, mem, dest, home)
+        if source_id is None:
+            return await fail(
+                f"❌ Inbox {msg.id}: unsch без ссылки и вне топика",
+                f"❌ Inbox {msg.id}: укажите чат — ссылку t.me/... или "
+                f"напишите unsch в топике чата. Удалена, ничего не снято.")
+
+    entries = main.load_schedule(main.SCHEDULE_FILE)
+    remain = [e for e in entries if e['chat_id'] != source_id]
+    if len(remain) == len(entries):
+        await _drop_command(main, dest, msg, 'выполнено')
+        await _notify_inbox(main, dest, home,
+                            f"ℹ️ Чат {source_id} не найден в расписании.")
+        return 'ok'
+    if not main.save_schedule(main.SCHEDULE_FILE, remain):
+        return await fail(f"❌ Inbox {msg.id}: ошибка записи SCHEDULE.txt",
+                          f"❌ Inbox {msg.id}: ошибка записи расписания.")
+    if not git_push_schedule(f"sched: unsch {source_id}"):
+        main.save_schedule(main.SCHEDULE_FILE, entries)  # откат локально
+        return await fail(f"❌ Inbox {msg.id}: git push не прошёл (unsch)",
+                          f"❌ Inbox {msg.id}: не удалось запушить в GitHub — "
+                          f"расписание не изменено.")
+    await _drop_command(main, dest, msg, 'выполнено')
+    listing = await main.schedule_listing_text()
+    await _notify_inbox(main, dest, home,
+                        f"✅ Чат {source_id} убран из расписания.\n\n{listing}")
+    print(f"🗑️ Inbox {msg.id}: unsch {source_id} — снято и запушено")
+    return 'ok'
+
+
+async def _sched_add(main, mem, dest, msg, m):
+    """'HH:MM sum1d [ссылка]' → запись в SCHEDULE.txt + git push.
+
+    Период: из sum-команды (schedule_period_from_parsed) либо готовый
+    ('1d', '20', '1d+'). Чат: ссылка → топик (название = чат).
+    Занятый слот → сдвиг +5 мин. Успех → удаление + подтверждение + список.
+    """
+    from telethon.utils import get_peer_id
+    hour, minute, cmd = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+    snippet = m.group(0) if len(m.group(0)) <= 60 else m.group(0)[:57] + '...'
+    top_id = msg_topic_id(msg)
+    home = top_id if top_id and top_id != 1 else None
+
+    async def fail(log_text, notice_text):
+        print(f"{log_text} | {snippet!r}")
+        if await _drop_command(main, dest, msg, 'провал'):
+            await _notify_inbox(main, dest, home,
+                                f"{notice_text}\nКоманда: {snippet!r}")
+        return 'fail'
+
+    if hour > 23 or minute > 59:
+        return await fail(f"❌ Inbox {msg.id}: неверное время {hour:02d}:{minute:02d}",
+                          f"❌ Inbox {msg.id}: неверное время — нужно 00:00–23:59. "
+                          f"Команда удалена.")
+
+    # Период: sum/copy-команда → производный; иначе готовый '1d'/'20'/'1d+'
+    if re.match(r'^/?(?:sum|copy)(?=[\d+\-]|\s)', cmd, re.IGNORECASE):
+        try:
+            parsed = main.parse_chat_command_args(cmd)
+        except Exception as e:
+            return await fail(f"❌ Inbox {msg.id}: не распарсить {cmd!r}: {e}",
+                              f"❌ Inbox {msg.id}: команда не распознана — удалена.")
+        if parsed is None:
+            return await fail(f"❌ Inbox {msg.id}: не команда {cmd!r}",
+                              f"❌ Inbox {msg.id}: команда не распознана — удалена.")
+        if not parsed.get('use_ai'):
+            return await fail(f"❌ Inbox {msg.id}: в расписании только sum (copy)",
+                              f"❌ Inbox {msg.id}: в расписании поддерживается "
+                              f"только sum (не copy). Команда удалена.")
+        period = main.schedule_period_from_parsed(parsed)
+        if period is None:
+            return await fail(f"❌ Inbox {msg.id}: период не сводится к SCHEDULE",
+                              f"❌ Inbox {msg.id}: в расписание ставятся только "
+                              f"одиночные периоды (sum1d, sum12h, sum20) — "
+                              f"диапазоны/time_range не поддерживаются. Удалена.")
+    else:
+        period = cmd.lower()  # готовый формат SCHEDULE ('1d', '20', '1d+')
+        clean, _, _ = main._parse_suffixes(period)
+        if not re.fullmatch(r'\d+[hd]|\d+', clean):
+            return await fail(f"❌ Inbox {msg.id}: битый период {cmd!r}",
+                              f"❌ Inbox {msg.id}: период {cmd!r} не понятен "
+                              f"(ожидалось 1d/12h/20). Команда удалена.")
+
+    # Источник: ссылка → топик
+    source_id = None
+    link = extract_chat_link(cmd)
+    if link is not None:
+        kind, value = link
+        if kind == 'internal':
+            source_id = value
+        else:
+            try:
+                entity = await main.telegram_client.get_entity(value)
+                source_id = get_peer_id(entity)
+            except Exception as e:
+                return await fail(
+                    f"❌ Inbox {msg.id}: не резолвится ссылка {value!r}: {e}",
+                    f"❌ Inbox {msg.id}: не резолвится ссылка {value!r} — "
+                    f"команда удалена, повтора не будет.")
+    if source_id is None:
+        if home and home != 1:
+            source_id = await resolve_topic_source(main, mem, dest, home)
+        if source_id is None:
+            return await fail(
+                f"❌ Inbox {msg.id}: расписание без ссылки и вне топика",
+                f"❌ Inbox {msg.id}: нужна ссылка t.me/.../@... либо "
+                f"команда в топике чата. Удалена, ничего не добавлено.")
+
+    # Дубль (точное совпадение чат+время+период) — не плодим
+    clean, plus, minus = main._parse_suffixes(period)
+    entry_args = dict(chat_id=source_id, hour=hour, minute=minute, period=clean,
+                      post_to_source=plus, post_as_telegram=minus)
+    entries = main.load_schedule(main.SCHEDULE_FILE)
+    for e in entries:
+        if (e['chat_id'] == source_id and e['hour'] == hour
+                and e['minute'] == minute and e['period'] == clean
+                and bool(e.get('post_to_source')) == plus
+                and bool(e.get('post_as_telegram')) == minus):
+            await _drop_command(main, dest, msg, 'выполнено')
+            await _notify_inbox(main, dest, home,
+                                f"ℹ️ Такая запись уже есть: {source_id} "
+                                f"{hour:02d}:{minute:02d}, {period}")
+            return 'ok'
+
+    slot = main.schedule_free_slot(entries, hour, minute)
+    if slot is None:
+        return await fail(f"❌ Inbox {msg.id}: нет свободного слота за сутки",
+                          f"❌ Inbox {msg.id}: все 5-мин слоты заняты — "
+                          f"не добавлено. Команда удалена.")
+    h, mi = slot
+    entries.append(dict(entry_args, hour=h, minute=mi))
+    if not main.save_schedule(main.SCHEDULE_FILE, entries):
+        return await fail(f"❌ Inbox {msg.id}: ошибка записи SCHEDULE.txt",
+                          f"❌ Inbox {msg.id}: ошибка записи расписания.")
+    if not git_push_schedule(f"sched: {source_id} {h:02d}:{mi:02d} {period}"):
+        main.save_schedule(main.SCHEDULE_FILE, entries[:-1])  # откат локально
+        return await fail(f"❌ Inbox {msg.id}: git push не прошёл",
+                          f"❌ Inbox {msg.id}: не удалось запушить в GitHub — "
+                          f"расписание локально откатлено, повторите позже.")
+
+    await _drop_command(main, dest, msg, 'выполнено')
+    shifted = (h, mi) != (hour, minute)
+    time_note = f"{hour:02d}:{minute:02d}→{h:02d}:{mi:02d} (слот был занят)" \
+        if shifted else f"{h:02d}:{mi:02d}"
+    listing = await main.schedule_listing_text()
+    await _notify_inbox(
+        main, dest, home,
+        f"✅ Расписание добавлено: {source_id}, {time_note}, {period}\n\n{listing}")
+    print(f"📅 Inbox {msg.id}: sched +{source_id} {h:02d}:{mi:02d} {period} — запушено")
+    return 'ok'
+
+
 async def process_inbox_message(main, mem, dest, msg):
     """Обработка одного inbox-сообщения. Возвращает 'ok' | 'fail' | 'skip'.
 
@@ -496,6 +740,16 @@ async def process_inbox_message(main, mem, dest, msg):
     text = (getattr(msg, 'text', None) or '').strip()
     if not text:
         return 'skip'
+
+    # Команды расписания: 'sch' | 'unsch [link]' | 'HH:MM sum1d [link]' | '/sch HH:MM 1d'
+    if text.lower() in ('sch', '/sch'):
+        return await _sched_list(main, mem, dest, msg)
+    if re.match(r'^/?unsch(\s|$)', text, re.IGNORECASE):
+        return await _sched_unsch(main, mem, dest, msg, text)
+    m_sc = SCHED_RE.match(text)
+    if m_sc:
+        return await _sched_add(main, mem, dest, msg, m_sc)
+
     try:
         parsed = main.parse_chat_command_args(text)
     except Exception as e:
