@@ -3444,6 +3444,12 @@ def parse_chat_command_args(text):
         m = re.match(r'^(/?(?:sum|copy))([\d+\-].*)$', parts[0], re.IGNORECASE)
         if m:
             parts = [m.group(1), m.group(2)]
+    else:
+        # Склейка в мног part ('sum50 t.me/...'): остаток — строго с цифры,
+        # чтобы не зацепить слова ('sum-up 100' — не команда, как раньше).
+        m = re.match(r'^(/?(?:sum|copy))(\d.*)$', parts[0], re.IGNORECASE)
+        if m:
+            parts = [m.group(1), m.group(2)] + parts[1:]
 
     head = parts[0].lower()
     if head.startswith('/'):
@@ -3580,12 +3586,16 @@ async def process_chat_command(event, use_ai=True):
         time_range_start = parsed['time_range_start']
         time_range_end = parsed['time_range_end']
 
-        # parts нужен только для строки логирования ниже
+        # parts нужен только для строки логирования ниже (сплит зеркалит парсер)
         parts = message_text.split()
         if len(parts) == 1:
             m = re.match(r'^(/(?:sum|copy))(.+)$', parts[0], re.IGNORECASE)
             if m:
                 parts = [m.group(1), m.group(2)]
+        else:
+            m = re.match(r'^(/(?:sum|copy))(\d.*)$', parts[0], re.IGNORECASE)
+            if m:
+                parts = [m.group(1), m.group(2)] + parts[1:]
 
         # Получаем чат один раз и используем для логирования и далее
         chat = await event.get_chat()

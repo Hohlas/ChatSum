@@ -5,7 +5,8 @@
 попали в окно [now - LAG_MAX, now] (время МСК), выполняет их через общее ядро
 main.scheduled_analysis_job и дедуплицирует через state.json (ветка `state`).
 В режиме --watch дополнительно опрашивает inbox (тема General канала
-результатов): форвард + команда sum/copy → выполнение через main.run_analysis.
+результатов): команда со ссылкой (`sum20 t.me/…`) либо команда в топике чата →
+выполнение через main.run_analysis.
 
 Режимы:
   python run_once.py --due                              # всё, что в окне
@@ -285,71 +286,112 @@ async def run_due(main, args):
 # ──────────────────────────────────────────────
 
 INBOX_INITIAL_LIMIT = 100  # глубина первого опроса (покрывает межрановый зазор)
-INBOX_PENDING_MAX = 20  # сколько неспаренных команд/форвардов помним внутри рана
+
+# Ссылка на чат в тексте команды: t.me/chatname | @chatname | t.me/c/ID[/msgid].
+LINK_RE = re.compile(
+    r'(?:https?://)?t\.me/(c/(\d+)(?:/\d+)?|[A-Za-z0-9_]{5,})', re.IGNORECASE)
+AT_RE = re.compile(r'(?<![\w@/])@([A-Za-z0-9_]{5,})')
+# Служебные t.me-пути — не чаты (joinchat требует вступления, такое не умеем).
+LINK_RESERVED = {'joinchat', 'iv', 'share', 'socks', 'proxy', 'addstickers',
+                 'addemoji', 'boost', 'setlanguage', 'c'}
 
 
-def forward_source_id(msg):
-    """ID источника из собственного форварда msg (канал/чат/пользователь) или None.
+def extract_chat_link(text):
+    """Ссылка на чат из текста команды или None.
 
-    PeerUser тоже годится: диалог анализируется как обычный чат.
-    Без атрибуции (копипаст, запрет указания авторства) → None.
+    Возвращает ('username', name) | ('internal', -100ID).
+    Голые слова ссылками НЕ считаются (только t.me/… или @…), иначе опечатка
+    будет вечно ретраиться как резолв.
     """
-    from telethon.tl.types import PeerChannel, PeerChat, PeerUser
-    from telethon.utils import get_peer_id
-
-    fwd = getattr(msg, 'fwd_from', None)
-    peer = getattr(fwd, 'from_id', None) if fwd else None
-    if isinstance(peer, (PeerChannel, PeerChat, PeerUser)):
-        return get_peer_id(peer)
+    m = LINK_RE.search(text or '')
+    if m:
+        if m.group(2) is not None:
+            return ('internal', int(f"-100{m.group(2)}"))
+        name = m.group(1)
+        if name.lower() not in LINK_RESERVED:
+            return ('username', name)
+        return None
+    m = AT_RE.search(text or '')
+    if m:
+        return ('username', m.group(1))
     return None
 
 
-def find_pair_forward(cmd, forwards, consumed):
-    """Спаривание (§2 п.3 плана): команда, а следующим сообщением — форвард.
+async def fetch_forum_topics(main, dest):
+    """{topic_id: title} канала результатов (кэш за ран берёт вызыватель)."""
+    try:
+        from telethon.tl.functions.channels import GetForumTopicsRequest
+        result = await main.telegram_client(GetForumTopicsRequest(
+            channel=dest, offset_date=0, offset_id=0, offset_topic=0, limit=100))
+        return {t.id: t.title for t in getattr(result, 'topics', [])
+                if getattr(t, 'id', None) and getattr(t, 'title', None)}
+    except Exception as e:
+        print(f"⚠️ Inbox: не удалось получить список топиков: {e}")
+        return {}
 
-    Порядок фиксированный: форвард строго НОВЕЕ команды (твой флоу: сначала
-    пишешь команду, потом пересылаешь цитату). forwards — форварды-кандидаты
-    (без своей команды); consumed — id уже использованных в этом ране.
-    Давности нет: команда хоть месячной давности ждёт свой форвард.
-    Побеждает ближайший сверху; возврат — сообщение-форвард или None.
+
+async def fetch_dialog_names(main):
+    """{точное название: chat_id} по всем диалогам + список дублей названий."""
+    from telethon.utils import get_peer_id
+    names = {}
+    dups = set()
+    try:
+        async for d in main.telegram_client.iter_dialogs():
+            ent = getattr(d, 'entity', None)
+            if ent is None:
+                continue
+            title = getattr(ent, 'title', None) or None
+            if not title:
+                first = getattr(ent, 'first_name', None)
+                if first:
+                    title = first + (f" {ent.last_name}" if getattr(ent, 'last_name', None) else "")
+            if not title:
+                continue
+            try:
+                cid = get_peer_id(ent)
+            except Exception:
+                continue
+            if title in names and names[title] != cid:
+                dups.add(title)
+            else:
+                names[title] = cid
+    except Exception as e:
+        print(f"⚠️ Inbox: не удалось получить диалоги: {e}")
+    return names, dups
+
+
+async def resolve_topic_source(main, mem, dest, top_id):
+    """Источник команды, написанной в топике: название топика = название чата.
+
+    Возвращает chat_id или None. Кэширует топики и диалоги за ран в mem.
+    Неопознанное логирует вызыватель (один раз за ран).
     """
-    best = None
-    best_dist = None
-    for fwd in forwards:
-        if getattr(fwd, 'id', None) in consumed:
-            continue
-        if getattr(fwd, 'id', 0) <= cmd.id:
-            continue  # форвард должен идти ПОСЛЕ команды, не до неё
-        try:
-            dist = fwd.id - cmd.id
-        except Exception:
-            continue
-        if best is None or dist < best_dist:
-            best, best_dist = fwd, dist
-    return best
-
-
-def resolve_inbox_source(msg):
-    """Источник команды по строгому порядку (§2 плана).
-
-    1. fwd_from.from_id (PeerChannel/PeerChat/PeerUser) самого сообщения.
-    2. Иначе reply-родитель с fwd_from.from_id.
-    Возвращает (source_chat_id | None, parent_msg | None).
-    Отсутствие форварда → (None, ...) = не команда.
-    """
-    source = forward_source_id(msg)
-    if source is not None:
-        return source, None
-
-    reply_id = getattr(msg, 'reply_to_msg_id', None)
-    if reply_id:
-        return None, reply_id  # родителя догрузит вызыватель (нужен async)
-    return None, None
+    if dest == 'me':
+        return None
+    if mem.get('topics') is None:
+        mem['topics'] = await fetch_forum_topics(main, dest)
+    title = mem['topics'].get(top_id)
+    if not title:
+        return None
+    if mem.get('dialogs') is None:
+        names, dups = await fetch_dialog_names(main)
+        mem['dialogs'] = names
+        for dup in sorted(dups):
+            print(f"⚠️ Inbox: название '{dup}' есть у нескольких чатов — беру первый")
+    src = mem['dialogs'].get(title)
+    return src
 
 
 def new_inbox_mem():
-    """Память inbox внутри одного рана: неспаренные команды/форварды + съеденные форварды."""
-    return {'cmds': {}, 'fwds': {}, 'consumed': set()}
+    """Память inbox внутри одного рана: кэши топиков/диалогов + антиспам лога."""
+    return {'topics': None, 'dialogs': None, 'skip_logged': set()}
+
+
+def _log_once(mem, key, text):
+    """Пропуск логируем один раз за ран (не засоряем лог каждые 20 сек)."""
+    if key not in mem['skip_logged']:
+        mem['skip_logged'].add(key)
+        print(text)
 
 
 async def poll_inbox_once(main, last_seen, mem):
@@ -360,11 +402,12 @@ async def poll_inbox_once(main, last_seen, mem):
     last_seen растёт всегда (in-memory, за ран), обработанные команды удаляются
     (дедуп персистить не надо).
 
-    mem (из new_inbox_mem) помнит неспаренные команды/форварды между опросами:
-    команда и форвард могут прийти в разные опросы (твой флоу: сначала команда,
-    следующим сообщением — цитата). Успешная пара удаляется целиком, повторное
-    использование форварда исключено (consumed + удаление).
+    Источник команды (строго по порядку): явная ссылка (`sum20 t.me/…`/`@…`/
+    `t.me/c/ID/…`) → топик (название топика = название чата среди диалогов).
+    Всё остальное — пропуск без удаления.
     """
+    from telethon.utils import get_peer_id
+
     dest = main.RESULTS_DESTINATION
     if last_seen is None:
         batch = [m async for m in main.telegram_client.iter_messages(dest, limit=INBOX_INITIAL_LIMIT)]
@@ -374,81 +417,59 @@ async def poll_inbox_once(main, last_seen, mem):
         batch = [m async for m in main.telegram_client.iter_messages(dest, min_id=last_seen)]
         batch.sort(key=lambda m: m.id)
 
-    if not batch and not mem['cmds'] and not mem['fwds']:
+    if not batch:
         return last_seen, 0
-    new_last_seen = last_seen
-    if batch:
-        new_last_seen = max([m.id for m in batch] + ([last_seen] if last_seen else []))
-    fresh_ids = {m.id for m in batch}
-
-    # Чистим память: сверх лимита выкидываем давно лежащее (давности нет —
-    # команда хоть месячной давности ждёт свой форвард).
-    for store in (mem['cmds'], mem['fwds']):
-        while len(store) > INBOX_PENDING_MAX:
-            store.pop(next(iter(store)))
-
-    parsed_cache = {}
-
-    def _parsed(m):
-        if m.id not in parsed_cache:
-            text = (getattr(m, 'text', None) or '').strip()
-            try:
-                parsed_cache[m.id] = main.parse_chat_command_args(text) if text else None
-            except Exception as e:
-                # Битый параметр ('sum abh'): не команда и не провал анализа —
-                # пропускаем, не удаляем, опрос не отравляем (лог — раз на опрос).
-                if m.id in fresh_ids:
-                    print(f"⚠️  Inbox {m.id}: не удалось распарсить {text!r}: {e} — пропускаю")
-                parsed_cache[m.id] = None
-        return parsed_cache[m.id]
-
-    # Запоминаем свежие кандидаты (команды — всегда; форварды — без своей команды).
-    for m in batch:
-        if _parsed(m) is not None:
-            mem['cmds'].setdefault(m.id, m)
-        elif forward_source_id(m) is not None:
-            mem['fwds'].setdefault(m.id, m)
-
-    forwards_pool = sorted(mem['fwds'].values(), key=lambda m: m.id)
+    new_last_seen = max(m.id for m in batch)
 
     failed = 0
-    # Новые команды первыми: свежее намерение побеждает при дележе форварда.
-    for cmd_id in sorted(mem['cmds'], reverse=True):
-        msg = mem['cmds'][cmd_id]
-        parsed = _parsed(msg)
-        if parsed is None:
-            mem['cmds'].pop(cmd_id, None)
+    for msg in batch:
+        text = (getattr(msg, 'text', None) or '').strip()
+        if not text:
             continue
+        try:
+            parsed = main.parse_chat_command_args(text)
+        except Exception as e:
+            # Битый параметр ('sum abh'): не команда и не провал анализа —
+            # пропускаем, не удаляем, опрос не отравляем.
+            print(f"⚠️  Inbox {msg.id}: не удалось распарсить {text!r}: {e} — пропускаю")
+            continue
+        if parsed is None:
+            continue  # не команда — не трогаем
 
-        paired_fwd = None
-        parent_id = None
-        source_id, need_parent = resolve_inbox_source(msg)
-        if need_parent is not None:
-            parent_id = need_parent
-            try:
-                parent = await main.telegram_client.get_messages(dest, ids=need_parent)
-                if isinstance(parent, list):
-                    parent = parent[0] if parent else None
-                if parent is not None:
-                    source_id, _ = resolve_inbox_source(parent)
-            except Exception as e:
-                print(f"⚠️ Inbox {msg.id}: не удалось получить родителя {need_parent}: {e}")
-                failed += 1
+        source_id = None
+        via = ""
+        link = extract_chat_link(text)
+        if link is not None:
+            kind, value = link
+            if kind == 'internal':
+                source_id = value
+                via = " (ссылка)"
+            else:
+                try:
+                    entity = await main.telegram_client.get_entity(value)
+                    source_id = get_peer_id(entity)
+                    via = " (ссылка)"
+                except Exception as e:
+                    _log_once(mem, f"link:{msg.id}",
+                              f"❌ Inbox {msg.id}: не резолвится ссылка {value!r}: {e} "
+                              f"(сообщение оставляю)")
+                    failed += 1
+                    continue
+        if source_id is None:
+            top_id = getattr(msg, 'reply_to_top_id', None)
+            if top_id not in (None, 1):
+                source_id = await resolve_topic_source(main, mem, dest, top_id)
+                if source_id is None:
+                    _log_once(mem, f"topic:{top_id}",
+                              f"⏭️  Inbox {msg.id}: топик {top_id} не сопоставлен "
+                              f"ни с одним чатом — пропускаю (не удаляю)")
+                    continue
+                via = " (топик)"
+            else:
+                _log_once(mem, "general",
+                          f"⏭️  Inbox {msg.id}: команда в General без ссылки — пропускаю "
+                          f"(нужна ссылка t.me/…/@… или команда в топике чата; не удаляю)")
                 continue
-        if source_id is None:
-            # п.3 плана: команда выше, форвард — следующим сообщением.
-            paired_fwd = find_pair_forward(
-                msg, forwards_pool, mem['consumed'])
-            if paired_fwd is not None:
-                source_id = forward_source_id(paired_fwd)
-        if source_id is None:
-            if msg.id in fresh_ids:
-                if need_parent is not None:
-                    print(f"⏭️  Inbox {msg.id}: команда без форварда источника "
-                          f"(ответ на {need_parent}, у родителя нет форварда) — жду пару")
-                else:
-                    print(f"⏭️  Inbox {msg.id}: команда без форварда источника — жду пару")
-            continue  # остаётся в памяти до следующего опроса
 
         try:
             chat_entity = await main.telegram_client.get_entity(source_id)
@@ -461,12 +482,13 @@ async def poll_inbox_once(main, last_seen, mem):
             else:
                 chat_name = f"чат {source_id}"
         except Exception as e:
-            print(f"❌ Inbox {msg.id}: нет доступа к чату {source_id}: {e} (повторю следующим опросом)")
+            _log_once(mem, f"noaccess:{msg.id}",
+                      f"❌ Inbox {msg.id}: нет доступа к чату {source_id}: {e} "
+                      f"(сообщение оставляю)")
             failed += 1
             continue
 
         use_ai = parsed['use_ai']
-        via = f" (пара с форвардом {paired_fwd.id})" if paired_fwd is not None else ""
         print(f"▶️  Inbox {msg.id}: {'sum' if use_ai else 'copy'} из '{chat_name}' ({source_id}){via}")
         try:
             topic_id = await main.get_or_create_topic(chat_name)
@@ -494,23 +516,15 @@ async def poll_inbox_once(main, last_seen, mem):
             print(f"❌ Inbox {msg.id}: исключение при выполнении: {e}")
 
         if ok is True:
-            to_delete = [msg.id] + ([paired_fwd.id] if paired_fwd is not None else [])
             try:
-                await main.telegram_client.delete_messages(dest, to_delete)
-                print(f"✅ Inbox {msg.id}: выполнено, удалено сообщений: {len(to_delete)}")
+                await main.telegram_client.delete_messages(dest, [msg.id])
+                print(f"✅ Inbox {msg.id}: выполнено, команда удалена")
             except Exception as e:
-                print(f"⚠️ Inbox {msg.id}: выполнено, но удалить не удалось: {e}")
-            mem['cmds'].pop(cmd_id, None)
-            if paired_fwd is not None:
-                mem['fwds'].pop(paired_fwd.id, None)
-                mem['consumed'].add(paired_fwd.id)
-            if parent_id is not None:
-                # Родитель-форвард уже отработал как источник — в пары не отдаём.
-                mem['fwds'].pop(parent_id, None)
-                mem['consumed'].add(parent_id)
+                print(f"⚠️ Inbox {msg.id}: выполнено, но удалить команду не удалось: {e}")
         else:
             failed += 1
-            print(f"❌ Inbox {msg.id}: НЕ выполнено — сообщение оставляю (будет повторено)")
+            _log_once(mem, f"fail:{msg.id}",
+                      f"❌ Inbox {msg.id}: НЕ выполнено — сообщение оставляю (будет повторено)")
 
     return new_last_seen, failed
 

@@ -103,11 +103,10 @@ def main():
 
     test_parser()
     test_bundle_keys()
-    test_resolve_source()
+    test_extract_link()
     test_watch_args()
     test_inbox_no_poison()
-    test_find_pair_forward()
-    test_pair_flow()
+    test_inbox_v2_flows()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")
@@ -155,6 +154,10 @@ def test_parser():
     r = p('sum+')
     check('parse sum+: default + post_to_source',
           r is not None and r['hours'] == 24 and r['post_to_source'] is True, r)
+    r = p('sum50 t.me/NodesGuru')
+    check('parse sum50 + link: limit держится',
+          r is not None and r['limit'] == 50 and r['use_ai'] is True, r)
+    check('parse sum-up 100 -> None (не команда)', p('sum-up 100') is None, p('sum-up 100'))
     # VPS-эквивалентность: те же строки со слэшем дают те же результаты
     for txt in ['sum100', 'sum 100-800', 'sum12h', 'copy1d', 'sum1d+', 'sum', 'copy 50']:
         a, b = p(txt), p('/' + txt)
@@ -186,28 +189,27 @@ def test_bundle_keys():
         os.environ.update(saved)
 
 
-def test_resolve_source():
-    from telethon.tl.types import PeerChannel, PeerChat, PeerUser
-
-    class Fwd:
-        def __init__(self, from_id):
-            self.from_id = from_id
-
-    class Msg:
-        def __init__(self, fwd_from=None, reply_to_msg_id=None):
-            self.fwd_from = fwd_from
-            self.reply_to_msg_id = reply_to_msg_id
-
-    src, parent = run_once.resolve_inbox_source(Msg(Fwd(PeerChannel(channel_id=1369370434))))
-    check('resolve fwd channel', src == -1001369370434 and parent is None, (src, parent))
-    src, parent = run_once.resolve_inbox_source(Msg(Fwd(PeerChat(chat_id=456))))
-    check('resolve fwd chat', src == -456 and parent is None, (src, parent))
-    src, parent = run_once.resolve_inbox_source(Msg(Fwd(PeerUser(user_id=789))))
-    check('resolve fwd user -> user id', src == 789 and parent is None, (src, parent))
-    src, parent = run_once.resolve_inbox_source(Msg(reply_to_msg_id=42))
-    check('resolve reply -> parent id', src is None and parent == 42, (src, parent))
-    src, parent = run_once.resolve_inbox_source(Msg())
-    check('resolve plain -> skip', src is None and parent is None, (src, parent))
+def test_extract_link():
+    e = run_once.extract_chat_link
+    check('link full url', e('sum20 https://t.me/NodesGuru') == ('username', 'NodesGuru'),
+          e('sum20 https://t.me/NodesGuru'))
+    check('link bare t.me', e('sum t.me/NodesGuru') == ('username', 'NodesGuru'),
+          e('sum t.me/NodesGuru'))
+    check('link @', e('copy1d @NodesGuru') == ('username', 'NodesGuru'),
+          e('copy1d @NodesGuru'))
+    check('link c/ with msgid',
+          e('sum50 https://t.me/c/1892263845/899001') == ('internal', -1001892263845),
+          e('sum50 https://t.me/c/1892263845/899001'))
+    check('link c/ with thread',
+          e('sum https://t.me/c/1892263845/1?thread=5') == ('internal', -1001892263845),
+          e('sum https://t.me/c/1892263845/1?thread=5'))
+    check('link joinchat ignored', e('sum https://t.me/joinchat/AAAAbbbb') is None,
+          e('sum https://t.me/joinchat/AAAAbbbb'))
+    check('link plus ignored', e('sum https://t.me/+AbCdEfGh') is None,
+          e('sum https://t.me/+AbCdEfGh'))
+    check('link bare word ignored', e('sum hello') is None, e('sum hello'))
+    check('link no link', e('sum50') is None, e('sum50'))
+    check('link empty', e('') is None, e(''))
 
 
 def test_watch_args():
@@ -219,19 +221,12 @@ def test_watch_args():
 
 def test_inbox_no_poison():
     """Битое 'sum abh' и слово 'summer' не отравляют опрос: валидная
-    команда в том же батче выполняется и удаляется."""
-    from telethon.tl.types import PeerChannel
-
-    class Fwd:
-        def __init__(self, from_id):
-            self.from_id = from_id
-
+    команда со ссылкой в том же батче выполняется и удаляется."""
     class FakeMsg:
-        def __init__(self, id, text, fwd_from=None, reply_to_msg_id=None):
+        def __init__(self, id, text, reply_to_top_id=None):
             self.id = id
             self.text = text
-            self.fwd_from = fwd_from
-            self.reply_to_msg_id = reply_to_msg_id
+            self.reply_to_top_id = reply_to_top_id
 
     class FakeEntity:
         title = 'SrcChat'
@@ -273,9 +268,9 @@ def test_inbox_no_poison():
 
     msgs = [
         FakeMsg(1, 'hello'),
-        FakeMsg(2, 'sum abh', fwd_from=Fwd(PeerChannel(channel_id=111))),
+        FakeMsg(2, 'sum abh'),
         FakeMsg(3, 'summer'),
-        FakeMsg(4, 'sum10', fwd_from=Fwd(PeerChannel(channel_id=111))),
+        FakeMsg(4, 'sum10 t.me/c/1892263845/50'),
     ]
     client = FakeClient(msgs)
     fake = FakeMain(client)
@@ -284,78 +279,30 @@ def test_inbox_no_poison():
     check('inbox poison: batch consumed', new_last_seen == 4 and failed == 0,
           (new_last_seen, failed))
     check('inbox poison: only valid cmd ran',
-          len(fake.ran) == 1 and fake.ran[0]['limit'] == 10 and fake.ran[0]['use_ai'] is True,
+          len(fake.ran) == 1 and fake.ran[0]['limit'] == 10 and fake.ran[0]['use_ai'] is True
+          and fake.ran[0]['chat_id'] == -1001892263845,
           fake.ran)
     check('inbox poison: only valid cmd deleted', client.deleted == [4], client.deleted)
 
 
-def test_find_pair_forward():
-    """Спаривание строго вперёд: команда → форвард следующим сообщением."""
-    from datetime import timezone
-    from telethon.tl.types import PeerChannel
-
-    class Fwd:
-        def __init__(self, from_id):
-            self.from_id = from_id
-
-    class M:
-        def __init__(self, id, dt, fwd=None):
-            self.id = id
-            self.date = dt
-            self.fwd_from = Fwd(fwd) if fwd else None
-
-    base = datetime(2026, 10, 3, 19, 0, tzinfo=timezone.utc)
-
-    def mins(n):
-        return base + timedelta(minutes=n)
-
-    cmd = M(100, mins(0))
-    f1 = M(101, mins(1), PeerChannel(channel_id=1))
-    f2 = M(103, mins(1), PeerChannel(channel_id=2))
-    got = run_once.find_pair_forward(cmd, [f1, f2], set())
-    check('pair: ближайший сверху', got is f1, getattr(got, 'id', None))
-
-    old = M(99, mins(-1), PeerChannel(channel_id=3))
-    got = run_once.find_pair_forward(cmd, [old], set())
-    check('pair: форвард ДО команды игнорируется', got is None, got)
-
-    got = run_once.find_pair_forward(cmd, [f1], {101})
-    check('pair: использованный исключается', got is None, got)
-
-    far = M(1200, mins(60 * 24 * 30), PeerChannel(channel_id=4))
-    got = run_once.find_pair_forward(cmd, [far], set())
-    check('pair: давности нет (месяц спустя — тоже пара)', got is far, getattr(got, 'id', None))
-
-    got = run_once.find_pair_forward(cmd, [], set())
-    check('pair: пустой пул', got is None, got)
-
-
-def test_pair_flow():
-    """Команда и форвард в РАЗНЫХ опросах: poll1 запоминает команду,
-    poll2 спаривает с форвардом — один анализ, удалены оба сообщения."""
-    from datetime import timezone
-    from telethon.tl.types import PeerChannel
-
-    class Fwd:
-        def __init__(self, from_id):
-            self.from_id = from_id
+def _make_v2_fakes():
+    """Фейки для inbox v2: батчи задаются через client.batches."""
 
     class FakeMsg:
-        def __init__(self, id, text, dt, fwd_from=None):
+        def __init__(self, id, text, reply_to_top_id=None):
             self.id = id
             self.text = text
-            self.date = dt
-            self.fwd_from = fwd_from
-            self.reply_to_msg_id = None
+            self.reply_to_top_id = reply_to_top_id
 
     class FakeEntity:
-        title = 'PairChat'
+        def __init__(self, title):
+            self.title = title
 
     class FakeClient:
-        def __init__(self, batches):
-            self.batches = batches
-            self.calls = 0
+        def __init__(self):
+            self.batches = []
             self.deleted = []
+            self.calls = 0
 
         async def iter_messages(self, dest, limit=None, min_id=None):
             batch = self.batches[min(self.calls, len(self.batches) - 1)]
@@ -365,11 +312,9 @@ def test_pair_flow():
                     continue
                 yield m
 
-        async def get_messages(self, dest, ids):
-            return None
-
-        async def get_entity(self, peer_id):
-            return FakeEntity()
+        async def get_entity(self, peer):
+            return FakeEntity({-1001892263845: 'LinkChat',
+                               -100111: 'PairChat'}.get(peer, f'чат {peer}'))
 
         async def send_message(self, dest, text, reply_to=None):
             return None
@@ -392,32 +337,53 @@ def test_pair_flow():
             self.ran.append(kw)
             return True
 
-    t0 = datetime(2026, 10, 3, 19, 0, tzinfo=timezone.utc)
-    cmd = FakeMsg(50, 'sum20', t0)
-    fwd = FakeMsg(51, 'цитата', t0 + timedelta(minutes=1),
-                  fwd_from=Fwd(PeerChannel(channel_id=777)))
-    client = FakeClient([[cmd], [fwd]])
-    fake = FakeMain(client)
-    loop = asyncio.get_event_loop()
+    client = FakeClient()
+    return FakeMsg, client, FakeMain(client)
+
+
+def test_inbox_v2_flows():
+    """v2: ссылка в General и команда в топике выполняются и удаляются;
+    неизвестный топик и команда без ссылки — пропуск без удаления."""
+    import io
+    import contextlib
+    FakeMsg, client, fake = _make_v2_fakes()
+    client.batches = [[
+        FakeMsg(10, 'sum20 https://t.me/c/1892263845/50'),
+        FakeMsg(11, 'sum10', reply_to_top_id=7),
+        FakeMsg(12, 'sum5', reply_to_top_id=9),
+        FakeMsg(13, 'sum5'),
+    ]]
     mem = run_once.new_inbox_mem()
+    # Предзаполняем кэши (fetch_* — тонкие обёртки Telethon, их гоняет E2E).
+    mem['topics'] = {7: 'PairChat', 9: 'Mystery'}
+    mem['dialogs'] = {'PairChat': -100111}
+    loop = asyncio.get_event_loop()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ls, failed = loop.run_until_complete(run_once.poll_inbox_once(fake, None, mem))
+    out = buf.getvalue()
+    check('v2: batch consumed', ls == 13 and failed == 0, (ls, failed))
+    check('v2: ссылка выполнена', len(fake.ran) == 2, fake.ran)
+    by_chat = {kw['chat_id']: kw for kw in fake.ran}
+    check('v2: ссылка даёт лимит+чат',
+          by_chat.get(-1001892263845, {}).get('limit') == 20, by_chat)
+    check('v2: топик даёт чат из диалогов',
+          by_chat.get(-100111, {}).get('limit') == 10, by_chat)
+    check('v2: удалены только выполненные', client.deleted == [10, 11], client.deleted)
+    check('v2: неизвестный топик залогирован',
+          out.count('топик 9 не сопоставлен') == 1, out)
+    check('v2: команда без ссылки залогирована',
+          out.count('без ссылки') == 1, out)
 
-    ls1, failed1 = loop.run_until_complete(run_once.poll_inbox_once(fake, None, mem))
-    check('pair flow: poll1 только запоминает',
-          ls1 == 50 and failed1 == 0 and not fake.ran and 50 in mem['cmds'],
-          (ls1, failed1, fake.ran))
-
-    ls2, failed2 = loop.run_until_complete(run_once.poll_inbox_once(fake, ls1, mem))
-    check('pair flow: poll2 выполняет один анализ',
-          ls2 == 51 and failed2 == 0 and len(fake.ran) == 1
-          and fake.ran[0]['limit'] == 20 and fake.ran[0]['chat_id'] == -1000000000777,
-          (ls2, failed2, fake.ran))
-    check('pair flow: удалены оба сообщения', client.deleted == [50, 51], client.deleted)
-    check('pair flow: форвард помечен использованным', mem['consumed'] == {51}, mem['consumed'])
-
-    # Третий опрос: повторов нет (команда съедена, форвард удалён/помечен).
-    ls3, failed3 = loop.run_until_complete(run_once.poll_inbox_once(fake, ls2, mem))
-    check('pair flow: без повторов', ls3 == 51 and failed3 == 0 and len(fake.ran) == 1,
-          (ls3, failed3, len(fake.ran)))
+    # _log_once: повторный прогон тех же причин — молчит.
+    mem2 = run_once.new_inbox_mem()
+    mem2['topics'] = {9: 'Mystery'}
+    mem2['dialogs'] = {}
+    run_once._log_once(mem2, 'topic:9', 'LINE')
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        run_once._log_once(mem2, 'topic:9', 'LINE')
+    check('v2: повторный лог подавлен', buf2.getvalue() == '', buf2.getvalue())
 
 
 if __name__ == '__main__':
