@@ -78,9 +78,14 @@ jobs:
           if [ -n "$CHAT_ID" ]; then
             python run_once.py --chat-id "$CHAT_ID" --period "${PERIOD:-1d}"
           else
-            # только цифры, иначе дефолты run_once.py (защита от инъекций)
-            case "${POLL_INTERVAL:-60}" in ''|*[!0-9]*) POLL_INTERVAL=60 ;; esac
-            case "${WATCH_SECONDS:-480}" in ''|*[!0-9]*) WATCH_SECONDS=480 ;; esac
+            # только цифры, иначе дефолты run_once.py (защита от инъекций);
+            # сначала подставить дефолт в саму переменную: case проверяет
+            # раскрытое значение, но присваивает сырое — пустая строка
+            # от schedule-событий иначе проскочила бы в argparse как ''.
+            POLL_INTERVAL="${POLL_INTERVAL:-60}"
+            case "$POLL_INTERVAL" in ''|*[!0-9]*) POLL_INTERVAL=60 ;; esac
+            WATCH_SECONDS="${WATCH_SECONDS:-480}"
+            case "$WATCH_SECONDS" in ''|*[!0-9]*) WATCH_SECONDS=480 ;; esac
             python run_once.py --watch --poll-interval "$POLL_INTERVAL" --watch-seconds "$WATCH_SECONDS"
           fi
 
