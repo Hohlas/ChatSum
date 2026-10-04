@@ -122,6 +122,7 @@ def main():
     test_key_cursor()
     test_503_rotates_key()
     test_rotate_advances_cursor()
+    test_duty_gap()
     test_handoff()
     test_duty()
     test_heartbeat_loop()
@@ -781,6 +782,38 @@ def test_rotate_advances_cursor():
     finally:
         (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
          bot.google_analysis_counter, bot.google_client) = saved
+
+
+def test_duty_gap():
+    """Самодиагностика пропусков: варнинг строго за порогом, мусор молчит."""
+    from datetime import timezone
+    now = datetime(2026, 10, 4, 18, 0, tzinfo=timezone.utc)
+    gap, warn = run_once.duty_gap_info('2026-10-04T17:57:00Z', now)
+    check('гэп: 3 мин — тихо', (gap, warn) == (180, False), (gap, warn))
+    gap, warn = run_once.duty_gap_info('2026-10-04T17:52:00Z', now)
+    check('гэп: 8 мин — варнинг', (gap, warn) == (480, True), (gap, warn))
+    gap, warn = run_once.duty_gap_info('2026-10-04T17:53:00Z', now)
+    check('гэп: ровно порог — тихо (строго больше)',
+          (gap, warn) == (420, False), (gap, warn))
+    for bad in (None, 'xx', '2026-10-04T18:05:00Z'):
+        gap, warn = run_once.duty_gap_info(bad, now)
+        check(f'гэп: {bad} — молчим', (gap, warn) == (None, False), (gap, warn))
+
+    saved = (run_once.leader_read, run_once.standby_read)
+    try:
+        run_once.leader_read = lambda: (
+            {'run_id': 'old/1', 'heartbeat_utc': '2026-10-04T17:50:00Z'}, 'a')
+        run_once.standby_read = lambda: (
+            {'run_id': 'me/1', 'heartbeat_utc': '2026-10-04T17:59:00Z'}, 'b')
+        hb, run = run_once.prev_duty_heartbeat('me/1')
+        check('гэп: свой свежий standby дыру не маскирует',
+              (hb, run) == ('2026-10-04T17:50:00Z', 'old/1'), (hb, run))
+        run_once.leader_read = lambda: (None, None)
+        hb, run = run_once.prev_duty_heartbeat('me/1')
+        check('гэп: остался только свой — базы нет',
+              (hb, run) == (None, None), (hb, run))
+    finally:
+        run_once.leader_read, run_once.standby_read = saved
 
 
 def test_handoff():

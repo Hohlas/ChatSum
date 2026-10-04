@@ -187,6 +187,11 @@ MAX_DUE_PER_ITERATION = 1    # due-саммари за итерацию: inbox �
                              # каждую итерацию, догон расписания идёт по одному —
                              # иначе шторм догона (4–6 слотов) хоронит команды
 
+try:
+    GAP_WARN_SEC = int((os.getenv('GAP_WARN_SEC', '') or '').strip() or 420)
+except ValueError:
+    GAP_WARN_SEC = 420           # тишина дежурства дольше этого — варнинг в General
+
 
 def handoff_enabled():
     """Есть ли доступ к API для флага (GITHUB_TOKEN + GITHUB_REPOSITORY)."""
@@ -258,6 +263,48 @@ def leader_should_yield(mine, remote, now=None):
     if rs != ms:
         return rs >= ms
     return str(remote.get('run_id') or '') > str((mine or {}).get('run_id') or '')
+
+
+def duty_gap_info(last_hb_utc, now=None, threshold_sec=GAP_WARN_SEC):
+    """Самодиагностика пропусков: (gap_sec|None, warn: bool).
+
+    last_hb_utc — последний чужой heartbeat (ISO/None/мусор). Возвращает
+    зазор в секундах и флаг варнинга (строго больше порога). Базы нет,
+    мусор, зазор в будущем/отрицательный — (None, False): молчим.
+    """
+    hb = _parse_utc(last_hb_utc)
+    if hb is None:
+        return None, False
+    now = now or _utc_now()
+    gap = (now - hb).total_seconds()
+    if gap <= 0:
+        return None, False
+    return int(gap), gap > threshold_sec
+
+
+def prev_duty_heartbeat(exclude_run_id):
+    """Последний ЧУЖОЙ heartbeat дежурства: (hb_iso|None, run_id|None).
+
+    Берёт свежее из флагов лидера и standby. Свой run_id исключаем:
+    иначе standby, принимающий дежурство в том же ране, своими же
+    heartbeat'ами замазал бы реальную дыру предшественника.
+    """
+    best_hb, best_run = None, None
+    for reader in (leader_read, standby_read):
+        try:
+            doc, _ = reader()
+        except Exception:
+            continue
+        if not isinstance(doc, dict):
+            continue
+        if doc.get('run_id') == exclude_run_id:
+            continue
+        hb = _parse_utc(doc.get('heartbeat_utc'))
+        if hb is None:
+            continue
+        if best_hb is None or hb > _parse_utc(best_hb):
+            best_hb, best_run = doc.get('heartbeat_utc'), doc.get('run_id')
+    return best_hb, best_run
 
 
 def standby_should_promote(remote, consec_stale_reads, now=None,
@@ -1581,7 +1628,11 @@ async def _leader_startup(main, args, state, path, me, poll):
     Claim неготовым → connect → ready + pull предшественника + пауза →
     проверка: флаг уже у более нового (стартовали толпой) — идём в standby,
     а не выходим: толпа сама рассосётся, дежурство не прервётся.
+    Самодиагностика пропусков: чужой heartbeat читаем ДО claim'а (свой claim
+    его перезапишет); если тишина дольше GAP_WARN_SEC — варнинг в General
+    по факту восстановления (слать раньше некому).
     """
+    prev_hb, prev_run = prev_duty_heartbeat(me['run_id'])
     print(f"👑 Заявляю лидерство (run {me['run_id']})...")
     leader_claim(me)
     try:
@@ -1608,6 +1659,17 @@ async def _leader_startup(main, args, state, path, me, poll):
     if leader_should_yield(me, remote):
         print(f"👑 Пока я стартовал, флаг у {remote.get('run_id')} — ухожу в standby.")
         return 'standby'
+    gap_sec, warn = duty_gap_info(prev_hb)
+    if gap_sec is not None:
+        print(f"👑 Тишина дежурства перед заступлением: {gap_sec // 60} мин "
+              f"(последний heartbeat {prev_hb} от {prev_run}).")
+        if warn:
+            mins = gap_sec // 60
+            await _notify_inbox(
+                main, main.RESULTS_DESTINATION, 1,
+                f"⚠️ Дежурство прерывалось: тишина {mins} мин "
+                f"(последний heartbeat {prev_hb} от {prev_run}). "
+                f"Заступил {me['run_id']} — проверяю due и inbox.")
     return 'leader'
 
 
