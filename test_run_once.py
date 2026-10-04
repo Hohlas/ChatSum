@@ -121,6 +121,7 @@ def main():
     test_503_rotates_key()
     test_handoff()
     test_duty()
+    test_heartbeat_loop()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")
@@ -910,6 +911,39 @@ def test_duty():
     check('duty: prune чистит старые счётчики',
           'old' not in st['inbox_attempts'] and 'new' in st['inbox_attempts']
           and 'old' not in st['due_fails'], st)
+
+
+def test_heartbeat_loop():
+    """Фоновый heartbeat бьёт по времени (не по итерациям) и останавливается отменой."""
+    saved_sec = run_once.LEADER_HEARTBEAT_SEC
+    saved_claim = run_once.leader_claim
+    saved_push = run_once.push_state_best_effort
+    calls = {'claim': 0, 'push': 0}
+    me = {'run_id': 't', 'ready': True, 'heartbeat_utc': 'old',
+          'watch_started_utc': '2026-10-04T09:00:00Z'}
+    try:
+        run_once.LEADER_HEARTBEAT_SEC = 0.05
+        run_once.leader_claim = lambda doc: calls.__setitem__('claim', calls['claim'] + 1) or True
+        run_once.push_state_best_effort = lambda path: calls.__setitem__('push', calls['push'] + 1) or True
+        loop = asyncio.get_event_loop()
+
+        async def run_briefly():
+            task = asyncio.create_task(run_once._heartbeat_loop(me, '/tmp/x.json'))
+            await asyncio.sleep(0.22)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        loop.run_until_complete(run_briefly())
+        check('heartbeat: claim+push бились несколько раз за 0.22с',
+              calls['claim'] >= 2 and calls['push'] >= 2, calls)
+        check('heartbeat: метка обновлена', me['heartbeat_utc'] != 'old', me['heartbeat_utc'])
+    finally:
+        run_once.LEADER_HEARTBEAT_SEC = saved_sec
+        run_once.leader_claim = saved_claim
+        run_once.push_state_best_effort = saved_push
 
 
 def _now_utc():

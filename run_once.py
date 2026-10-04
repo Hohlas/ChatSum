@@ -1563,15 +1563,36 @@ async def _leader_startup(main, args, state, path, me, poll):
     return 'leader'
 
 
+async def _heartbeat_loop(me, path):
+    """Фоновый heartbeat лидера каждые LEADER_HEARTBEAT_SEC (best-effort).
+
+    Отдельной задачей — осознанно: итерация лидера с тяжёлым саммари длится
+    дольше STALE_SEC, heartbeat по счётчику итераций протухал прямо посреди
+    задачи и standby объявлял живого мёртвым (наблюдалось в проде 2026-10-04).
+    Фоновая задача interleaves на await'ах (Telegram/Gemini HTTP) и бьёт
+    ровно по времени. Останавливается отменой от вызывателя.
+    """
+    try:
+        while True:
+            await asyncio.sleep(LEADER_HEARTBEAT_SEC)
+            me['heartbeat_utc'] = _utc_str(_utc_now())
+            leader_claim(me)
+            push_state_best_effort(path)
+    except asyncio.CancelledError:
+        pass
+
+
 async def _run_leader_loop(main, args, state, path, me, poll, use_handoff):
     """Дежурный цикл лидера: due + inbox до дедлайна. Возвращает exit-код."""
     failed_total = 0
     last_seen = None
     inbox_mem = new_inbox_mem()
     inbox_mem['state'] = state  # счётчик попыток живёт в state (переживает handoff)
-    hb_every = max(1, LEADER_HEARTBEAT_SEC // poll)
     sched_every = max(1, SCHEDULE_REFRESH_SEC // poll)
     iteration = 0
+    hb_task = None
+    if use_handoff:
+        hb_task = asyncio.create_task(_heartbeat_loop(me, path))
     try:
         deadline = time.monotonic() + args.watch_seconds
         while True:
@@ -1584,10 +1605,6 @@ async def _run_leader_loop(main, args, state, path, me, poll, use_handoff):
                     # как разруливатель сплит-брейна: старший молча выходит.
                     print(f"👑 Обнаружен более новый лидер {remote.get('run_id')} — выхожу.")
                     break
-                if iteration % hb_every == 0:
-                    me['heartbeat_utc'] = _utc_str(_utc_now())
-                    leader_claim(me)
-                    push_state_best_effort(path)
                 if iteration % sched_every == 0:
                     refresh_schedule_best_effort(main)
             failed_total += await run_due_once(main, args, state, path)
@@ -1608,6 +1625,12 @@ async def _run_leader_loop(main, args, state, path, me, poll, use_handoff):
                 break
             await asyncio.sleep(min(poll, deadline - now))
     finally:
+        if hb_task is not None:
+            hb_task.cancel()
+            try:
+                await hb_task
+            except asyncio.CancelledError:
+                pass
         await _watch_cleanup(main, state, path, use_handoff)
 
     print(f"🏁 Watch завершён ({iteration} итераций, неуспехов: {failed_total}).")
