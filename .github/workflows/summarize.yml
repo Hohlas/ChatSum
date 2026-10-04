@@ -2,7 +2,10 @@ name: ChatSum scheduled summaries
 
 on:
   schedule:
-    - cron: '*/10 * * * *'   # UTC; раннер сам решает, что «должно» в МСК
+    # Дежурство лидер+standby (флаги в ветке state): watch до 5 ч мостит
+    # зазоры cron. */11 дрейфует по часу (11 взаимно просто с 60) — тики не
+    # залипают на штурме начала часа (см. доки GitHub про high load).
+    - cron: '*/11 * * * *'   # UTC
   workflow_dispatch:          # ручной запуск из UI
     inputs:
       chat_id:
@@ -12,25 +15,26 @@ on:
         description: 'Период (1d, 12h)'
         required: false
       poll_interval:
-        description: 'Пауза между опросами inbox в режиме --watch, сек (по умолч. 60)'
+        description: 'Пауза между опросами inbox в режиме --watch, сек (по умолч. 30)'
         required: false
-        default: '60'
+        default: '30'
       watch_seconds:
-        description: 'Длительность цикла --watch, сек (по умолч. 480)'
+        description: 'Длительность цикла --watch, сек (по умолч. 18000 = 5 ч)'
         required: false
-        default: '480'
+        default: '18000'
 
 permissions:
   contents: write
 
-concurrency:
-  group: chatsum
-  cancel-in-progress: false
+# Параллельность РАЗРЕШЕНА осознанно: перекрытие ранов — суть дежурства.
+# Гонки гасит handoff (leader.json): живёт один лидер, остальные выходят.
+# Убирать этот комментарий и возвращать concurrency — только вместе с
+# возвратом коротких ранов.
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 330   # 5.5 ч: watch 5 ч + установка + хвостовой анализ
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -74,6 +78,9 @@ jobs:
           WATCH_SECONDS:  ${{ github.event.inputs.watch_seconds }}
           # run_once.py читает/пишет state по этому пути (вне рабочего дерева)
           STATE_PATH: ${{ runner.temp }}/state.json
+          # handoff лидерства через Contents API ветки state
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           if [ -n "$CHAT_ID" ]; then
             python run_once.py --chat-id "$CHAT_ID" --period "${PERIOD:-1d}"
@@ -82,10 +89,10 @@ jobs:
             # сначала подставить дефолт в саму переменную: case проверяет
             # раскрытое значение, но присваивает сырое — пустая строка
             # от schedule-событий иначе проскочила бы в argparse как ''.
-            POLL_INTERVAL="${POLL_INTERVAL:-60}"
-            case "$POLL_INTERVAL" in ''|*[!0-9]*) POLL_INTERVAL=60 ;; esac
-            WATCH_SECONDS="${WATCH_SECONDS:-480}"
-            case "$WATCH_SECONDS" in ''|*[!0-9]*) WATCH_SECONDS=480 ;; esac
+            POLL_INTERVAL="${POLL_INTERVAL:-30}"
+            case "$POLL_INTERVAL" in ''|*[!0-9]*) POLL_INTERVAL=30 ;; esac
+            WATCH_SECONDS="${WATCH_SECONDS:-18000}"
+            case "$WATCH_SECONDS" in ''|*[!0-9]*) WATCH_SECONDS=18000 ;; esac
             python run_once.py --watch --poll-interval "$POLL_INTERVAL" --watch-seconds "$WATCH_SECONDS"
           fi
 

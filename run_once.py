@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
-"""Однократный запуск срочных заданий — точка входа для GitHub Actions (вариант B).
+"""Однократный запуск срочных заданий — точка входа для GitHub Actions.
 
-Запускается по cron каждые 10 минут, определяет, какие задания из SCHEDULE.txt
-попали в окно [now - LAG_MAX, now] (время МСК), выполняет их через общее ядро
-main.scheduled_analysis_job и дедуплицирует через state.json (ветка `state`).
+Дежурный watch-цикл (лидер + standby через флаги в ветке state) опрашивает
+inbox каждые ~30 сек и крутит due-задачи из SCHEDULE.txt. Слот due, если
+в state.completed нет отметки за дату его последнего наступления (МСК), —
+опоздание любой длины догоняется одним разом. Выполняет через общее ядро
+main.scheduled_analysis_job / main.run_analysis.
 В режиме --watch дополнительно опрашивает inbox (тема General канала
 результатов): команда со ссылкой (`sum20 t.me/…`) либо команда в топике чата →
 выполнение через main.run_analysis.
 
 Режимы:
   python run_once.py --due                              # всё, что в окне
-  python run_once.py --watch [--watch-seconds 480] [--poll-interval 60]
+  python run_once.py --watch [--watch-seconds 18000] [--poll-interval 30]
   python run_once.py --chat-id -100... --period 1d [--post-source] [--post-tg]
   python run_once.py --list                             # напечатать расписание
 """
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import re
 import sys
 import time
+import urllib.error
+import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
@@ -32,9 +38,6 @@ load_dotenv('private.txt', override=False)
 
 MSK = timezone(timedelta(hours=3))
 STATE_DEFAULT = 'state.json'
-LAG_MAX_DEFAULT = 45    # минуты: cron GitHub нередко стартует/опазывает на 30-45 мин,
-                        # окно должно перекрывать «gap» между соседними ранами, иначе
-                        # слот навсегда выпадает (следующий ран видит его уже вне окна)
 STATE_RETENTION_DAYS = 3
 
 
@@ -47,15 +50,13 @@ def parse_args(argv):
                    help='Цикл ~watch-seconds: due-задачи + опрос inbox (форвард + sum/copy)')
     g.add_argument('--list', action='store_true', help='Напечатать расписание и выйти')
     g.add_argument('--chat-id', type=int, help='Chat ID для ручного прогона')
-    p.add_argument('--watch-seconds', type=int, default=480,
-                   help='Длительность цикла --watch, секунд (по умолчанию 480)')
-    p.add_argument('--poll-interval', type=int, default=60,
-                   help='Пауза между итерациями --watch, секунд (по умолчанию 60)')
+    p.add_argument('--watch-seconds', type=int, default=18000,
+                   help='Длительность цикла --watch, секунд (по умолчанию 18000 = 5 ч)')
+    p.add_argument('--poll-interval', type=int, default=30,
+                   help='Пауза между итерациями --watch, секунд (по умолчанию 30)')
     p.add_argument('--period', default='1d', help='Период анализа (1d, 12h)')
     p.add_argument('--post-source', action='store_true', help='Публиковать результат в исходном чате')
     p.add_argument('--post-tg', action='store_true', help='Отправлять как сообщение Telegram вместо Telegraph')
-    p.add_argument('--lag-max', type=int, default=LAG_MAX_DEFAULT,
-                   help=f'Допуск опозданий окна, минут (по умолчанию {LAG_MAX_DEFAULT})')
     args = p.parse_args(argv)
     if not (args.due or args.list or args.watch or args.chat_id is not None):
         p.error('Укажите --due, --watch, --list или --chat-id')
@@ -90,12 +91,22 @@ def save_state(path, state):
 
 
 def prune_state(state):
-    """Оставляет в completed только записи за последние ~3 суток (МСК)."""
+    """Оставляет в completed только записи за последние ~3 суток (МСК).
+
+    Счётчики inbox_attempts/due_fails тоже стареют: записи старше 3 суток
+    выкидываем, иначе state вечно пухнет от удалённых команд.
+    """
     completed = state.setdefault('completed', {})
-    if not completed:
-        return
-    cutoff = (datetime.now(MSK).date() - timedelta(days=STATE_RETENTION_DAYS)).isoformat()
-    state['completed'] = {k: v for k, v in completed.items() if v >= cutoff}
+    if completed:
+        cutoff = (datetime.now(MSK).date() - timedelta(days=STATE_RETENTION_DAYS)).isoformat()
+        state['completed'] = {k: v for k, v in completed.items() if v >= cutoff}
+    cutoff_utc = _utc_str(_utc_now() - timedelta(days=STATE_RETENTION_DAYS))
+    for field, ts_key in (('inbox_attempts', 'ts'), ('due_fails', 'first_utc')):
+        counters = state.get(field)
+        if not isinstance(counters, dict):
+            continue
+        state[field] = {k: v for k, v in counters.items()
+                        if not isinstance(v, dict) or str(v.get(ts_key) or '') >= cutoff_utc}
 
 
 def task_key(entry):
@@ -148,6 +159,346 @@ def store_key_cursor(main, state):
     return state
 
 
+# ──────────────────────────────────────────────
+# Дежурство: лидер + standby для длинных перекрывающихся ранов
+#
+# Крон тикает каждые 11 мин, а watch-цикл живёт до 5 ч. Роли распределяются
+# двумя флагами в ветке state (через Contents API, без checkout посреди
+# работы): leader.json — кто опрашивает inbox и крутит due; standby.json —
+# кто лёгким поллингом (без Telegram) следит за heartbeat лидера.
+# Новорождённый ран при живом лидере НЕ вытесняет его, а становится standby
+# (вытесняя более старый standby). Standby promotes себя в лидеры, если флаг
+# лидера пропал, протух (старше LEADER_STALE_SEC) или помечен retiring
+# (лидер грациозно уходит на дедлайне) — подтверждение двумя подряд
+# протухшими чтениями против ложных срабатываний. Два живых лидера
+# невозможны дольше итерации: правило «новее побеждает», старший выходит.
+# ──────────────────────────────────────────────
+
+LEADER_FILE = 'leader.json'
+STANDBY_FILE = 'standby.json'
+LEADER_STALE_SEC = 300       # лидер без heartbeat дольше этого — мёртв
+LEADER_HEARTBEAT_SEC = 120   # период heartbeat + push state
+SCHEDULE_REFRESH_SEC = 600   # период обновления SCHEDULE.txt из origin/main
+PROMOTE_CONFIRM_READS = 2    # подряд протухших чтений перед promotion
+INBOX_MAX_ATTEMPTS = 5       # попыток inbox-команды, дальше — удалить
+DUE_FAIL_THRESHOLD = 3       # подряд провалов due-ключа до пропуска
+DUE_FAIL_SKIP_SEC = 10800    # пропуск падающего due-ключа: 3 часа
+
+
+def handoff_enabled():
+    """Есть ли доступ к API для флага (GITHUB_TOKEN + GITHUB_REPOSITORY)."""
+    return bool(os.getenv('GITHUB_TOKEN', '').strip()
+                and os.getenv('GITHUB_REPOSITORY', '').strip())
+
+
+def my_run_id():
+    run_id = os.getenv('GITHUB_RUN_ID', '').strip()
+    if run_id:
+        return f"{run_id}/{os.getenv('GITHUB_RUN_ATTEMPT', '').strip() or '1'}"
+    return f"local-{uuid.uuid4().hex[:8]}"
+
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
+def _utc_str(dt):
+    return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _parse_utc(raw):
+    try:
+        dt = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def new_leader_doc(run_id):
+    now = _utc_str(_utc_now())
+    return {'run_id': run_id, 'ready': False,
+            'heartbeat_utc': now, 'watch_started_utc': now}
+
+
+def leader_is_live(doc, now=None):
+    """Свежий ли heartbeat (мёртвых лидеров игнорируем)."""
+    if not isinstance(doc, dict):
+        return False
+    hb = _parse_utc(doc.get('heartbeat_utc'))
+    if hb is None:
+        return False
+    now = now or _utc_now()
+    return (now - hb).total_seconds() < LEADER_STALE_SEC
+
+
+def leader_should_yield(mine, remote, now=None):
+    """Уступить ли лидерство чужому флагу (чистая логика, тестируется).
+
+    Уступаем только живому ГОТОВОМУ более новому лидеру. Своему run_id,
+    мёртвому и ещё стартующему (ready=false) — не уступаем: стартущий
+    никого не вытесняет, пока не поднимется. Равные watch_started
+    (старт в одну секунду) решает больший run_id — иначе уступят оба
+    и дежурство останется без лидера до следующего тика.
+    """
+    if not isinstance(remote, dict):
+        return False
+    if remote.get('run_id') == (mine or {}).get('run_id'):
+        return False
+    if not leader_is_live(remote, now):
+        return False
+    if not remote.get('ready'):
+        return False
+    rs = str(remote.get('watch_started_utc') or '')
+    ms = str((mine or {}).get('watch_started_utc') or '')
+    if rs != ms:
+        return rs >= ms
+    return str(remote.get('run_id') or '') > str((mine or {}).get('run_id') or '')
+
+
+def standby_should_promote(remote, consec_stale_reads, now=None,
+                           required=PROMOTE_CONFIRM_READS):
+    """Пора ли standby забирать лидерство (чистая логика, тестируется).
+
+    Да — если флага нет вообще, лидер объявил retiring (уходит на дедлайне)
+    или heartbeat протух подряд `required` чтений (защита от одиночного
+    сбоя сети: один протухший GET ещё не смерть).
+    """
+    if not isinstance(remote, dict):
+        return True
+    if remote.get('retiring'):
+        return True
+    if not leader_is_live(remote, now):
+        return consec_stale_reads >= required
+    return False
+
+
+def _flag_claim(flag_file, doc, label):
+    """Записать свой флаг (last-writer-wins, один ретрай при гонке sha)."""
+    _, sha = gh_state_file_get(flag_file)
+    doc_text = json.dumps(doc if isinstance(doc, dict) else {}, ensure_ascii=False)
+    if gh_state_file_put(flag_file, doc_text, sha,
+                         message=f"{label}: {doc.get('run_id') if isinstance(doc, dict) else '?'}"):
+        return True
+    _, sha2 = gh_state_file_get(flag_file)
+    return gh_state_file_put(flag_file, doc_text, sha2,
+                             message=f"{label}: "
+                             f"{doc.get('run_id') if isinstance(doc, dict) else '?'} (retry)")
+
+
+def _flag_read(flag_file):
+    """Прочитать чужой флаг: (doc|None, sha|None)."""
+    doc, sha = gh_state_file_get(flag_file)
+    return (doc if isinstance(doc, dict) else None), sha
+
+
+def _gh_contents_url(path, for_write=False):
+    api = os.getenv('GITHUB_API_URL', 'https://api.github.com').rstrip('/')
+    repo = os.getenv('GITHUB_REPOSITORY', '').strip()
+    url = f"{api}/repos/{repo}/contents/{path}"
+    return url if for_write else f"{url}?ref=state"
+
+
+def _gh_headers():
+    return {'Authorization': f"Bearer {os.getenv('GITHUB_TOKEN', '').strip()}",
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28'}
+
+
+def gh_state_file_get(path):
+    """Прочитать файл из ветки state. Возвращает (obj|str|None, sha|None).
+
+    404 (нет ветки/файла) и сетевые ошибки — (None, None), вызыватель
+    трактует как «флага нет», ран продолжает соло. Ран не роняем никогда.
+    """
+    req = urllib.request.Request(_gh_contents_url(path), headers=_gh_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            payload = json.load(r)
+    except urllib.error.HTTPError as e:
+        if getattr(e, 'code', None) != 404:
+            print(f"⚠️ Handoff: GET {path} → HTTP {e.code}")
+        return None, None
+    except Exception as e:
+        print(f"⚠️ Handoff: GET {path} не удался: {e}")
+        return None, None
+    try:
+        raw = base64.b64decode(payload.get('content') or '').decode('utf-8')
+    except Exception as e:
+        print(f"⚠️ Handoff: {path} не декодируется: {e}")
+        return None, None
+    if path.endswith('.json'):
+        try:
+            return json.loads(raw or '{}'), payload.get('sha')
+        except Exception:
+            return {}, payload.get('sha')
+    return raw, payload.get('sha')
+
+
+def gh_state_file_put(path, text, sha=None, message=None):
+    """Записать файл в ветку state. Возвращает True/False (ран не роняет)."""
+    body = json.dumps({
+        'message': message or f"chatsum: {path} {my_run_id()}",
+        'content': base64.b64encode(text.encode('utf-8')).decode(),
+        'branch': 'state',
+        **({'sha': sha} if sha else {}),
+    }).encode()
+    req = urllib.request.Request(
+        _gh_contents_url(path, for_write=True), data=body,
+        headers={**_gh_headers(), 'Content-Type': 'application/json'}, method='PUT')
+    try:
+        with urllib.request.urlopen(req, timeout=20):
+            return True
+    except urllib.error.HTTPError as e:
+        print(f"⚠️ Handoff: PUT {path} → HTTP {e.code}")
+        return False
+    except Exception as e:
+        print(f"⚠️ Handoff: PUT {path} не удался: {e}")
+        return False
+
+
+def leader_read():
+    """Прочитать чужой флаг лидера: (doc|None, sha|None)."""
+    return _flag_read(LEADER_FILE)
+
+
+def leader_claim(doc):
+    """Записать свой флаг лидера (last-writer-wins, один ретрай при гонке sha)."""
+    return _flag_claim(LEADER_FILE, doc, 'leader')
+
+
+def standby_read():
+    """Прочитать чужой флаг standby: (doc|None, sha|None)."""
+    return _flag_read(STANDBY_FILE)
+
+
+def standby_claim(doc):
+    """Записать свой флаг standby (last-writer-wins, один ретрай при гонке sha)."""
+    return _flag_claim(STANDBY_FILE, doc, 'standby')
+
+
+def merge_completed(local_completed, remote_completed):
+    """Объединение dedup-карт: побеждает свежая дата (строки ISO сравнимы)."""
+    merged = dict(remote_completed or {})
+    for k, v in (local_completed or {}).items():
+        if k not in merged or str(v) >= str(merged[k]):
+            merged[k] = v
+    return merged
+
+
+def _as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def merge_counters(local_counters, remote_counters):
+    """Объединение счётчиков {key: {'n': int, ...}}: побеждает большее n.
+
+    Монотонность важна для pull-merge перед финальным save: запись поверх
+    свежей ветки обязана быть надмножеством, иначе Persist затёр бы прогресс
+    лидера (баг «молчаливый standby перетирает state»).
+    """
+    merged = {k: dict(v) if isinstance(v, dict) else {'n': v}
+              for k, v in (remote_counters or {}).items()}
+    for k, v in (local_counters or {}).items():
+        v = dict(v) if isinstance(v, dict) else {'n': v}
+        cur = merged.get(k)
+        cur_n = cur.get('n', 0) if isinstance(cur, dict) else 0
+        try:
+            new_n = int(v.get('n', 0))
+        except (TypeError, ValueError):
+            new_n = 0
+        if k not in merged or new_n >= cur_n:
+            merged[k] = v
+    return merged
+
+
+def merge_states(local, remote):
+    """Union двух state-словарей в пользу свежих/больших значений (pure)."""
+    merged = dict(local or {})
+    remote = remote or {}
+    merged['completed'] = merge_completed(_as_dict((local or {}).get('completed')),
+                                          _as_dict(remote.get('completed')))
+    merged['inbox_attempts'] = merge_counters(_as_dict((local or {}).get('inbox_attempts')),
+                                              _as_dict(remote.get('inbox_attempts')))
+    merged['due_fails'] = merge_counters(_as_dict((local or {}).get('due_fails')),
+                                         _as_dict(remote.get('due_fails')))
+    if str(remote.get('last_run_utc') or '') > str(merged.get('last_run_utc') or ''):
+        merged['last_run_utc'] = remote['last_run_utc']
+    if 'google_key_cursor' in remote and 'google_key_cursor' not in merged:
+        merged['google_key_cursor'] = remote['google_key_cursor']
+    return merged
+
+
+def _read_local_state_json(path):
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def pull_state_best_effort(path):
+    """Подтянуть state из origin/state в локальный файл (union всего).
+
+    Нужно преемнику при handoff и обязательно перед финальным save:
+    запись поверх свежей ветки обязана быть надмножеством, иначе Persist
+    затёр бы чужой прогресс (молчаливый standby, уходящий лидер).
+    """
+    local = _read_local_state_json(path)
+    remote, _ = gh_state_file_get(STATE_DEFAULT)
+    if not isinstance(remote, dict):
+        return
+    try:
+        save_state(path, merge_states(local, remote))
+    except Exception as e:
+        print(f"⚠️ Не удалось сохранить state после pull: {e}")
+
+
+def push_state_best_effort(path):
+    """Запушить локальный state в origin/state (merge при гонке sha)."""
+    local = _read_local_state_json(path)
+    if not local:
+        return False
+
+    remote, sha = gh_state_file_get(STATE_DEFAULT)
+    text = json.dumps(merge_states(local, remote) if isinstance(remote, dict) else local,
+                      ensure_ascii=False, indent=2)
+    if gh_state_file_put(STATE_DEFAULT, text, sha, message=f"state: {my_run_id()}"):
+        return True
+    remote2, sha2 = gh_state_file_get(STATE_DEFAULT)  # гонка sha — один ретрай
+    text2 = json.dumps(merge_states(local, remote2) if isinstance(remote2, dict) else local,
+                       ensure_ascii=False, indent=2)
+    return gh_state_file_put(STATE_DEFAULT, text2, sha2, message=f"state: {my_run_id()} (retry)")
+
+
+def refresh_schedule_best_effort(main):
+    """Обновить локальный SCHEDULE.txt из origin/main.
+
+    За 5-часовой ран файл протухает: правки владельца и других ранов
+    иначе не видны. Локальных незапушенных правок у дежурного не бывает
+    (_sched_add/_sched_unsch пушат сразу либо откатывают), так что
+    перезапись безопасна. Возвращает True/False.
+    """
+    import subprocess
+    try:
+        f = subprocess.run(['git', 'fetch', '--quiet', '--depth=1', 'origin', 'main'],
+                           capture_output=True, text=True, timeout=60)
+        if f.returncode != 0:
+            return False
+        s = subprocess.run(['git', 'show', 'origin/main:SCHEDULE.txt'],
+                           capture_output=True, text=True, timeout=30)
+        if s.returncode != 0 or not s.stdout.strip():
+            return False
+        text = s.stdout if s.stdout.endswith('\n') else s.stdout + '\n'
+        with open(main.SCHEDULE_FILE, 'w', encoding='utf-8') as fh:
+            fh.write(text)
+        return True
+    except Exception:
+        return False
+
+
 def git_push_schedule(message):
     """Коммитит SCHEDULE.txt и пушит в origin main (rebase-retry при гонке).
 
@@ -193,49 +544,30 @@ def git_push_schedule(message):
 
 
 # ──────────────────────────────────────────────
-# Окно и должные задания (чистая логика, тестируемая без Telegram)
+# Должные задания: персональный водяной знак (чистая логика, тестируется)
 # ──────────────────────────────────────────────
 
-def compute_due(entries, now_msk_naive, lag_max, since_msk_naive=None):
-    """Возвращает [(entry, occurrence_naive_msk, date_key)] для заданий в окне.
+def compute_due(entries, now_msk_naive, completed=None):
+    """Возвращает [(entry, occurrence_naive_msk, date_key)] для необработанных.
 
-    now_msk_naive — текущее время МСК (naive, без tz). Границы округлены к минуте.
-    occurrence — ближайшее прошедшее наступление HH:MM в МСК (в пределах суток).
-    date_key — МСК-дата occurrence (используется как значение в state.completed).
-
-    since_msk_naive — время последнего рана (МСК). Если задано, окно расширяется
-    до него: слот, который выпал из окна из-за простоя раннера (GitHub-очередь),
-    догоняется следующим раном. Пересечение полуночи безопасно: попадает лишь
-    последнее occurrence на каждый слот.
+    now_msk_naive — текущее время МСК (naive). occurrence — последнее
+    наступление HH:MM не позже now; date_key — его МСК-дата.
+    Слот due, если в completed нет отметки именно за эту дату наступления.
+    Глобального окна/лага НЕТ осознанно: опоздание на 5 часов или сутки
+    всё равно догоняется одним разом (период считается на момент
+    выполнения, повторный прогон свежих данных безвреден). Больше одного
+    наступления на ключ за ран не бывает — «шторма повторов» нет.
     """
     now = now_msk_naive.replace(second=0, microsecond=0)
-    window_start = now - timedelta(minutes=lag_max)
-    if since_msk_naive is not None:
-        window_start = min(window_start, since_msk_naive.replace(second=0, microsecond=0))
+    completed = completed or {}
     due = []
     for entry in entries:
         slot = now.replace(hour=entry['hour'], minute=entry['minute'])
         occurrence = slot if slot <= now else slot - timedelta(days=1)
-        if window_start <= occurrence <= now:
-            due.append((entry, occurrence, occurrence.strftime('%Y-%m-%d')))
+        date_key = occurrence.strftime('%Y-%m-%d')
+        if completed.get(task_key(entry)) != date_key:
+            due.append((entry, occurrence, date_key))
     return due
-
-
-def _last_run_msk_naive(state):
-    """Время последнего успешного рана из state как naive-МСК или None.
-
-    Используется для догона слотов, выпавших из окна лага при простое раннера.
-    """
-    raw = (state or {}).get('last_run_utc')
-    if not raw:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(MSK).replace(tzinfo=None)
 
 
 # ──────────────────────────────────────────────
@@ -312,22 +644,46 @@ def cmd_list(main):
     return 0
 
 
+def due_skip_info(due_fails, key, now=None):
+    """Пропустить ли due-ключ: 3+ подряд провалов и не прошло 3 ч с первого.
+
+    Без этого постоянно падающий чат жёг бы Gemini каждые 30 сек весь 5-часовой
+    ран. Успех сбрасывает счётчик (см. run_due_once). Чистая логика.
+    """
+    rec = (due_fails or {}).get(key)
+    if not isinstance(rec, dict):
+        return False
+    try:
+        n = int(rec.get('n', 0))
+    except (TypeError, ValueError):
+        return False
+    if n < DUE_FAIL_THRESHOLD:
+        return False
+    first = _parse_utc(rec.get('first_utc'))
+    if first is None:
+        return False
+    now = now or _utc_now()
+    return (now - first).total_seconds() < DUE_FAIL_SKIP_SEC
+
+
 async def run_due_once(main, args, state, path):
     """Одна итерация due-задач: compute → dedup → выполнение → save.
 
     Соединение уже установлено вызывателем (run_due / run_watch).
-    Возвращает число невыполненных задач (0 = всё хорошо).
+    Отметка completed — строго при ok is True (флаг в самом конце).
+    Провал — счётчик due_fails (общий через API-push), пропуск 3 ч после
+    трёх подряд провалов. Возвращает число невыполненных задач.
     """
     now_msk = datetime.now(MSK)
     now_naive = now_msk.replace(second=0, microsecond=0)
-    since_naive = _last_run_msk_naive(state)
     entries = main.load_schedule(main.SCHEDULE_FILE)
-    due = compute_due(entries, now_naive, args.lag_max, since_naive)
+    due = compute_due(entries, now_naive, state.get('completed'))
     if not due:
-        print(f"[{now_msk.strftime('%Y-%m-%d %H:%M:%S')} МСК] Нет заданий в окне (lag_max={args.lag_max} мин).")
+        print(f"[{now_msk.strftime('%Y-%m-%d %H:%M:%S')} МСК] Нет необработанных слотов.")
         return 0
 
-    completed = state['completed']
+    completed = state.setdefault('completed', {})
+    due_fails = state.setdefault('due_fails', {})
 
     pending = []
     for entry, occurrence, date_key in due:
@@ -335,10 +691,14 @@ async def run_due_once(main, args, state, path):
         if completed.get(key) == date_key:
             print(f"⏭️  Уже выполнено: {key} ({date_key})")
             continue
+        if due_skip_info(due_fails, key):
+            print(f"⏭️  Пропускаю до восстановления: {key} "
+                  f"({due_fails[key].get('n')} провалов подряд)")
+            continue
         pending.append((entry, occurrence, key, date_key))
 
     if not pending:
-        print("Все должные задания уже выполнены (dedup).")
+        print("Все должные задания выполнены или на backoff.")
         return 0
 
     failed = 0
@@ -356,13 +716,28 @@ async def run_due_once(main, args, state, path):
             print(f"❌ Исключение при выполнении {key}: {e}")
         if ok is True:
             completed[key] = date_key
-            state['last_run_utc'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            state['last_run_utc'] = _utc_str(_utc_now())
+            due_fails.pop(key, None)
             prune_state(state)
             save_state(path, state)
+            # Длинный ран: сразу делимся прогрессом с преемником (best-effort).
+            if handoff_enabled():
+                push_state_best_effort(path)
             print(f"✅ {key} выполнено, записано в state")
         else:
             failed += 1
-            print(f"❌ {key} НЕ выполнено — в state не записываю (будет повторено)")
+            rec = due_fails.get(key)
+            if not isinstance(rec, dict) or not rec.get('first_utc'):
+                rec = {'n': 0, 'first_utc': _utc_str(_utc_now())}
+            try:
+                rec['n'] = int(rec.get('n', 0)) + 1
+            except (TypeError, ValueError):
+                rec['n'] = 1
+            due_fails[key] = rec
+            save_state(path, state)
+            if handoff_enabled():
+                push_state_best_effort(path)
+            print(f"❌ {key} НЕ выполнено (провал {rec['n']}) — повтор позже")
     return failed
 
 
@@ -403,6 +778,7 @@ async def run_due(main, args):
 # ──────────────────────────────────────────────
 
 INBOX_INITIAL_LIMIT = 100  # глубина первого опроса (покрывает межрановый зазор)
+FIRST_SWEEP_MAX_PAGES = 10  # потолок глубокой пагинации первого прохода (10×100)
 
 # Ссылка на чат в тексте команды: t.me/chatname | @chatname | t.me/c/ID[/msgid].
 LINK_RE = re.compile(
@@ -544,8 +920,80 @@ def msg_topic_id(msg):
 
 
 def new_inbox_mem():
-    """Память inbox внутри одного рана: кэши топиков/диалогов + антиспам лога."""
+    """Память inbox внутри одного рана: кэши топиков/диалогов + антиспам лога.
+
+    Вызыватель-лидер дополнительно кладёт mem['state'] = state (тот же dict):
+    счётчик попыток команд переживает handoff через state.json. Без 'state'
+    (юнит-тесты) — старое поведение: провал удаляет команду сразу.
+    """
     return {'topics': None, 'dialogs': None, 'skip_logged': set()}
+
+
+def _inbox_attempts(mem):
+    """Словарь попыток из state (или None, если mem без state)."""
+    st = (mem or {}).get('state')
+    if not isinstance(st, dict):
+        return None
+    return st.setdefault('inbox_attempts', {})
+
+
+def _inbox_state_save(mem):
+    """Сохранить state после изменения счётчика (файл + API-push преемнику)."""
+    st = (mem or {}).get('state')
+    if not isinstance(st, dict):
+        return
+    try:
+        save_state(state_path(), st)
+    except Exception as e:
+        print(f"⚠️ Не удалось сохранить state (попытки): {e}")
+        return
+    if handoff_enabled():
+        push_state_best_effort(state_path())
+
+
+def _attempt_bump(mem, msg_id):
+    """Зарегистрировать провал: возвращает (n, exhausted).
+
+    Без state в mem — (1, True): старое поведение, финал сразу.
+    Иначе n растёт до INBOX_MAX_ATTEMPTS, exhausted на пределе.
+    """
+    att = _inbox_attempts(mem)
+    if att is None:
+        return 1, True
+    key = str(msg_id)
+    rec = att.get(key)
+    if not isinstance(rec, dict):
+        rec = {}
+    try:
+        n = int(rec.get('n', 0)) + 1
+    except (TypeError, ValueError):
+        n = 1
+    rec['n'] = n
+    rec['ts'] = _utc_str(_utc_now())
+    att[key] = rec
+    return n, n >= INBOX_MAX_ATTEMPTS
+
+
+def _attempt_clear(mem, msg_id):
+    """Сбросить счётчик после успеха (команда выполнена и удаляется)."""
+    att = _inbox_attempts(mem)
+    if att is None:
+        return
+    att.pop(str(msg_id), None)
+
+
+def _attempt_number(mem, msg_id):
+    """Номер предстоящей попытки (для прогресс-сообщения)."""
+    att = _inbox_attempts(mem)
+    if att is None:
+        return 1
+    rec = att.get(str(msg_id))
+    if not isinstance(rec, dict):
+        return 1
+    try:
+        return int(rec.get('n', 0)) + 1
+    except (TypeError, ValueError):
+        return 1
 
 
 def _log_once(mem, key, text):
@@ -777,14 +1225,17 @@ async def _sched_add(main, mem, dest, msg, m):
 
 
 async def process_inbox_message(main, mem, dest, msg):
-    """Обработка одного inbox-сообщения. Возвращает 'ok' | 'fail' | 'skip'.
+    """Обработка одного inbox-сообщения. Возвращает 'ok' | 'fail' | 'skip' | 'retry'.
 
     Источник команды (строго по порядку): явная ссылка → топик (только если
     msg_topic_id указывает на известный топик канала результатов; заголовок
     есть у сообщений ВСЕХ топиков — опрос их не разделяет). Всё остальное —
-    General: без ссылки = провал. Успех и провал — удаление команды;
-    провал — плюс диагностика с текстом команды (куда: топик источника,
-    если он определён, иначе туда, где лежала команда).
+    General: резолв по названию чата, иначе провал.
+    Успех — удаление команды. Провал — счётчик попыток в state (до
+    INBOX_MAX_ATTEMPTS команда НЕ удаляется и повторяется; смерть процесса
+    посреди анализа — тоже повтор, сообщение переживает смерть). Исчерпание —
+    удаление + диагностика. Без mem['state'] (тесты) — старое поведение:
+    провал удаляет сразу. 'retry' в счёт failed_total не входит.
     Не-команды не трогаем никогда.
     """
     from telethon.utils import get_peer_id
@@ -826,7 +1277,13 @@ async def process_inbox_message(main, mem, dest, msg):
     snippet = text if len(text) <= 60 else text[:57] + '…'
 
     async def fail(notice_topic, log_text, notice_text):
-        print(f"{log_text} | {snippet!r}")
+        n, exhausted = _attempt_bump(mem, msg.id)
+        _inbox_state_save(mem)
+        if not exhausted:
+            print(f"{log_text} | {snippet!r} "
+                  f"(попытка {n}/{INBOX_MAX_ATTEMPTS} — команда оставлена для повтора)")
+            return 'retry'
+        print(f"{log_text} | {snippet!r} (попытки исчерпаны: {n})")
         if await _drop_command(main, dest, msg, 'провал'):
             await _notify_inbox(main, dest, notice_topic,
                                 f"{notice_text}\nКоманда: {snippet!r}")
@@ -894,13 +1351,27 @@ async def process_inbox_message(main, mem, dest, msg):
 
     use_ai = parsed['use_ai']
     print(f"▶️  Inbox {msg.id}: {'sum' if use_ai else 'copy'} из '{chat_name}' ({source_id}){via}")
+
+    # Handoff-гонка: пир мог взять ту же команду секундами раньше (оба рана
+    # видят её до удаления). Перечитываем: сообщения уже нет — значит, взято
+    # пиром, пропускаем без повтора. Ошибка проверки — продолжаем (fail-open).
+    try:
+        still = await main.telegram_client.get_messages(dest, ids=msg.id)
+        if not still:
+            print(f"⏭️ Inbox {msg.id}: команда уже взята другим раном — пропускаю")
+            return 'skip'
+    except Exception as e:
+        print(f"⚠️ Inbox {msg.id}: не удалось перепроверить команду ({e}) — продолжаю")
+
     notify_topic = home
+    attempt_no = _attempt_number(mem, msg.id)
+    retry_note = f" 🔁 Попытка {attempt_no}/{INBOX_MAX_ATTEMPTS}." if attempt_no > 1 else ""
     try:
         topic_out = await main.get_or_create_topic(chat_name)
         notify_topic = topic_out
         action = "анализ" if use_ai else "экспорт"
         await main.telegram_client.send_message(
-            dest, f"🔄 Начинаю {action} по команде из inbox, чат '{chat_name}'...",
+            dest, f"🔄 Начинаю {action} по команде из inbox, чат '{chat_name}'...{retry_note}",
             reply_to=topic_out)
         ok = await main.run_analysis(
             chat_id=source_id,
@@ -922,20 +1393,87 @@ async def process_inbox_message(main, mem, dest, msg):
         print(f"❌ Inbox {msg.id}: исключение при выполнении: {e}")
 
     if ok is True:
+        _attempt_clear(mem, msg.id)
+        _inbox_state_save(mem)
         await _drop_command(main, dest, msg, 'выполнено')
         print(f"✅ Inbox {msg.id}: выполнено")
         return 'ok'
     print(f"❌ Inbox {msg.id}: НЕ выполнено")
+    n, exhausted = _attempt_bump(mem, msg.id)
+    _inbox_state_save(mem)
+    if not exhausted:
+        print(f"⏳ Inbox {msg.id}: попытка {n}/{INBOX_MAX_ATTEMPTS} — команда оставлена для повтора")
+        return 'retry'
     if await _drop_command(main, dest, msg, 'провал'):
         # Детали провала анализа уже в топике (error-path run_analysis) —
         # здесь однострочник, чтобы не ждали впустую.
         await _notify_inbox(main, dest, notify_topic,
-                            f"⛔ Inbox {msg.id}: не выполнено — команда удалена, "
-                            f"повтора не будет.\nКоманда: {snippet!r}")
+                            f"⛔ Inbox {msg.id}: не выполнено после {n} попыток — "
+                            f"команда удалена.\nКоманда: {snippet!r}")
     else:
         _log_once(mem, f"dropfail:{msg.id}",
                   f"⚠️ Inbox {msg.id}: команда не удалена — повторится следующим опросом")
     return 'fail'
+
+
+async def _process_batch(main, mem, dest, batch):
+    """Прогнать батч по process_inbox_message.
+
+    Возвращает (failed, new_last_seen). 'retry' (попытка записана, команда
+    оставлена) провалом не считается — ран остаётся зелёным, пока идёт
+    борьба. new_last_seen откатывается к (старейший retry − 1), чтобы
+    оставленные команды перечитались уже следующим опросом (через ~30 сек),
+    а не только после рестарта рана. Повторно подхваченные поглощённые
+    сообщения безопасны: команды-однодневки уже удалены, не-команды — skip.
+    """
+    failed = 0
+    top = None
+    retry_ids = []
+    for msg in batch:
+        status = await process_inbox_message(main, mem, dest, msg)
+        mid = getattr(msg, 'id', 0) or 0
+        if top is None or mid > top:
+            top = mid
+        if status == 'fail':
+            failed += 1
+        elif status == 'retry':
+            retry_ids.append(mid)
+    if retry_ids:
+        return failed, min(retry_ids) - 1
+    return failed, top
+
+
+async def poll_inbox_first(main, mem):
+    """Глубокий первый проход: листаем назад, пока страница полная.
+
+    Штатный первый опрос берёт только свежие INBOX_INITIAL_LIMIT сообщений:
+    при 5-часовом зазоре, забитом собственными саммари бота, команда старше
+    окна вывалилась бы за границу и была бы пропущена навсегда (last_seen
+    встал бы на свежий максимум). Пагинация по offset_id закрывает это.
+    Потолок FIRST_SWEEP_MAX_PAGES страниц — от перебора всего канала.
+    Возвращает (new_last_seen, failed_count).
+    """
+    dest = main.RESULTS_DESTINATION
+    collected = []
+    offset_id = 0
+    for _ in range(FIRST_SWEEP_MAX_PAGES):
+        page = [m async for m in main.telegram_client.iter_messages(
+            dest, limit=INBOX_INITIAL_LIMIT, offset_id=offset_id)]
+        page = [m for m in page if getattr(m, 'id', 0)]
+        if not page:
+            break
+        collected.extend(page)
+        offset_id = min(m.id for m in page)
+        if len(page) < INBOX_INITIAL_LIMIT:
+            break
+    collected.sort(key=lambda m: m.id)
+    if not collected:
+        return None, 0
+    if len(collected) > INBOX_INITIAL_LIMIT:
+        print(f"📥 Inbox: глубокий проход — {len(collected)} сообщений "
+              f"(зазор был больше {INBOX_INITIAL_LIMIT})")
+    failed, new_last_seen = await _process_batch(main, mem, dest, collected)
+    return new_last_seen, failed
 
 
 async def poll_inbox_once(main, last_seen, mem):
@@ -943,53 +1481,115 @@ async def poll_inbox_once(main, last_seen, mem):
 
     Итерация отдаёт сообщения ВСЕХ топиков канала (не только General) —
     топик каждой команды определяет process_inbox_message по reply_to.
-    last_seen=None → первый опрос: берём до INBOX_INITIAL_LIMIT свежих
-    (покрывает команды из межранового зазора). Дальше — только id > last_seen.
-    last_seen растёт всегда (in-memory, за ран).
+    last_seen=None → глубокий первый проход poll_inbox_first (см.).
+    Дальше — только id > last_seen. last_seen растёт всегда (in-memory).
     """
     dest = main.RESULTS_DESTINATION
     if last_seen is None:
-        batch = [m async for m in main.telegram_client.iter_messages(dest, limit=INBOX_INITIAL_LIMIT)]
-        batch = [m for m in batch if getattr(m, 'id', 0)]
-        batch.sort(key=lambda m: m.id)
-    else:
-        batch = [m async for m in main.telegram_client.iter_messages(dest, min_id=last_seen)]
-        batch.sort(key=lambda m: m.id)
+        return await poll_inbox_first(main, mem)
+    batch = [m async for m in main.telegram_client.iter_messages(dest, min_id=last_seen)]
+    batch.sort(key=lambda m: m.id)
 
     if not batch:
         return last_seen, 0
-    new_last_seen = max(m.id for m in batch)
-
-    failed = 0
-    for msg in batch:
-        if await process_inbox_message(main, mem, dest, msg) == 'fail':
-            failed += 1
-
+    failed, new_last_seen = await _process_batch(main, mem, dest, batch)
     return new_last_seen, failed
 
 
-async def run_watch(main, args):
-    """Цикл §1 плана: due-задачи + опрос inbox до дедлайна, disconnect один раз."""
-    path = state_path()
-    state = load_state(path)
-    restore_key_cursor(main, state)
+async def _watch_cleanup(main, state, path, use_handoff=False):
+    """Единая финализация watch: pull-merge, курсор ключей, save, disconnect.
 
+    pull-merge перед save обязателен при handoff: свежая ветка могла уйти
+    вперёд (преемник уже пушил), запись обязана быть надмножеством — иначе
+    финальный Persist затёр бы чужой прогресс stale-снапшотом. Перезагрузка
+    идёт in-place (clear+update), чтобы живая ссылка mem['state'] не протухла.
+    """
+    if use_handoff:
+        pull_state_best_effort(path)
+        try:
+            fresh = load_state(path)
+            state.clear()
+            state.update(fresh)
+        except Exception as e:
+            print(f"⚠️ Не удалось перечитать state: {e}")
+    store_key_cursor(main, state)
+    try:
+        save_state(path, state)
+    except Exception as e:
+        print(f"⚠️ Не удалось сохранить state: {e}")
+    try:
+        await main.telegram_client.disconnect()
+    except Exception as e:
+        print(f"⚠️ Ошибка при disconnect: {e}")
+    try:
+        await main.http_client.aclose()
+    except Exception as e:
+        print(f"⚠️ Ошибка при закрытии http_client: {e}")
+
+
+async def _leader_startup(main, args, state, path, me, poll):
+    """Заявить лидерство и подняться. Возвращает 'leader' | 'standby'.
+
+    Claim неготовым → connect → ready + pull предшественника + пауза →
+    проверка: флаг уже у более нового (стартовали толпой) — идём в standby,
+    а не выходим: толпа сама рассосётся, дежурство не прервётся.
+    """
+    print(f"👑 Заявляю лидерство (run {me['run_id']})...")
+    leader_claim(me)
     try:
         await main.telegram_client.start(phone=main.PHONE)
     except Exception as e:
         print(f"❌ Не удалось подключиться к Telegram: {e}")
         print("   Проверьте TELEGRAM_SESSION / TELEGRAM_API_ID / TELEGRAM_API_HASH.")
-        return 1
+        return 'fail'
+    me['ready'] = True
+    me['heartbeat_utc'] = _utc_str(_utc_now())
+    leader_claim(me)
+    pull_state_best_effort(path)
+    try:
+        fresh = load_state(path)
+        state.clear()
+        state.update(fresh)
+    except Exception as e:
+        print(f"⚠️ Не удалось перечитать state: {e}")
+    restore_key_cursor(main, state)
+    refresh_schedule_best_effort(main)
+    print(f"👑 Дежурство заявлено, пауза {poll}с перед проверкой флага...")
+    await asyncio.sleep(poll)
+    remote, _ = leader_read()
+    if leader_should_yield(me, remote):
+        print(f"👑 Пока я стартовал, флаг у {remote.get('run_id')} — ухожу в standby.")
+        return 'standby'
+    return 'leader'
 
+
+async def _run_leader_loop(main, args, state, path, me, poll, use_handoff):
+    """Дежурный цикл лидера: due + inbox до дедлайна. Возвращает exit-код."""
     failed_total = 0
     last_seen = None
     inbox_mem = new_inbox_mem()
+    inbox_mem['state'] = state  # счётчик попыток живёт в state (переживает handoff)
+    hb_every = max(1, LEADER_HEARTBEAT_SEC // poll)
+    sched_every = max(1, SCHEDULE_REFRESH_SEC // poll)
+    iteration = 0
     try:
         deadline = time.monotonic() + args.watch_seconds
-        iteration = 0
         while True:
             iteration += 1
             print(f"─── Итерация {iteration} ───")
+            if use_handoff:
+                remote, _ = leader_read()
+                if leader_should_yield(me, remote):
+                    # Нормально такого нет (новички идут в standby), срабатывает
+                    # как разруливатель сплит-брейна: старший молча выходит.
+                    print(f"👑 Обнаружен более новый лидер {remote.get('run_id')} — выхожу.")
+                    break
+                if iteration % hb_every == 0:
+                    me['heartbeat_utc'] = _utc_str(_utc_now())
+                    leader_claim(me)
+                    push_state_best_effort(path)
+                if iteration % sched_every == 0:
+                    refresh_schedule_best_effort(main)
             failed_total += await run_due_once(main, args, state, path)
             try:
                 last_seen, inbox_failed = await poll_inbox_once(main, last_seen, inbox_mem)
@@ -998,25 +1598,126 @@ async def run_watch(main, args):
                 print(f"⚠️ Ошибка опроса inbox (итерация {iteration}): {e}")
             now = time.monotonic()
             if now >= deadline:
+                if use_handoff:
+                    # Мягкая передача: standby проснётся сразу, а не через stale.
+                    me['retiring'] = True
+                    me['heartbeat_utc'] = _utc_str(_utc_now())
+                    leader_claim(me)
+                    push_state_best_effort(path)
+                    print("👑 Дедлайн — объявляю retiring, standby принимает дежурство.")
                 break
-            await asyncio.sleep(min(args.poll_interval, deadline - now))
+            await asyncio.sleep(min(poll, deadline - now))
     finally:
-        store_key_cursor(main, state)
-        try:
-            save_state(path, state)
-        except Exception as e:
-            print(f"⚠️ Не удалось сохранить state: {e}")
-        try:
-            await main.telegram_client.disconnect()
-        except Exception as e:
-            print(f"⚠️ Ошибка при disconnect: {e}")
-        try:
-            await main.http_client.aclose()
-        except Exception as e:
-            print(f"⚠️ Ошибка при закрытии http_client: {e}")
+        await _watch_cleanup(main, state, path, use_handoff)
 
     print(f"🏁 Watch завершён ({iteration} итераций, неуспехов: {failed_total}).")
     return 1 if failed_total else 0
+
+
+async def _run_standby_loop(main, args, state, path, me, poll):
+    """Лёгкий наблюдатель без Telegram: следит за флагом, принимает дежурство.
+
+    Новый standby вытесняет старый по правилу «новее побеждает» (флаг один —
+    толпа не копится). Promotion при пропавшем/протухшем (два подряд чтения)
+    / retiring лидере; дальше — обычный подъём через _leader_startup.
+    Возвращает exit-код (0 — спокойное дежурство/передача).
+    """
+    me['ready'] = True
+    me['heartbeat_utc'] = _utc_str(_utc_now())
+    standby_claim(me)
+    print(f"🛡️ Standby {me['run_id']}: слежу за лидером, Telegram не подключаю.")
+    stale_reads = 0
+    sb_every = max(1, LEADER_HEARTBEAT_SEC // poll)
+    iteration = 0
+    try:
+        deadline = time.monotonic() + args.watch_seconds
+        while True:
+            iteration += 1
+            now = time.monotonic()
+            if now >= deadline:
+                print("🛡️ Standby: дедлайн — выхожу, лидер жив и без меня.")
+                break
+            await asyncio.sleep(min(poll, deadline - time.monotonic()))
+            sremote, _ = standby_read()
+            if leader_should_yield(me, sremote):
+                print(f"🛡️ Более новый standby {sremote.get('run_id')} — выхожу.")
+                break
+            remote, _ = leader_read()
+            if isinstance(remote, dict) and not remote.get('retiring') and leader_is_live(remote):
+                stale_reads = 0
+            else:
+                if not isinstance(remote, dict) or remote.get('retiring'):
+                    stale_reads = PROMOTE_CONFIRM_READS  # пропал/уходит — сразу
+                else:
+                    stale_reads += 1
+                if standby_should_promote(remote, stale_reads):
+                    why = 'retiring' if isinstance(remote, dict) and remote.get('retiring') \
+                        else ('пропал' if not isinstance(remote, dict) else 'мёртв')
+                    print(f"🛡️ Лидер {why} — принимаю дежурство.")
+                    res = await _leader_startup(main, args, state, path, me, poll)
+                    if res == 'leader':
+                        return await _run_leader_loop(main, args, state, path, me, poll, True)
+                    if res == 'standby':
+                        stale_reads = 0  # кто-то успел раньше — снова наблюдаем
+                        continue
+                    return 1  # 'fail' — Telegram не поднялся
+            if iteration % sb_every == 0:
+                me['heartbeat_utc'] = _utc_str(_utc_now())
+                standby_claim(me)
+    finally:
+        await _watch_cleanup(main, state, path, True)
+
+    return 0
+
+
+async def run_watch(main, args):
+    """Дежурство watch: лидер работает, standby страхует, disconnect один раз.
+
+    Без handoff (нет GITHUB_TOKEN) — сольный режим: сразу лидерский цикл.
+    С handoff: при живом лидере новорождённый идёт в standby (Telegram не
+    трогает); иначе — подъём лидером. Heartbeat + push state каждые
+    LEADER_HEARTBEAT_SEC, refresh SCHEDULE.txt каждые SCHEDULE_REFRESH_SEC.
+    """
+    path = state_path()
+    state = load_state(path)
+    restore_key_cursor(main, state)
+
+    use_handoff = handoff_enabled()
+    me = new_leader_doc(my_run_id())
+    poll = max(1, args.poll_interval)
+
+    if not use_handoff:
+        print("👑 Handoff выключен (нет GITHUB_TOKEN/GITHUB_REPOSITORY) — сольный режим.")
+        try:
+            await main.telegram_client.start(phone=main.PHONE)
+        except Exception as e:
+            print(f"❌ Не удалось подключиться к Telegram: {e}")
+            print("   Проверьте TELEGRAM_SESSION / TELEGRAM_API_ID / TELEGRAM_API_HASH.")
+            return 1
+        me['ready'] = True
+        return await _run_leader_loop(main, args, state, path, me, poll, False)
+
+    remote, _ = leader_read()
+    if (isinstance(remote, dict) and remote.get('run_id') != me['run_id']
+            and not remote.get('retiring') and leader_is_live(remote)):
+        print(f"👑 Лидер {remote.get('run_id')} жив — становлюсь standby.")
+        return await _run_standby_loop(main, args, state, path, me, poll)
+
+    res = await _leader_startup(main, args, state, path, me, poll)
+    if res == 'leader':
+        return await _run_leader_loop(main, args, state, path, me, poll, True)
+    if res == 'standby':
+        return await _run_standby_loop(main, args, state, path, me, poll)
+    # 'fail' — Telegram не поднялся; чистим клиентов и выходим с ошибкой.
+    try:
+        await main.telegram_client.disconnect()
+    except Exception:
+        pass
+    try:
+        await main.http_client.aclose()
+    except Exception:
+        pass
+    return 1
 
 
 async def run_manual(main, args):

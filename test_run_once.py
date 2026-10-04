@@ -47,35 +47,32 @@ def make_entries(now, mins_back):
 def main():
     now = datetime(2026, 10, 2, 6, 52)
 
-    # Тест окна: слот now-3min попадает в [now-15, now]
-    due = run_once.compute_due(make_entries(now, 3), now, 15)
-    check('slot now-3min c lag=15 выполняется', len(due) == 1, due)
+    # Per-key метка: слот due, если нет отметки за дату наступления
+    due = run_once.compute_due(make_entries(now, 3), now, {})
+    check('per-key: слот без отметки — due', len(due) == 1, due)
 
-    # Слот now-20min НЕ попадает в [now-15, now]
-    due = run_once.compute_due(make_entries(now, 20), now, 15)
-    check('slot now-20min c lag=15 НЕ выполняется', len(due) == 0, due)
+    # Отметка за сегодняшнюю дату наступления — skip
+    e = make_entries(now, 3)[0]
+    key = run_once.task_key(e)
+    due = run_once.compute_due([e], now, {key: '2026-10-02'})
+    check('per-key: слот с отметкой — skip', len(due) == 0, due)
 
-    # Тот же слот now-20min попадает при lag=30
-    due = run_once.compute_due(make_entries(now, 20), now, 30)
-    check('slot now-20min c lag=30 выполняется', len(due) == 1, due)
+    # Дыра 5 часов: слот now-300min без отметки — всё равно due (догон)
+    due = run_once.compute_due(make_entries(now, 300), now, {})
+    check('per-key: слот 5-часовой давности — due', len(due) == 1, due)
 
-    # Догон простоя: слот now-90min при lag=45, но since=now-120min — попадает
-    due = run_once.compute_due(make_entries(now, 90), now, 45, now - timedelta(minutes=120))
-    check('догон: слот now-90min c since=now-120 выполняется', len(due) == 1, due)
-    # Без since тот же слот выпадает (за пределами лага)
-    due = run_once.compute_due(make_entries(now, 90), now, 45, None)
-    check('догон: без since слот now-90min выпадает', len(due) == 0, due)
-    # since сам расширяет окно: слот now-10min всё ещё попадает
-    due = run_once.compute_due(make_entries(now, 10), now, 45, now - timedelta(minutes=120))
-    check('догон: слот now-10min остаётся в окне', len(due) == 1, due)
+    # Свежий last_run при НЕвыполненном слоте — всё равно due (дыра 2 закрыта:
+    # глобального окна больше нет, решает только персональная метка)
+    due = run_once.compute_due(make_entries(now, 300), now, {'other|00:00|1d': '2026-10-02'})
+    check('per-key: чужой прогресс не гасит слот', len(due) == 1, due)
 
-    # Полночь МСК: слот 23:58 пред. суток, now=00:03 — окно пересекает полночь
+    # Полночь МСК: слот 23:58 пред. суток, now=00:03 — ровно 1 срабатывание
     entries = [{
         'chat_id': -100, 'hour': 23, 'minute': 58,
         'period': '1d', 'post_to_source': False, 'post_as_telegram': False,
     }]
     now_mid = datetime(2026, 10, 2, 0, 3)
-    due = run_once.compute_due(entries, now_mid, 15)
+    due = run_once.compute_due(entries, now_mid, {})
     check('полночь: ровно 1 срабатывание', len(due) == 1, due)
     if due:
         _, occ, dk = due[0]
@@ -118,9 +115,12 @@ def main():
     test_inbox_no_poison()
     test_msg_topic_id()
     test_inbox_v2_flows()
+    test_inbox_retry_flow()
     test_sched_flows()
     test_key_cursor()
     test_503_rotates_key()
+    test_handoff()
+    test_duty()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")
@@ -228,7 +228,7 @@ def test_extract_link():
 
 def test_watch_args():
     a = run_once.parse_args(['--watch'])
-    check('watch defaults', a.watch and a.watch_seconds == 480 and a.poll_interval == 60, a)
+    check('watch defaults', a.watch and a.watch_seconds == 18000 and a.poll_interval == 30, a)
     a = run_once.parse_args(['--watch', '--watch-seconds', '120', '--poll-interval', '10'])
     check('watch custom', a.watch_seconds == 120 and a.poll_interval == 10, a)
 
@@ -250,11 +250,23 @@ def test_inbox_no_poison():
             self.msgs = msgs
             self.deleted = []
 
-        async def iter_messages(self, dest, limit=None, min_id=None):
-            for m in self.msgs:
-                if min_id is not None and m.id <= min_id:
-                    continue
+        async def iter_messages(self, dest, limit=None, min_id=None, offset_id=0):
+            msgs = self.msgs
+            if min_id is not None:
+                msgs = [m for m in msgs if m.id > min_id]
+            if offset_id:
+                msgs = [m for m in msgs if m.id < offset_id]
+            if limit is not None:
+                msgs = msgs[-int(limit):]
+            for m in msgs:
                 yield m
+
+        async def get_messages(self, dest, ids=None):
+            want = ids if isinstance(ids, (list, tuple)) else [ids]
+            found = [m for m in self.msgs if m.id in want]
+            if isinstance(ids, (list, tuple)):
+                return found
+            return found[0] if found else None
 
         async def get_entity(self, peer_id):
             return FakeEntity()
@@ -339,14 +351,26 @@ def _make_inbox_fakes(run_ok=True):
                 SimpleNamespace(id=tid, title=title)
                 for tid, title in self.topics])
 
-        async def iter_messages(self, dest, limit=None, min_id=None):
+        async def iter_messages(self, dest, limit=None, min_id=None, offset_id=0):
             msgs = sorted(self.msgs, key=lambda m: m.id)
             if min_id is not None:
                 msgs = [m for m in msgs if m.id > min_id]
+            if offset_id:
+                msgs = [m for m in msgs if m.id < offset_id]
             if limit is not None:
                 msgs = msgs[-int(limit):]
             for m in msgs:
                 yield m
+
+        async def get_messages(self, dest, ids=None):
+            # Как продовый Telethon: скалярный ids → сообщение или None
+            if ids is None:
+                return list(self.msgs)
+            want = ids if isinstance(ids, (list, tuple)) else [ids]
+            found = [m for m in self.msgs if m.id in want]
+            if isinstance(ids, (list, tuple)):
+                return found
+            return found[0] if found else None
 
         async def get_entity(self, peer):
             return FakeEntity({-1001892263845: 'LinkChat',
@@ -472,6 +496,46 @@ def test_inbox_v2_flows():
     with contextlib.redirect_stdout(buf2):
         run_once._log_once(mem2, 'topic:9', 'LINE')
     check('v2: повторный лог подавлен', buf2.getvalue() == '', buf2.getvalue())
+
+
+def test_inbox_retry_flow():
+    """Провал анализа со state: команда живёт до 5 попыток и перечитывается
+    уже следующим опросом (last_seen откатывается); успех/исчерпание — удаление."""
+    FakeMsg, client, fake = _make_inbox_fakes(run_ok=False)
+    client.msgs = [FakeMsg(10, 'sum20 https://t.me/c/1892263845/50')]
+    mem = run_once.new_inbox_mem()
+    mem['state'] = {}
+    loop = asyncio.get_event_loop()
+    with _quiet():
+        ls1, f1 = loop.run_until_complete(run_once.poll_inbox_once(fake, None, mem))
+    check('retry: 1-й провал — не удалена, не failed',
+          client.deleted == [] and f1 == 0, (client.deleted, f1))
+    check('retry: last_seen откатан ниже команды', ls1 == 9, ls1)
+    check('retry: счётчик попыток 1',
+          mem['state'].get('inbox_attempts', {}).get('10', {}).get('n') == 1,
+          mem['state'].get('inbox_attempts'))
+    with _quiet():
+        ls2, f2 = loop.run_until_complete(run_once.poll_inbox_once(fake, ls1, mem))
+    check('retry: 2-й опрос перечитал команду (не ждём рестарта)',
+          len(fake.ran) == 2 and ls2 == 9 and f2 == 0, (len(fake.ran), ls2, f2))
+    fake.run_ok = True
+    with _quiet():
+        ls3, f3 = loop.run_until_complete(run_once.poll_inbox_once(fake, ls2, mem))
+    check('retry: успех с 3-й — удалена, счётчик сброшен, last_seen вперёд',
+          client.deleted == [10] and mem['state'].get('inbox_attempts') == {}
+          and ls3 == 10 and f3 == 0, (client.deleted, ls3, f3))
+
+    # Исчерпание: 5 провалов подряд → удаление + failed
+    FakeMsg2, client2, fake2 = _make_inbox_fakes(run_ok=False)
+    client2.msgs = [FakeMsg2(20, 'sum20 https://t.me/c/1892263845/50')]
+    mem2 = run_once.new_inbox_mem()
+    mem2['state'] = {}
+    ls = f = None
+    with _quiet():
+        for _ in range(5):
+            ls, f = loop.run_until_complete(run_once.poll_inbox_once(fake2, ls, mem2))
+    check('retry: после 5 провалов — удалена и failed',
+          client2.deleted == [20] and f == 1 and ls == 20, (client2.deleted, f, ls))
 
 
 def test_sched_flows():
@@ -685,6 +749,172 @@ def test_503_rotates_key():
          bot.google_analysis_counter, bot.google_client,
          bot.asyncio.sleep) = saved
         bot.set_google_api_key_index = saved_set_index
+
+
+def test_handoff():
+    """Лидерство: уступаем только живому готовому более новому флагу."""
+    from datetime import timezone
+    now = datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc)
+
+    def doc(run, ready, hb_sec_ago, started, retiring=False):
+        hb = (now - timedelta(seconds=hb_sec_ago)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        d = {'run_id': run, 'ready': ready,
+             'heartbeat_utc': hb, 'watch_started_utc': started}
+        if retiring:
+            d['retiring'] = True
+        return d
+
+    mine = doc('111/1', True, 0, '2026-10-04T09:00:00Z')
+
+    # Свой run_id — не уступаем
+    check('handoff: свой флаг — не уступаем',
+          run_once.leader_should_yield(mine, dict(mine), now) is False)
+    # Нет флага — не уступаем
+    check('handoff: нет флага — не уступаем',
+          run_once.leader_should_yield(mine, None, now) is False)
+    # Мёртвый лидер (heartbeat 30 мин при stale 300с) — не уступаем
+    dead = doc('222/1', True, 1800, '2026-10-04T09:30:00Z')
+    check('handoff: мёртвый лидер — не уступаем',
+          run_once.leader_should_yield(mine, dead, now) is False)
+    check('handoff: мёртвый — не live', run_once.leader_is_live(dead, now) is False)
+    # Граница stale: 299с — жив, 301с — мёртв
+    edge_live = doc('x', True, 299, '2026-10-04T09:30:00Z')
+    edge_dead = doc('x', True, 301, '2026-10-04T09:30:00Z')
+    check('handoff: 299с — live', run_once.leader_is_live(edge_live, now) is True)
+    check('handoff: 301с — не live', run_once.leader_is_live(edge_dead, now) is False)
+    # Стартущий (ready=false), но новее — НЕ уступаем, он ещё не дежурит
+    starting = doc('333/1', False, 0, '2026-10-04T09:30:00Z')
+    check('handoff: стартущий — не уступаем',
+          run_once.leader_should_yield(mine, starting, now) is False)
+    check('handoff: стартущий — live', run_once.leader_is_live(starting, now) is True)
+    # Готовый новее — уступаем (передача флага)
+    newer = doc('444/1', True, 0, '2026-10-04T09:30:00Z')
+    check('handoff: готовый новее — уступаем',
+          run_once.leader_should_yield(mine, newer, now) is True)
+    # Готовый старше — не уступаем (мы новее, флаг наш)
+    older = doc('000/1', True, 0, '2026-10-04T08:00:00Z')
+    check('handoff: готовый старше — не уступаем',
+          run_once.leader_should_yield(mine, older, now) is False)
+    # Равный старт в одну секунду: побеждает больший run_id (оба не уступают —
+    # дыры «остались без лидера» нет)
+    tie_a = doc('aaa', True, 0, '2026-10-04T09:30:00Z')
+    tie_b = doc('zzz', True, 0, '2026-10-04T09:30:00Z')
+    check('handoff: tie — меньший уступает',
+          run_once.leader_should_yield(tie_a, tie_b, now) is True)
+    check('handoff: tie — больший остаётся',
+          run_once.leader_should_yield(tie_b, tie_a, now) is False)
+    # Битый heartbeat — не live, не уступаем
+    broken = {'run_id': 'x', 'ready': True, 'heartbeat_utc': 'мусор',
+              'watch_started_utc': '2026-10-04T09:30:00Z'}
+    check('handoff: битый heartbeat — не уступаем',
+          run_once.leader_should_yield(mine, broken, now) is False)
+
+    # merge_completed: объединение, побеждает свежая дата
+    merged = run_once.merge_completed({'a': '2026-10-04', 'b': '2026-10-03'},
+                                      {'b': '2026-10-04', 'c': '2026-10-04'})
+    check('handoff: merge union + свежая побеждает',
+          merged == {'a': '2026-10-04', 'b': '2026-10-04', 'c': '2026-10-04'}, merged)
+
+    # my_run_id: формат GitHub и локальный фолбэк (без сети)
+    saved = (os.getenv('GITHUB_RUN_ID'), os.getenv('GITHUB_RUN_ATTEMPT'))
+    try:
+        os.environ['GITHUB_RUN_ID'] = '123'
+        os.environ['GITHUB_RUN_ATTEMPT'] = '2'
+        check('handoff: run_id из env', run_once.my_run_id() == '123/2', run_once.my_run_id())
+        del os.environ['GITHUB_RUN_ID']
+        os.environ.pop('GITHUB_RUN_ATTEMPT', None)
+        rid = run_once.my_run_id()
+        check('handoff: локальный фолбэк', rid.startswith('local-'), rid)
+        # Без токена — соло, сеть не трогаем
+        os.environ.pop('GITHUB_TOKEN', None)
+        check('handoff: без токена выключен', run_once.handoff_enabled() is False)
+    finally:
+        for k, v in (('GITHUB_RUN_ID', saved[0]), ('GITHUB_RUN_ATTEMPT', saved[1])):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_duty():
+    """Standby/promote, due-backoff, inbox-попытки, merge state, prune счётчиков."""
+    from datetime import timezone
+    now = datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc)
+
+    def doc(run, ready, hb_sec_ago, started, retiring=False):
+        hb = (now - timedelta(seconds=hb_sec_ago)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        d = {'run_id': run, 'ready': ready,
+             'heartbeat_utc': hb, 'watch_started_utc': started}
+        if retiring:
+            d['retiring'] = True
+        return d
+
+    live = doc('111/1', True, 10, '2026-10-04T09:00:00Z')
+    stale = doc('111/1', True, 400, '2026-10-04T09:00:00Z')
+    retiring = doc('111/1', True, 10, '2026-10-04T09:00:00Z', retiring=True)
+
+    # Promotion: нет флага / retiring — сразу; живому — нет; протухшему —
+    # только со второго подряд чтения
+    check('duty: нет флага — promote', run_once.standby_should_promote(None, 0, now) is True)
+    check('duty: retiring — promote', run_once.standby_should_promote(retiring, 0, now) is True)
+    check('duty: живой — ждём', run_once.standby_should_promote(live, 9, now) is False)
+    check('duty: 1-е протухшее чтение — ждём',
+          run_once.standby_should_promote(stale, 1, now) is False)
+    check('duty: 2-е протухшее чтение — promote',
+          run_once.standby_should_promote(stale, 2, now) is True)
+
+    # Due-backoff: <3 провалов — работаем; 3 свежих — пропуск; старые (>3ч) — снова работаем
+    fresh_ts = (now - timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    old_ts = (now - timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    check('duty: 2 провала — работаем',
+          run_once.due_skip_info({'k': {'n': 2, 'first_utc': fresh_ts}}, 'k', now) is False)
+    check('duty: 3 свежих провала — пропуск',
+          run_once.due_skip_info({'k': {'n': 3, 'first_utc': fresh_ts}}, 'k', now) is True)
+    check('duty: 3 старых провала — снова работаем',
+          run_once.due_skip_info({'k': {'n': 3, 'first_utc': old_ts}}, 'k', now) is False)
+    check('duty: нет записи — работаем',
+          run_once.due_skip_info({}, 'k', now) is False)
+
+    # Inbox-попытки: рост до 5, exhausted на пределе; без state — финал сразу
+    mem = {'state': {}}
+    for i in range(1, 5):
+        n, exh = run_once._attempt_bump(mem, 777)
+        check(f'duty: попытка {i} — не exhausted', (n, exh) == (i, False), (n, exh))
+    check('duty: номер предстоящей — 5', run_once._attempt_number(mem, 777) == 5)
+    n, exh = run_once._attempt_bump(mem, 777)
+    check('duty: 5-я — exhausted', (n, exh) == (5, True), (n, exh))
+    check('duty: без state — финал сразу',
+          run_once._attempt_bump({}, 777) == (1, True))
+    run_once._attempt_clear(mem, 777)
+    check('duty: clear сбрасывает', run_once._attempt_number(mem, 777) == 1)
+
+    # merge_states: union completed + max счётчиков + свежий last_run
+    local = {'completed': {'a': '2026-10-04'}, 'inbox_attempts': {'m1': {'n': 2, 'ts': 'x'}},
+             'due_fails': {}, 'last_run_utc': '2026-10-04T08:00:00Z'}
+    remote = {'completed': {'b': '2026-10-04'}, 'inbox_attempts': {'m1': {'n': 4, 'ts': 'y'}},
+              'due_fails': {'k': {'n': 1, 'first_utc': 'z'}}, 'last_run_utc': '2026-10-04T09:00:00Z'}
+    m = run_once.merge_states(local, remote)
+    check('duty: merge completed union',
+          m['completed'] == {'a': '2026-10-04', 'b': '2026-10-04'}, m['completed'])
+    check('duty: merge attempts max', m['inbox_attempts']['m1']['n'] == 4, m['inbox_attempts'])
+    check('duty: merge due_fails union', 'k' in m['due_fails'], m['due_fails'])
+    check('duty: merge last_run свежий',
+          m['last_run_utc'] == '2026-10-04T09:00:00Z', m['last_run_utc'])
+
+    # prune счётчиков: старше 3 суток — вылетают, свежие — живут
+    st = {'completed': {},
+          'inbox_attempts': {'old': {'n': 5, 'ts': '2026-09-01T00:00:00Z'},
+                             'new': {'n': 1, 'ts': _now_utc()}},
+          'due_fails': {'old': {'n': 3, 'first_utc': '2026-09-01T00:00:00Z'}}}
+    run_once.prune_state(st)
+    check('duty: prune чистит старые счётчики',
+          'old' not in st['inbox_attempts'] and 'new' in st['inbox_attempts']
+          and 'old' not in st['due_fails'], st)
+
+
+def _now_utc():
+    from datetime import timezone
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def _quiet():
