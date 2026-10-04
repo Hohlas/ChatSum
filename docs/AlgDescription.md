@@ -11,7 +11,8 @@ do not "tune" them without the owner.
 - `main.py` — core: Telegram client, `scheduled_analysis_job` (scheduled slot),
   `run_analysis` (one inbox command; returns True only if ALL `send_*` passed),
   Gemini key rotation (`select_google_api_key_for_new_analysis`, round-robin;
-  `rotate_*` on 503/quota).
+  `rotate_*` on 503/quota — rotate also advances the persistent counter, so the
+  next analysis starts past dead keys instead of re-walking them).
 - `run_once.py` — scheduler + duty wrapper. Imports `main.py`. Entry points:
   `--due` (manual drain), `--watch` (duty loop). All times in slots are
   **MSK = UTC+3** (`MSK`, `run_once.py:39`).

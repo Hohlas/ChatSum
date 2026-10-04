@@ -121,6 +121,7 @@ def main():
     test_sched_flows()
     test_key_cursor()
     test_503_rotates_key()
+    test_rotate_advances_cursor()
     test_handoff()
     test_duty()
     test_heartbeat_loop()
@@ -753,6 +754,33 @@ def test_503_rotates_key():
          bot.google_analysis_counter, bot.google_client,
          bot.asyncio.sleep) = saved
         bot.set_google_api_key_index = saved_set_index
+
+
+def test_rotate_advances_cursor():
+    """Связка счётчика с ротацией: следующий анализ стартует со свежего
+    ключа, а не возвращается на пропущенные (сессия 8)."""
+    saved = (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
+             bot.google_analysis_counter, bot.google_client)
+    try:
+        bot.GOOGLE_API_KEYS = ['k1', 'k2', 'k3']
+        bot.google_analysis_counter = 0
+        with _quiet():
+            bot.select_google_api_key_for_new_analysis()
+        check('связка: select стартует с ключа 1/3',
+              bot.current_google_key_index == 0, bot.current_google_key_index)
+        with _quiet():
+            bot.rotate_google_api_key('сухой ключ')
+        check('связка: rotate ушёл на ключ 2/3',
+              bot.current_google_key_index == 1, bot.current_google_key_index)
+        check('связка: rotate двинул счётчик',
+              bot.get_google_key_cursor() == 2, bot.get_google_key_cursor())
+        with _quiet():
+            bot.select_google_api_key_for_new_analysis()
+        check('связка: следующий select — ключ 3/3, не назад',
+              bot.current_google_key_index == 2, bot.current_google_key_index)
+    finally:
+        (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
+         bot.google_analysis_counter, bot.google_client) = saved
 
 
 def test_handoff():

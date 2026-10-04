@@ -805,11 +805,15 @@ def set_google_api_key_index(index):
 def rotate_google_api_key(reason=None):
     """
     Переключает активный Google API key на следующий по кругу.
+    Заодно двигает persistent-счётчик (сессия 8): следующий анализ
+    стартует ровно со следующего ключа, а не прыгает назад на уже сухие.
     """
+    global google_analysis_counter
     if not GOOGLE_API_KEYS:
         return None
 
     set_google_api_key_index(current_google_key_index + 1)
+    google_analysis_counter += 1
     active_key = get_current_google_api_key()
     if reason:
         print(f"🔄 Переключение Google API key: {reason}")
