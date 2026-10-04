@@ -59,6 +59,16 @@ def main():
     due = run_once.compute_due(make_entries(now, 20), now, 30)
     check('slot now-20min c lag=30 выполняется', len(due) == 1, due)
 
+    # Догон простоя: слот now-90min при lag=45, но since=now-120min — попадает
+    due = run_once.compute_due(make_entries(now, 90), now, 45, now - timedelta(minutes=120))
+    check('догон: слот now-90min c since=now-120 выполняется', len(due) == 1, due)
+    # Без since тот же слот выпадает (за пределами лага)
+    due = run_once.compute_due(make_entries(now, 90), now, 45, None)
+    check('догон: без since слот now-90min выпадает', len(due) == 0, due)
+    # since сам расширяет окно: слот now-10min всё ещё попадает
+    due = run_once.compute_due(make_entries(now, 10), now, 45, now - timedelta(minutes=120))
+    check('догон: слот now-10min остаётся в окне', len(due) == 1, due)
+
     # Полночь МСК: слот 23:58 пред. суток, now=00:03 — окно пересекает полночь
     entries = [{
         'chat_id': -100, 'hour': 23, 'minute': 58,
@@ -417,6 +427,7 @@ def test_inbox_v2_flows():
         FakeMsg(13, 'sum5'),                      # General без ссылки
         FakeMsg(14, 'sum5', top=4033),            # ответ ВНУТРИ General (не топик)
         FakeMsg(15, 'sum5', top=999, reply_top=7),  # ответ не на корень топика 7
+        FakeMsg(16, 'sum7 PairChat'),               # General: чат по названию
     ]
     mem = run_once.new_inbox_mem()
     # Предзаполняем кэши (fetch_* — тонкие обёртки Telethon, их гоняет E2E).
@@ -427,16 +438,16 @@ def test_inbox_v2_flows():
     with contextlib.redirect_stdout(buf):
         ls, failed = loop.run_until_complete(run_once.poll_inbox_once(fake, None, mem))
     out = buf.getvalue()
-    check('v2: batch consumed', ls == 15 and failed == 3, (ls, failed))
-    check('v2: ссылка + 2 топик-команды выполнены', len(fake.ran) == 3, fake.ran)
+    check('v2: batch consumed', ls == 16 and failed == 3, (ls, failed))
+    check('v2: ссылка + 2 топик-команды + имя выполнены', len(fake.ran) == 4, fake.ran)
     by_chat = {kw['chat_id']: kw for kw in fake.ran}
     check('v2: ссылка даёт лимит+чат',
           by_chat.get(-1001892263845, {}).get('limit') == 20, by_chat)
     pair_limits = [kw['limit'] for kw in fake.ran if kw['chat_id'] == -100111]
-    check('v2: сум в топике → чат из диалогов (10 и 5)',
-          pair_limits == [10, 5], pair_limits)
+    check('v2: сум в топике и по названию → чат из диалогов (10, 5, 7)',
+          pair_limits == [10, 5, 7], pair_limits)
     check('v2: удалены все командные (успех и провал)',
-          client.deleted == [10, 11, 12, 13, 14, 15], client.deleted)
+          client.deleted == [10, 11, 12, 13, 14, 15, 16], client.deleted)
     check('v2: неизвестный топик залогирован',
           out.count('топик 9 не сопоставлен') == 1, out)
     check('v2: вне топика залогировано (13 и 14)',
@@ -444,7 +455,7 @@ def test_inbox_v2_flows():
     # Диагностика: msg12 → топик 9; msg13/14 → General; везде текст команды
     diag12 = [t for (_d, t, r) in client.sent if r == 9 and 'не сопоставлен' in t]
     diag_gen = [t for (_d, t, r) in client.sent
-                if r is None and 'нужна ссылка' in t]
+                if r is None and 'не нашёл чат' in t]
     check('v2: диагностика нерезолвленного топика', len(diag12) == 1, client.sent)
     check('v2: диагностика вне топика (13 и 14)', len(diag_gen) == 2, client.sent)
     check('v2: диагностика несёт текст команды',

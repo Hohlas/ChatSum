@@ -32,7 +32,9 @@ load_dotenv('private.txt', override=False)
 
 MSK = timezone(timedelta(hours=3))
 STATE_DEFAULT = 'state.json'
-LAG_MAX_DEFAULT = 15    # минуты
+LAG_MAX_DEFAULT = 45    # минуты: cron GitHub нередко стартует/опазывает на 30-45 мин,
+                        # окно должно перекрывать «gap» между соседними ранами, иначе
+                        # слот навсегда выпадает (следующий ран видит его уже вне окна)
 STATE_RETENTION_DAYS = 3
 
 
@@ -194,15 +196,22 @@ def git_push_schedule(message):
 # Окно и должные задания (чистая логика, тестируемая без Telegram)
 # ──────────────────────────────────────────────
 
-def compute_due(entries, now_msk_naive, lag_max):
+def compute_due(entries, now_msk_naive, lag_max, since_msk_naive=None):
     """Возвращает [(entry, occurrence_naive_msk, date_key)] для заданий в окне.
 
     now_msk_naive — текущее время МСК (naive, без tz). Границы округлены к минуте.
     occurrence — ближайшее прошедшее наступление HH:MM в МСК (в пределах суток).
     date_key — МСК-дата occurrence (используется как значение в state.completed).
+
+    since_msk_naive — время последнего рана (МСК). Если задано, окно расширяется
+    до него: слот, который выпал из окна из-за простоя раннера (GitHub-очередь),
+    догоняется следующим раном. Пересечение полуночи безопасно: попадает лишь
+    последнее occurrence на каждый слот.
     """
     now = now_msk_naive.replace(second=0, microsecond=0)
     window_start = now - timedelta(minutes=lag_max)
+    if since_msk_naive is not None:
+        window_start = min(window_start, since_msk_naive.replace(second=0, microsecond=0))
     due = []
     for entry in entries:
         slot = now.replace(hour=entry['hour'], minute=entry['minute'])
@@ -210,6 +219,23 @@ def compute_due(entries, now_msk_naive, lag_max):
         if window_start <= occurrence <= now:
             due.append((entry, occurrence, occurrence.strftime('%Y-%m-%d')))
     return due
+
+
+def _last_run_msk_naive(state):
+    """Время последнего успешного рана из state как naive-МСК или None.
+
+    Используется для догона слотов, выпавших из окна лага при простое раннера.
+    """
+    raw = (state or {}).get('last_run_utc')
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(MSK).replace(tzinfo=None)
 
 
 # ──────────────────────────────────────────────
@@ -294,8 +320,9 @@ async def run_due_once(main, args, state, path):
     """
     now_msk = datetime.now(MSK)
     now_naive = now_msk.replace(second=0, microsecond=0)
+    since_naive = _last_run_msk_naive(state)
     entries = main.load_schedule(main.SCHEDULE_FILE)
-    due = compute_due(entries, now_naive, args.lag_max)
+    due = compute_due(entries, now_naive, args.lag_max, since_naive)
     if not due:
         print(f"[{now_msk.strftime('%Y-%m-%d %H:%M:%S')} МСК] Нет заданий в окне (lag_max={args.lag_max} мин).")
         return 0
@@ -477,6 +504,28 @@ async def resolve_topic_source(main, mem, dest, top_id):
             print(f"⚠️ Inbox: название '{dup}' есть у нескольких чатов — беру первый")
     src = mem['dialogs'].get(title)
     return src
+
+
+async def resolve_name_source(main, mem, text, exclude):
+    """Источник команды из General: чат, упомянутый названием в тексте команды.
+
+    Нужно, т.к. в General нет заголовка топика, а распознать чат можно и без
+    ссылки. Ищем название диалога (от длинных к коротким) как подстроку текста.
+    exclude — id командного чата, чтобы '@username' не сматчился на себя.
+    Возвращает chat_id или None. Кэш диалогов — в mem за ран.
+    """
+    if mem.get('dialogs') is None:
+        names, dups = await fetch_dialog_names(main)
+        mem['dialogs'] = names
+        for dup in sorted(dups):
+            print(f"⚠️ Inbox: название '{dup}' есть у нескольких чатов — беру первый")
+    low = (text or '').lower()
+    for title, cid in sorted(mem['dialogs'].items(), key=lambda kv: -len(kv[0])):
+        if cid == exclude:
+            continue
+        if len(title) >= 3 and title.lower() in low:
+            return cid
+    return None
 
 
 def msg_topic_id(msg):
@@ -675,10 +724,13 @@ async def _sched_add(main, mem, dest, msg, m):
         if home and home != 1:
             source_id = await resolve_topic_source(main, mem, dest, home)
         if source_id is None:
+            source_id = await resolve_name_source(main, mem, cmd, exclude=dest)
+        if source_id is None:
             return await fail(
                 f"❌ Inbox {msg.id}: расписание без ссылки и вне топика",
-                f"❌ Inbox {msg.id}: нужна ссылка t.me/.../@... либо "
-                f"команда в топике чата. Удалена, ничего не добавлено.")
+                f"❌ Inbox {msg.id}: не нашёл чат — нужна ссылка t.me/.../@... "
+                f"или точное название чата, либо команда в топике чата. "
+                f"Удалена, ничего не добавлено.")
 
     # Дубль (точное совпадение чат+время+период) — не плодим
     clean, plus, minus = main._parse_suffixes(period)
@@ -813,12 +865,15 @@ async def process_inbox_message(main, mem, dest, msg):
                     f"команда удалена, повтора не будет.")
             via = " (топик)"
         else:
-            return await fail(
-                None,
-                f"❌ Inbox {msg.id}: команда без ссылки и вне топика — не выполнена",
-                f"❌ Inbox {msg.id}: команда вне топика чата — нужна ссылка "
-                f"t.me/.../@... либо напишите sum прямо в топике чата. "
-                f"Удалена, ничего не выполнено.")
+            source_id = await resolve_name_source(main, mem, text, exclude=dest)
+            if source_id is None:
+                return await fail(
+                    None,
+                    f"❌ Inbox {msg.id}: команда без ссылки и вне топика — не выполнена",
+                    f"❌ Inbox {msg.id}: не нашёл чат — укажите ссылку t.me/... "
+                    f"или @username, либо точное название чата, либо напишите "
+                    f"sum прямо в топике чата. Удалена, ничего не выполнено.")
+            via = " (название)"
 
     try:
         chat_entity = await main.telegram_client.get_entity(source_id)
