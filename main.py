@@ -286,7 +286,10 @@ NOISE_PATTERNS = [
 # Базовая конфигурация разбиения на чанки (по символам)
 # Используется как fallback для моделей без специальных настроек.
 DEFAULT_CHUNK_MAX_CHARS = 60000
-DEFAULT_CHUNK_OVERLAP_RATIO = 0.05
+# 2%: при крупных чанках (150+ тыс. токенов) границ между ними почти нет
+# (2 чанка вместо 8), а дублированный перехлёст дважды попадает в склейку.
+# 6 тыс. символов (~15-20 сообщений) покрывают типичную дистанцию ответа.
+DEFAULT_CHUNK_OVERLAP_RATIO = 0.02
 CHUNK_MAX_CHARS = DEFAULT_CHUNK_MAX_CHARS
 CHUNK_OVERLAP_CHARS = int(DEFAULT_CHUNK_MAX_CHARS * DEFAULT_CHUNK_OVERLAP_RATIO)
 CHUNK_DELAY_SECONDS = 10   # Задержка между запросами к API (для соблюдения RPM лимита)
@@ -1532,10 +1535,17 @@ def estimate_chunk_request_chars(chunk_messages):
     return prompt_chars + messages_chars + overhead_chars
 
 
-def estimate_total_ai_processing_seconds(chunks, use_ai=True, use_html_export=True):
+def estimate_total_ai_processing_seconds(chunks, use_ai=True, use_html_export=True,
+                                           thinking=False):
     """
     Консервативная оценка полного времени анализа:
     AI-обработка чанков + паузы между чанками + публикация результатов.
+
+    Калибровка по прод-замеру 2026-10-04 (1505 сообщений, 8 чанков, thinking=medium):
+    факт 26 мин против 7:48 по старой формуле. Разница — генерация при thinking
+    (~2 мин/чанк вместо 45 сек) и ретраи при перегрузке/квоте Gemini
+    (паузы 10с+20с + ротации ключей, ~30 сек бюджета на чанк).
+    Загрузка сообщений из Telegram и финальная склейка сюда не входят.
     """
     if not use_ai or not chunks:
         return 0
@@ -1543,10 +1553,12 @@ def estimate_total_ai_processing_seconds(chunks, use_ai=True, use_html_export=Tr
     ai_seconds = 0
     for chunk_messages, _, _ in chunks:
         request_chars = estimate_chunk_request_chars(chunk_messages)
-        # Консервативная эвристика: большие запросы к Gemini часто занимают
-        # десятки секунд и больше, поэтому берем более реалистичную оценку,
-        # чем просто паузы между чанками.
-        ai_seconds += max(45, request_chars // 2000)
+        # Генерация при thinking заметно медленнее; без thinking хватает старой эвристики.
+        gen_per_chunk = 120 if thinking else 45
+        gen_divisor = 800 if thinking else 2000
+        retry_budget_per_chunk = 30
+        ai_seconds += (max(gen_per_chunk, request_chars // gen_divisor)
+                       + retry_budget_per_chunk)
 
     chunk_pause_seconds = max(0, len(chunks) - 1) * CHUNK_DELAY_SECONDS
     publish_pause_seconds = max(0, len(chunks) - 1) * 4
@@ -2999,7 +3011,8 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             wait_time_seconds = estimate_total_ai_processing_seconds(
                 chunks,
                 use_ai=use_ai,
-                use_html_export=USE_HTML_EXPORT
+                use_html_export=USE_HTML_EXPORT,
+                thinking=USE_REASONING
             )
             
             wait_info = ""
@@ -3014,8 +3027,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             await telegram_client.send_message(
                 RESULTS_DESTINATION,
                 f"⚠️ **Внимание:** Большой объем сообщений ({len(optimized_messages)})\n"
-                f"Обработка будет выполняться в {num_chunks} этапов.{wait_info}\n"
-                f"💡 Для больших объемов можно использовать `/copy`, и анализировать вручную.",
+                f"Обработка будет выполняться в {num_chunks} этапов.{wait_info}\n",
                 reply_to=topic_id
             )
         
