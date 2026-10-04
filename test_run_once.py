@@ -921,6 +921,29 @@ def test_duty():
           run_once.merge_states({'google_key_cursor': 9},
                                 {'google_key_cursor': 4})['google_key_cursor'] == 9)
 
+    # _verify_push: всё на месте — True без лишних PUT; дыра — повторный PUT
+    saved_get = run_once.gh_state_file_get
+    saved_put = run_once.gh_state_file_put
+    puts = []
+    remote_doc = {'completed': {'a': '2026-10-04'}}
+    try:
+        run_once.gh_state_file_get = lambda p: (dict(remote_doc), 'sha1')
+        run_once.gh_state_file_put = lambda p, t, sha=None, message=None: (
+            puts.append((p, message)) or True)
+        check('duty: verify ок — True',
+              run_once._verify_push('/tmp/x', {'completed': {'a': '2026-10-04'}}) is True
+              and puts == [], puts)
+        check('duty: verify дыра — повторный PUT и True',
+              run_once._verify_push('/tmp/x', {'completed': {'a': '2026-10-04',
+                                                             'b': '2026-10-04'}}) is True
+              and len(puts) == 1 and 'verify-retry' in puts[0][1], puts)
+        run_once.gh_state_file_get = lambda p: (None, None)
+        check('duty: verify без ветки — False',
+              run_once._verify_push('/tmp/x', {'completed': {'a': 'x'}}) is False)
+    finally:
+        run_once.gh_state_file_get = saved_get
+        run_once.gh_state_file_put = saved_put
+
 
 def test_heartbeat_loop():
     """Фоновый heartbeat бьёт по времени (не по итерациям) и останавливается отменой."""

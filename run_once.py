@@ -465,7 +465,13 @@ def pull_state_best_effort(path):
 
 
 def push_state_best_effort(path):
-    """Запушить локальный state в origin/state (merge при гонке sha)."""
+    """Запушить локальный state в origin/state (merge при гонке sha).
+
+    После успешной записи — проверка чтением: перечитываем ветку и убеждаемся,
+    что все локальные completed-ключи на месте (растяжка на случай немой потери
+    записи API, как 2026-10-04 утром: 5 ✅ в логе, в ветке осел 1 ключ).
+    Не сошлось — один повторный PUT + громкий лог. Ран не роняем никогда.
+    """
     local = _read_local_state_json(path)
     if not local:
         return False
@@ -474,11 +480,38 @@ def push_state_best_effort(path):
     text = json.dumps(merge_states(local, remote) if isinstance(remote, dict) else local,
                       ensure_ascii=False, indent=2)
     if gh_state_file_put(STATE_DEFAULT, text, sha, message=f"state: {my_run_id()}"):
-        return True
+        return _verify_push(path, local)
     remote2, sha2 = gh_state_file_get(STATE_DEFAULT)  # гонка sha — один ретрай
     text2 = json.dumps(merge_states(local, remote2) if isinstance(remote2, dict) else local,
                        ensure_ascii=False, indent=2)
-    return gh_state_file_put(STATE_DEFAULT, text2, sha2, message=f"state: {my_run_id()} (retry)")
+    if gh_state_file_put(STATE_DEFAULT, text2, sha2, message=f"state: {my_run_id()} (retry)"):
+        return _verify_push(path, local)
+    return False
+
+
+def _verify_push(path, local):
+    """Сверить ветку с локальным файлом. Возвращает True, если все локальные
+    completed-ключи видны в ветке; иначе — повторный PUT и False/True по итогу."""
+    want = set((_as_dict(local.get('completed'))).keys())
+    if not want:
+        return True
+    remote, _ = gh_state_file_get(STATE_DEFAULT)
+    if isinstance(remote, dict):
+        have = set(_as_dict(remote.get('completed')).keys())
+        if want <= have:
+            return True
+        missing = sorted(want - have)
+        print(f"🚨 State-push не прижился (нет ключей {missing}) — повторный PUT")
+        merged = json.dumps(merge_states(local, remote), ensure_ascii=False, indent=2)
+        _, sha = gh_state_file_get(STATE_DEFAULT)
+        if gh_state_file_put(STATE_DEFAULT, merged, sha,
+                             message=f"state: {my_run_id()} (verify-retry)"):
+            return True
+        print("🚨 State-push: повтор тоже не подтверждён — метки только локально, "
+              "их заберёт финальный Persist шага workflow")
+    else:
+        print("🚨 State-push: не удалось перечитать ветку для проверки")
+    return False
 
 
 def refresh_schedule_best_effort(main):
