@@ -183,6 +183,9 @@ PROMOTE_CONFIRM_READS = 2    # подряд протухших чтений пе
 INBOX_MAX_ATTEMPTS = 5       # попыток inbox-команды, дальше — удалить
 DUE_FAIL_THRESHOLD = 3       # подряд провалов due-ключа до пропуска
 DUE_FAIL_SKIP_SEC = 10800    # пропуск падающего due-ключа: 3 часа
+MAX_DUE_PER_ITERATION = 1    # due-саммари за итерацию: inbox опрашивается первым
+                             # каждую итерацию, догон расписания идёт по одному —
+                             # иначе шторм догона (4–6 слотов) хоронит команды
 
 
 def handoff_enabled():
@@ -425,8 +428,13 @@ def merge_states(local, remote):
                                          _as_dict(remote.get('due_fails')))
     if str(remote.get('last_run_utc') or '') > str(merged.get('last_run_utc') or ''):
         merged['last_run_utc'] = remote['last_run_utc']
-    if 'google_key_cursor' in remote and 'google_key_cursor' not in merged:
-        merged['google_key_cursor'] = remote['google_key_cursor']
+    # Курсор ротации ключей: побеждает большее значение (иначе гонка двух
+    # лидеров откатывала бы счётчик и ключи ходили бы по кругу повторно).
+    try:
+        merged['google_key_cursor'] = max(int(merged.get('google_key_cursor', 0) or 0),
+                                         int(remote.get('google_key_cursor', 0) or 0))
+    except (TypeError, ValueError):
+        pass
     return merged
 
 
@@ -666,13 +674,15 @@ def due_skip_info(due_fails, key, now=None):
     return (now - first).total_seconds() < DUE_FAIL_SKIP_SEC
 
 
-async def run_due_once(main, args, state, path):
+async def run_due_once(main, args, state, path, max_tasks=None):
     """Одна итерация due-задач: compute → dedup → выполнение → save.
 
     Соединение уже установлено вызывателем (run_due / run_watch).
     Отметка completed — строго при ok is True (флаг в самом конце).
     Провал — счётчик due_fails (общий через API-push), пропуск 3 ч после
-    трёх подряд провалов. Возвращает число невыполненных задач.
+    трёх подряд провалов. max_tasks ограничивает число задач за вызов
+    (watch ставит MAX_DUE_PER_ITERATION, чтобы догон не хоронил inbox;
+    None = все, для ручного --due). Возвращает число невыполненных задач.
     """
     now_msk = datetime.now(MSK)
     now_naive = now_msk.replace(second=0, microsecond=0)
@@ -700,6 +710,11 @@ async def run_due_once(main, args, state, path):
     if not pending:
         print("Все должные задания выполнены или на backoff.")
         return 0
+
+    if max_tasks is not None and len(pending) > max_tasks:
+        print(f"⏳ Due-кап: беру {max_tasks} из {len(pending)}, "
+              f"остальные — следующими итерациями (inbox вперёд).")
+        pending = pending[:max_tasks]
 
     failed = 0
     for entry, occurrence, key, date_key in pending:
@@ -1607,12 +1622,14 @@ async def _run_leader_loop(main, args, state, path, me, poll, use_handoff):
                     break
                 if iteration % sched_every == 0:
                     refresh_schedule_best_effort(main)
-            failed_total += await run_due_once(main, args, state, path)
+            # Inbox всегда первый: команды не ждут догона расписания.
             try:
                 last_seen, inbox_failed = await poll_inbox_once(main, last_seen, inbox_mem)
                 failed_total += inbox_failed
             except Exception as e:
                 print(f"⚠️ Ошибка опроса inbox (итерация {iteration}): {e}")
+            failed_total += await run_due_once(main, args, state, path,
+                                               max_tasks=MAX_DUE_PER_ITERATION)
             now = time.monotonic()
             if now >= deadline:
                 if use_handoff:

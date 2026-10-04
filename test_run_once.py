@@ -122,6 +122,7 @@ def main():
     test_handoff()
     test_duty()
     test_heartbeat_loop()
+    test_due_cap()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")
@@ -912,6 +913,14 @@ def test_duty():
           'old' not in st['inbox_attempts'] and 'new' in st['inbox_attempts']
           and 'old' not in st['due_fails'], st)
 
+    # Курсор ротации при merge: побеждает максимум (без отката)
+    check('duty: merge курсор max (7,3)',
+          run_once.merge_states({'google_key_cursor': 3},
+                                {'google_key_cursor': 7})['google_key_cursor'] == 7)
+    check('duty: merge курсор max (9,4)',
+          run_once.merge_states({'google_key_cursor': 9},
+                                {'google_key_cursor': 4})['google_key_cursor'] == 9)
+
 
 def test_heartbeat_loop():
     """Фоновый heartbeat бьёт по времени (не по итерациям) и останавливается отменой."""
@@ -944,6 +953,68 @@ def test_heartbeat_loop():
         run_once.LEADER_HEARTBEAT_SEC = saved_sec
         run_once.leader_claim = saved_claim
         run_once.push_state_best_effort = saved_push
+
+
+def test_due_cap():
+    """Кап due: за вызов — не больше max_tasks, остаток — следующими вызовами."""
+    from types import SimpleNamespace
+    entries = [
+        {'chat_id': -101, 'hour': 6, 'minute': 0, 'period': '1d',
+         'post_to_source': False, 'post_as_telegram': False},
+        {'chat_id': -102, 'hour': 6, 'minute': 0, 'period': '1d',
+         'post_to_source': False, 'post_as_telegram': False},
+        {'chat_id': -103, 'hour': 6, 'minute': 0, 'period': '1d',
+         'post_to_source': False, 'post_as_telegram': False},
+    ]
+    calls = []
+
+    class FakeMain:
+        SCHEDULE_FILE = 'x'
+
+        @staticmethod
+        def load_schedule(path):
+            return entries
+
+        @staticmethod
+        async def scheduled_analysis_job(chat_id, period, post_to_source,
+                                         post_as_telegram=False):
+            calls.append(chat_id)
+            return True
+
+    saved_handoff = run_once.handoff_enabled
+    run_once.handoff_enabled = lambda: False  # без сети в юнит-тесте
+    path = '/tmp/opencode/test_due_cap.json'
+    if os.path.exists(path):
+        os.remove(path)
+    state = {'completed': {}, 'last_run_utc': None}
+    loop = asyncio.get_event_loop()
+    try:
+        with _quiet():
+            r1 = loop.run_until_complete(
+                run_once.run_due_once(FakeMain(), SimpleNamespace(), state, path,
+                                      max_tasks=1))
+            r2 = loop.run_until_complete(
+                run_once.run_due_once(FakeMain(), SimpleNamespace(), state, path,
+                                      max_tasks=1))
+            r3 = loop.run_until_complete(
+                run_once.run_due_once(FakeMain(), SimpleNamespace(), state, path,
+                                      max_tasks=1))
+            r4 = loop.run_until_complete(
+                run_once.run_due_once(FakeMain(), SimpleNamespace(), state, path,
+                                      max_tasks=1))
+        check('due-кап: по одной задаче за вызов', calls == [-101, -102, -103], calls)
+        check('due-кап: первые три вызова без неуспехов', (r1, r2, r3) == (0, 0, 0), (r1, r2, r3))
+        check('due-кап: четвёртый — нечего делать', r4 == 0 and len(calls) == 3, (r4, calls))
+        check('due-кап: все три помечены', len(state['completed']) == 3, state['completed'])
+        # Без капа (ручной --due) — всё сразу одним вызовом
+        calls.clear()
+        state2 = {'completed': {}, 'last_run_utc': None}
+        with _quiet():
+            r = loop.run_until_complete(
+                run_once.run_due_once(FakeMain(), SimpleNamespace(), state2, path))
+        check('due-кап: без капа всё сразу', calls == [-101, -102, -103] and r == 0, calls)
+    finally:
+        run_once.handoff_enabled = saved_handoff
 
 
 def _now_utc():
