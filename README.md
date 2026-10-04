@@ -30,7 +30,7 @@ Telegram userbot для сбора сообщений из чата и созд�
 6. Запустите `python3 main.py`.
 7. В Telegram отправьте в нужный чат `/sum 12h`.
 
-Шаги 3–4 делает за вас `./setup.sh`.
+Шаги 3–4 делает за вас `./scripts/setup.sh`.
 А если нужен бесплатный GitHub Actions вместо VPS — раздел
 «Запуск на GitHub Actions → Форк за 10 минут».
 
@@ -488,7 +488,7 @@ python3 main.py
 ### Вариант 2. Через `screen`
 
 ```bash
-./start_bot_background.sh
+./scripts/start_bot_background.sh
 screen -r telegram-chat-analyzer
 ```
 
@@ -499,7 +499,7 @@ screen -r telegram-chat-analyzer
 Остановить:
 
 ```bash
-./stop_bot.sh
+./scripts/stop_bot.sh
 ```
 
 ### Вариант 3. Через `systemd`
@@ -549,20 +549,20 @@ git clone https://github.com/<ВЫ>/ChatSum.git
 cd ChatSum
 # 2. Форк должен быть PUBLIC (Settings → General → Change visibility):
 #    на private-репо cron быстро съест бесплатные минуты Actions.
-./setup.sh                  # venv + зависимости + заготовка private.txt
+./scripts/setup.sh            # venv + зависимости + заготовка private.txt
 # ... заполните private.txt (ключи: my.telegram.org, aistudio.google.com)
-./venv/bin/python gen_session.py   # один раз: ввести код из Telegram
+./venv/bin/python tools/gen_session.py   # один раз: ввести код из Telegram
 gh auth login               # один раз: доступ gh к вашему форку
-./push_github_secrets.sh           # секреты и переменные — в ваш репозиторий
+./scripts/push_github_secrets.sh  # секреты и переменные — в ваш репозиторий
 ```
 
 Что делают скрипты:
 
-- `setup.sh` — проверяет Python 3.10+, создаёт/чинит `venv`, ставит
+- `scripts/setup.sh` — проверяет Python 3.10+, создаёт/чинит `venv`, ставит
   `requirements.txt`, создаёт `private.txt` из примера, проверяет наличие `gh`.
-- `gen_session.py` — печатает StringSession **и** сохраняет её
+- `tools/gen_session.py` — печатает StringSession **и** сохраняет её
   в `telegram_session.txt` (gitignored) для следующего шага.
-- `push_github_secrets.sh` — читает `private.txt` и сессию, заливает Secrets
+- `scripts/push_github_secrets.sh` — читает `private.txt` и сессию, заливает Secrets
   (`TELEGRAM_*`, `GOOGLE_API_KEY*`) и Variables (`GEMINI_*`) в репозиторий
   из git remote (переопределить: `--repo OWNER/REPO`; предпросмотр:
   `--dry-run`). Все `GOOGLE_API_KEY<N>` забираются сколько бы их ни было
@@ -593,7 +593,7 @@ gh auth login               # один раз: доступ gh к вашему �
 
 ### Настройка вручную (без скриптов)
 
-Если `push_github_secrets.sh` не подходит:
+Если `scripts/push_github_secrets.sh` не подходит:
 
 1. Проверьте visibility репозитория: для `schedule`-триггеров cron и
    бесплатных минут подходит **public**-репозиторий (`Settings → General →
@@ -605,7 +605,7 @@ gh auth login               # один раз: доступ gh к вашему �
    - `TELEGRAM_PHONE` — номер аккаунта;
    - `TELEGRAM_SESSION` — сгенерируйте один раз локально:
      ```bash
-     ./venv/bin/python gen_session.py
+     ./venv/bin/python tools/gen_session.py
      ```
      Скопируйте вывод (длинная строка) в секрет `TELEGRAM_SESSION`.
      Не коммитьте эту строку. Перевыпускается, если пароль/сессия были изменены.

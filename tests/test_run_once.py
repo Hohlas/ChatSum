@@ -1,8 +1,7 @@
 """Модульные тесты чистой логики run_once.py (без сети/Telegram).
 
-Запуск:
-  PYTHONPATH=. TELEGRAM_API_ID=12345 TELEGRAM_API_HASH=x TELEGRAM_PHONE=+1 \
-  TELEGRAM_SESSION=<StringSession> GOOGLE_API_KEY=x python3 test_run_once.py
+Запуск из корня репо:
+  ./venv/bin/python tests/test_run_once.py
 """
 
 import asyncio
@@ -10,6 +9,9 @@ import os
 import re
 import sys
 from datetime import datetime, timedelta
+
+# Тест живёт в tests/, а main.py/run_once.py — в корне репо.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # main.py на верхнем уровне создаёт TelegramClient, которому нужен
 # текущий event loop (Telethon). Обеспечиваем его до импорта.

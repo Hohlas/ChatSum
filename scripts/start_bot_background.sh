@@ -4,6 +4,8 @@
 
 BOT_NAME="telegram-chat-analyzer"
 
+cd "$(dirname "$0")/.."   # корень репо (сам скрипт живёт в scripts/)
+
 echo "🚀 Запуск Telegram Chat Analyzer в фоновом режиме..."
 
 # Проверка наличия screen
@@ -17,7 +19,7 @@ fi
 if screen -list | grep -q "$BOT_NAME"; then
     echo "⚠️  Бот уже запущен!"
     echo "Используйте: screen -r $BOT_NAME для подключения"
-    echo "Или: ./stop_bot.sh для остановки"
+    echo "Или: ./scripts/stop_bot.sh для остановки"
     exit 1
 fi
 
@@ -30,5 +32,5 @@ echo "📌 Полезные команды:"
 echo "  screen -r $BOT_NAME  - подключиться к боту"
 echo "  screen -ls           - список всех сессий"
 echo "  Ctrl+A, затем D      - отключиться от сессии (бот продолжит работать)"
-echo "  ./stop_bot.sh        - остановить бота"
+echo "  ./scripts/stop_bot.sh  - остановить бота"
 

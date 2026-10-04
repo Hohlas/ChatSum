@@ -2,6 +2,8 @@
 
 # Скрипт для запуска Telegram бота
 
+cd "$(dirname "$0")/.."   # корень репо (сам скрипт живёт в scripts/)
+
 echo "🚀 Запуск Telegram Chat Analyzer..."
 
 # Проверка наличия Python

@@ -3,7 +3,7 @@
 # Идемпотентен: безопасно запускать повторно (чинит битое venv).
 # Дальше: заполните private.txt и смотрите README «Форк за 10 минут».
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."   # корень репо (сам скрипт живёт в scripts/)
 
 VENV_DIR="venv"
 
@@ -58,5 +58,5 @@ echo ""
 echo "Готово. Дальше:"
 echo "  1. Заполните private.txt (Telegram API + Google ключи)"
 echo "  2. VPS-профиль:  ./$VENV_DIR/bin/python main.py"
-echo "  3. Actions-сессия: ./$VENV_DIR/bin/python gen_session.py   (попросит код из Telegram)"
-echo "  4. Секреты в GitHub: ./push_github_secrets.sh"
+echo "  3. Actions-сессия: ./$VENV_DIR/bin/python tools/gen_session.py   (попросит код из Telegram)"
+echo "  4. Секреты в GitHub: ./scripts/push_github_secrets.sh"

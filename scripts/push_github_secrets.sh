@@ -2,14 +2,14 @@
 # Заливает Secrets и Variables для GitHub Actions из private.txt одной командой.
 # Репозиторий определяется из git remote (форк-френдли), можно переопределить --repo.
 #
-#   ./push_github_secrets.sh [--repo OWNER/REPO] [--session STRING] [--dry-run]
+#   ./scripts/push_github_secrets.sh [--repo OWNER/REPO] [--session STRING] [--dry-run]
 #
 # TELEGRAM_SESSION берётся по приоритету:
 #   1. --session "..."   2. env TELEGRAM_SESSION
 #   3. telegram_session.txt (создаёт gen_session.py)   4. интерактивный ввод
 # Значения секретов НИКОГДА не печатаются (только имена и длины).
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."   # корень репо (сам скрипт живёт в scripts/)
 
 REPO=""
 SESSION_ARG=""
@@ -62,7 +62,7 @@ fi
 echo "Репозиторий: $REPO"
 
 if [ ! -f private.txt ]; then
-  echo "❌ Нет private.txt. Сначала: cp private.txt.example private.txt  (или ./setup.sh) и заполните ключи."
+  echo "❌ Нет private.txt. Сначала: cp private.txt.example private.txt  (или ./scripts/setup.sh) и заполните ключи."
   exit 1
 fi
 
@@ -101,7 +101,7 @@ if is_placeholder "$SESSION"; then
   fi
 fi
 if is_placeholder "$SESSION"; then
-  echo "❌ TELEGRAM_SESSION пуст. Сгенерируйте: ./venv/bin/python gen_session.py"
+  echo "❌ TELEGRAM_SESSION пуст. Сгенерируйте: ./venv/bin/python tools/gen_session.py"
   exit 1
 fi
 echo "TELEGRAM_SESSION: источник $SRC (длина ${#SESSION})"
