@@ -292,6 +292,17 @@ def duty_gap_info(last_hb_utc, now=None, threshold_sec=GAP_WARN_SEC):
     return int(gap), gap > threshold_sec
 
 
+def format_gap_warning(gap_sec, last_hb_iso):
+    """Короткий текст варнинга о пропуске: две строки, время — МСК.
+
+    Чистая логика, тестируется. Мусор на входе — сырая строка как есть.
+    """
+    mins = gap_sec // 60
+    hb = _parse_utc(last_hb_iso)
+    stamp = hb.astimezone(MSK).strftime('%Y-%m-%d %H:%M:%S') if hb else last_hb_iso
+    return f"⚠️ Дежурство прерывалось на {mins} мин.\nПоследний heartbeat {stamp}"
+
+
 def prev_duty_heartbeat(exclude_run_id):
     """Последний ЧУЖОЙ heartbeat дежурства: (hb_iso|None, run_id|None).
 
@@ -1753,12 +1764,9 @@ async def _leader_startup(main, args, state, path, me, poll):
         print(f"👑 Тишина дежурства перед заступлением: {gap_sec // 60} мин "
               f"(последний heartbeat {prev_hb} от {prev_run}).")
         if warn:
-            mins = gap_sec // 60
             await _notify_inbox(
                 main, main.RESULTS_DESTINATION, 1,
-                f"⚠️ Дежурство прерывалось: тишина {mins} мин "
-                f"(последний heartbeat {prev_hb} от {prev_run}). "
-                f"Заступил {me['run_id']} — проверяю due и inbox.")
+                format_gap_warning(gap_sec, prev_hb))
     return 'leader'
 
 

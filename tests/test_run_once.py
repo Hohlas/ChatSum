@@ -126,6 +126,7 @@ def main():
     test_work_wedge()
     test_leader_watch_inherit()
     test_timeout_budget()
+    test_gap_warning_format()
     test_handoff()
     test_duty()
     test_heartbeat_loop()
@@ -878,6 +879,18 @@ def test_timeout_budget():
           (watch + tail + setup) <= timeout * 60, (watch, timeout))
     check('бюджет: запас не меньше 5 мин',
           timeout * 60 - (watch + tail + setup) >= 300, timeout)
+
+
+def test_gap_warning_format():
+    """Формат варнинга: две строки, время МСК (UTC+3)."""
+    text = run_once.format_gap_warning(720, '2026-10-05T05:52:27Z')
+    check('варнинг: короткий формат с МСК',
+          text == '⚠️ Дежурство прерывалось на 12 мин.\n'
+                  'Последний heartbeat 2026-10-05 08:52:27', repr(text))
+    text = run_once.format_gap_warning(300, 'мусор')
+    check('варнинг: мусор не роняет, строка как есть',
+          text == '⚠️ Дежурство прерывалось на 5 мин.\n'
+                  'Последний heartbeat мусор', repr(text))
 
 
 def test_handoff():
