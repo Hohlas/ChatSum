@@ -131,14 +131,21 @@ A run never exits nonzero over state trouble — worst case the trailing
 (лидер+standby, свой run_id исключён) ДО claim'а; тишина дольше `GAP_WARN_SEC`
 (дефолт 240с, env; временно снижен с 420, чтобы видеть частоту аварийных
 зазоров 5–7 мин) — варнинг с длительностью в General (`_notify_inbox`, topic 1).
+Маркер прогресса (`work.json` {run_id, last_work_utc}): heartbeat отвечает
+«процесс жив», маркер — «работа движется». Дёргается раз в итерацию лидера
+и между чанками (`PROGRESS_HOOK` из `create_summary`), публикуется ритмом
+heartbeat (120с). Standby свергает живого по heartbeat лидера, если маркер
+его же run_id протух дольше `WORK_STALE_SEC` (2 подтверждающих чтения).
+Нет маркера (старый код) / чужой run_id — не свергаем.
 
 ## Load-bearing numbers (Actions mode only — VPS timing is just the APScheduler clock)
 
 | Symbol | Value | Meaning |
 |---|---|---|
-| cron / timeout | `*/11`, 330 min | schedule drift; 5h watch + setup + tail analysis |
+| cron / timeout | `*/11`, 345 min | schedule drift; 5h watch + setup + tail analysis (platform max 360) |
 | watch / poll defaults | 18000s / 30s | duty length / inbox latency while leader lives |
 | `LEADER_HEARTBEAT_SEC` / `LEADER_STALE_SEC` | 120 / 300 | liveness bound ≈ 2 missed beats |
+| `WORK_STALE_SEC` (`work.json`) | 900 | wedge bound: fresh heartbeat + no progress 15 min → takeover |
 | `SCHEDULE_REFRESH_SEC` | 600 | schedule staleness inside a 5h run |
 | `PROMOTE_CONFIRM_READS` | 2 | anti-flap on promotion |
 | `INBOX_MAX_ATTEMPTS` | 5 | command retries before deletion |

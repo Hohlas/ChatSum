@@ -294,6 +294,10 @@ CHUNK_MAX_CHARS = DEFAULT_CHUNK_MAX_CHARS
 CHUNK_OVERLAP_CHARS = int(DEFAULT_CHUNK_MAX_CHARS * DEFAULT_CHUNK_OVERLAP_RATIO)
 CHUNK_DELAY_SECONDS = 10   # Задержка между запросами к API (для соблюдения RPM лимита)
 
+# Хук маркера прогресса (сессия 12): run_once ставит сюда колбэк, create_summary
+# дёргает его между чанками. Без run_once остаётся None — поведение не меняется.
+PROGRESS_HOOK = None
+
 def get_model_generation_config(model_name):
     """
     Возвращает параметры генерации и чанкования для выбранной модели.
@@ -1818,6 +1822,13 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         stop_due_to_quota = False
         
         for chunk_idx, (chunk_messages, start_idx, end_idx) in enumerate(chunks, 1):
+            # Маркер прогресса для дежурства: честная длинная работа доказывает,
+            # что жива, между чанками (сессия 12). Best-effort, ран не роняет.
+            if PROGRESS_HOOK is not None:
+                try:
+                    PROGRESS_HOOK()
+                except Exception:
+                    pass
             if stop_due_to_quota:
                 skipped_msg = "⚠️ Чанк пропущен: обработка остановлена после исчерпания квоты Gemini API"
                 chunk_summaries.append((start_idx, end_idx, skipped_msg, True))

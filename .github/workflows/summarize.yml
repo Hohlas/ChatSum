@@ -19,9 +19,9 @@ on:
         required: false
         default: '30'
       watch_seconds:
-        description: 'Длительность цикла --watch, сек (по умолч. 16200 = 4.5 ч)'
+        description: 'Длительность цикла --watch, сек (по умолч. 18000 = 5 ч)'
         required: false
-        default: '16200'
+        default: '18000'
 
 permissions:
   contents: write
@@ -34,7 +34,9 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 330   # 5.5 ч: watch 4.5 ч + установка + хвостовой анализ (запас ~30 мин)
+    timeout-minutes: 355   # почти платформенный максимум 360: вотч 5ч + хвост ~30мин
+                           # + установка укладываются с запасом ~24мин; топор один,
+                           # держим его ближе к максимуму осознанно и явно
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -91,15 +93,18 @@ jobs:
             # от schedule-событий иначе проскочила бы в argparse как ''.
             POLL_INTERVAL="${POLL_INTERVAL:-30}"
             case "$POLL_INTERVAL" in ''|*[!0-9]*) POLL_INTERVAL=30 ;; esac
-            WATCH_SECONDS="${WATCH_SECONDS:-16200}"
-            case "$WATCH_SECONDS" in ''|*[!0-9]*) WATCH_SECONDS=16200 ;; esac
+            WATCH_SECONDS="${WATCH_SECONDS:-18000}"
+            case "$WATCH_SECONDS" in ''|*[!0-9]*) WATCH_SECONDS=18000 ;; esac
             python run_once.py --watch --poll-interval "$POLL_INTERVAL" --watch-seconds "$WATCH_SECONDS"
           fi
 
-      # state.json должен попасть в ветку state даже при частичном провале:
-      # успешные задачи уже записаны в файл, а упавшая останется для повтора.
+      # state.json должен попасть в ветку state даже при частичном провале
+      # и даже при килле по таймауту: метки выполненных слотов уже записаны
+      # в локальный файл. Безопасно по времени: в момент килла преемник ещё
+      # не поднялся (promotion ~5 мин), на ветке только наши собственные пуши —
+      # чужой прогресс затереть нечем; остаточную гонку закрывает rebase ниже.
       - name: Persist state
-        if: ${{ !cancelled() }}
+        if: ${{ always() }}
         run: |
           # state.json лежит в $RUNNER_TEMP (вне дерева) — см. Fetch state.
           # ВАЖНО: при первом запуске git checkout --orphan НЕ очищает дерево,

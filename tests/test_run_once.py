@@ -123,6 +123,7 @@ def main():
     test_503_rotates_key()
     test_rotate_advances_cursor()
     test_duty_gap()
+    test_work_wedge()
     test_handoff()
     test_duty()
     test_heartbeat_loop()
@@ -816,6 +817,41 @@ def test_duty_gap():
         run_once.leader_read, run_once.standby_read = saved
 
 
+def test_work_wedge():
+    """Маркер прогресса: свергаем только зависшего текущего лидера."""
+    from datetime import timezone
+    now = datetime(2026, 10, 5, 8, 0, tzinfo=timezone.utc)
+    leader = {'run_id': 'old/1', 'heartbeat_utc': '2026-10-05T07:59:00Z'}
+    fresh = {'run_id': 'old/1', 'last_work_utc': '2026-10-05T07:59:00Z'}
+    check('маркер: свежий прогресс — не завис',
+          run_once.work_is_wedged(fresh, leader, now) is False)
+    stale = {'run_id': 'old/1', 'last_work_utc': '2026-10-05T07:00:00Z'}
+    check('маркер: час без прогресса — завис',
+          run_once.work_is_wedged(stale, leader, now) is True)
+    edge = {'run_id': 'old/1', 'last_work_utc': '2026-10-05T07:45:00Z'}
+    check('маркер: ровно порог (15 мин) — ещё не завис (строго больше)',
+          run_once.work_is_wedged(edge, leader, now) is False)
+    slow = {'run_id': 'old/1', 'last_work_utc': '2026-10-05T07:44:00Z'}
+    check('маркер: 16 мин — завис (худший честный чанк ~12 мин уже позади)',
+          run_once.work_is_wedged(slow, leader, now) is True)
+    чужой = {'run_id': 'older/9', 'last_work_utc': '2026-10-05T07:00:00Z'}
+    check('маркер: протухший чужой run_id — не трогаем',
+          run_once.work_is_wedged(чужой, leader, now) is False)
+    for bad in (None, 'xx', {'run_id': 'old/1'}):
+        check(f'маркер: {bad} — по отсутствию данных не свергаем',
+              run_once.work_is_wedged(bad, leader, now) is False)
+    check('маркер: нет лидера — не свергаем',
+          run_once.work_is_wedged(stale, None, now) is False)
+    future = {'run_id': 'old/1', 'last_work_utc': '2026-10-05T08:05:00Z'}
+    check('маркер: будущее — не завис',
+          run_once.work_is_wedged(future, leader, now) is False)
+    run_once._last_work_utc = None
+    run_once.note_work_progress()
+    ts = run_once._parse_utc(run_once._last_work_utc)
+    check('маркер: note ставит свежую метку', ts is not None)
+    run_once._last_work_utc = None
+
+
 def test_handoff():
     """Лидерство: уступаем только живому готовому более новому флагу."""
     from datetime import timezone
@@ -1013,13 +1049,15 @@ def test_heartbeat_loop():
     saved_sec = run_once.LEADER_HEARTBEAT_SEC
     saved_claim = run_once.leader_claim
     saved_push = run_once.push_state_best_effort
-    calls = {'claim': 0, 'push': 0}
+    saved_work = run_once.work_claim
+    calls = {'claim': 0, 'push': 0, 'work': 0}
     me = {'run_id': 't', 'ready': True, 'heartbeat_utc': 'old',
           'watch_started_utc': '2026-10-04T09:00:00Z'}
     try:
         run_once.LEADER_HEARTBEAT_SEC = 0.05
         run_once.leader_claim = lambda doc: calls.__setitem__('claim', calls['claim'] + 1) or True
         run_once.push_state_best_effort = lambda path: calls.__setitem__('push', calls['push'] + 1) or True
+        run_once.work_claim = lambda doc: calls.__setitem__('work', calls['work'] + 1) or True
         loop = asyncio.get_event_loop()
 
         async def run_briefly():
@@ -1034,11 +1072,14 @@ def test_heartbeat_loop():
         loop.run_until_complete(run_briefly())
         check('heartbeat: claim+push бились несколько раз за 0.22с',
               calls['claim'] >= 2 and calls['push'] >= 2, calls)
+        check('heartbeat: маркер прогресса едет тем же ритмом',
+              calls['work'] >= 2, calls)
         check('heartbeat: метка обновлена', me['heartbeat_utc'] != 'old', me['heartbeat_utc'])
     finally:
         run_once.LEADER_HEARTBEAT_SEC = saved_sec
         run_once.leader_claim = saved_claim
         run_once.push_state_best_effort = saved_push
+        run_once.work_claim = saved_work
 
 
 def test_due_cap():

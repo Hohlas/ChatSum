@@ -193,6 +193,14 @@ except ValueError:
     GAP_WARN_SEC = 240           # тишина дежурства дольше этого — варнинг в General
                                 # (240: ловит аварийные зазоры от 300с, чистые
                                 # передачи через retiring — секунды — молчат)
+try:
+    WORK_STALE_SEC = int((os.getenv('WORK_STALE_SEC', '') or '').strip() or 900)
+except ValueError:
+    WORK_STALE_SEC = 900         # лидер без прогресса дольше этого — завис:
+                                # heartbeat свеж, а работа стоит (сессия 12).
+                                # 15 мин >> худшего честного чанка (~10-12 мин:
+                                # 3×180с таймаута + ретраи + ротации), << вотча
+WORK_FILE = 'work.json'         # маркер прогресса {run_id, last_work_utc}
 
 
 def handoff_enabled():
@@ -307,6 +315,62 @@ def prev_duty_heartbeat(exclude_run_id):
         if best_hb is None or hb > _parse_utc(best_hb):
             best_hb, best_run = doc.get('heartbeat_utc'), doc.get('run_id')
     return best_hb, best_run
+
+
+def work_read():
+    """Прочитать чужой маркер прогресса: (doc|None, sha|None)."""
+    return _flag_read(WORK_FILE)
+
+
+def work_claim(doc):
+    """Записать свой маркер прогресса (last-writer-wins, один ретрай при гонке)."""
+    return _flag_claim(WORK_FILE, doc, 'work')
+
+
+_last_work_utc = None  # локальная метка последнего прогресса (итерация/чанк)
+
+
+def note_work_progress():
+    """Отметить прогресс дежурства (дёргается из итераций и между чанками)."""
+    global _last_work_utc
+    _last_work_utc = _utc_str(_utc_now())
+
+
+def push_work_best_effort(run_id):
+    """Опубликовать маркер прогресса (best-effort: неуспех ран не роняет)."""
+    global _last_work_utc
+    if _last_work_utc is None:
+        note_work_progress()
+    try:
+        work_claim({'run_id': run_id, 'last_work_utc': _last_work_utc})
+    except Exception as e:
+        print(f"⚠️ Не удалось опубликовать маркер прогресса: {e}")
+
+
+def work_is_wedged(work_doc, leader_doc, now=None, threshold_sec=WORK_STALE_SEC):
+    """Завис ли лидер: heartbeat свеж, а прогресса нет дольше порога.
+
+    Чистая логика, тестируется. True — только если маркер есть, принадлежит
+    ТЕКУЩЕМУ лидеру и протух. Нет маркера (старый код) / чужой run_id /
+    мусор / будущее — False: по отсутствию данных никого не свергаем.
+    """
+    if not isinstance(work_doc, dict) or not isinstance(leader_doc, dict):
+        return False
+    if work_doc.get('run_id') != leader_doc.get('run_id'):
+        return False
+    age = now_or_age(work_doc.get('last_work_utc'), now)
+    if age is None:
+        return False
+    return age > threshold_sec
+
+
+def now_or_age(raw, now=None):
+    """Возраст метки в секундах; мусор/будущее → None."""
+    ts = _parse_utc(raw)
+    if ts is None:
+        return None
+    age = ((now or _utc_now()) - ts).total_seconds()
+    return age if age > 0 else None
 
 
 def standby_should_promote(remote, consec_stale_reads, now=None,
@@ -1615,6 +1679,10 @@ async def _watch_cleanup(main, state, path, use_handoff=False):
     except Exception as e:
         print(f"⚠️ Не удалось сохранить state: {e}")
     try:
+        main.PROGRESS_HOOK = None  # маркер прогресса: дежурство сдано
+    except AttributeError:
+        pass
+    try:
         await main.telegram_client.disconnect()
     except Exception as e:
         print(f"⚠️ Ошибка при disconnect: {e}")
@@ -1646,6 +1714,11 @@ async def _leader_startup(main, args, state, path, me, poll):
     me['ready'] = True
     me['heartbeat_utc'] = _utc_str(_utc_now())
     leader_claim(me)
+    note_work_progress()
+    try:
+        main.PROGRESS_HOOK = note_work_progress  # маркер дёргается между чанками
+    except AttributeError:
+        pass
     pull_state_best_effort(path)
     try:
         fresh = load_state(path)
@@ -1690,6 +1763,7 @@ async def _heartbeat_loop(me, path):
             me['heartbeat_utc'] = _utc_str(_utc_now())
             leader_claim(me)
             push_state_best_effort(path)
+            push_work_best_effort(me['run_id'])  # маркер прогресса едет тем же ритмом
     except asyncio.CancelledError:
         pass
 
@@ -1710,6 +1784,7 @@ async def _run_leader_loop(main, args, state, path, me, poll, use_handoff):
         while True:
             iteration += 1
             print(f"─── Итерация {iteration} ───")
+            note_work_progress()  # маркер: цикл жив, даже если задач нет
             if use_handoff:
                 remote, _ = leader_read()
                 if leader_should_yield(me, remote):
@@ -1764,6 +1839,7 @@ async def _run_standby_loop(main, args, state, path, me, poll):
     standby_claim(me)
     print(f"🛡️ Standby {me['run_id']}: слежу за лидером, Telegram не подключаю.")
     stale_reads = 0
+    wedge_reads = 0
     sb_every = max(1, LEADER_HEARTBEAT_SEC // poll)
     iteration = 0
     try:
@@ -1780,22 +1856,40 @@ async def _run_standby_loop(main, args, state, path, me, poll):
                 print(f"🛡️ Более новый standby {sremote.get('run_id')} — выхожу.")
                 break
             remote, _ = leader_read()
+            takeover_why = None
             if isinstance(remote, dict) and not remote.get('retiring') and leader_is_live(remote):
                 stale_reads = 0
+                # Лидер дышит, но работа стоит? Маркер прогресса отличает залипшего
+                # от занятого длинной задачей (честная работа дёргает маркер между
+                # чанками). Нет маркера (старый код) — не свергаем по бездействию.
+                try:
+                    wdoc, _ = work_read()
+                except Exception:
+                    wdoc = None
+                if work_is_wedged(wdoc, remote):
+                    wedge_reads += 1
+                    if wedge_reads >= PROMOTE_CONFIRM_READS:
+                        takeover_why = (f"завис (heartbeat свеж, а прогресса нет "
+                                        f"дольше {WORK_STALE_SEC // 60} мин)")
+                else:
+                    wedge_reads = 0
             else:
+                wedge_reads = 0
                 if not isinstance(remote, dict) or remote.get('retiring'):
                     stale_reads = PROMOTE_CONFIRM_READS  # пропал/уходит — сразу
                 else:
                     stale_reads += 1
                 if standby_should_promote(remote, stale_reads):
-                    why = 'retiring' if isinstance(remote, dict) and remote.get('retiring') \
+                    takeover_why = 'retiring' if isinstance(remote, dict) and remote.get('retiring') \
                         else ('пропал' if not isinstance(remote, dict) else 'мёртв')
-                    print(f"🛡️ Лидер {why} — принимаю дежурство.")
+            if takeover_why:
+                    print(f"🛡️ Лидер {takeover_why} — принимаю дежурство.")
                     res = await _leader_startup(main, args, state, path, me, poll)
                     if res == 'leader':
                         return await _run_leader_loop(main, args, state, path, me, poll, True)
                     if res == 'standby':
                         stale_reads = 0  # кто-то успел раньше — снова наблюдаем
+                        wedge_reads = 0
                         continue
                     return 1  # 'fail' — Telegram не поднялся
             if iteration % sb_every == 0:
