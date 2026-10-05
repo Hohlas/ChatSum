@@ -188,9 +188,11 @@ MAX_DUE_PER_ITERATION = 1    # due-саммари за итерацию: inbox �
                              # иначе шторм догона (4–6 слотов) хоронит команды
 
 try:
-    GAP_WARN_SEC = int((os.getenv('GAP_WARN_SEC', '') or '').strip() or 420)
+    GAP_WARN_SEC = int((os.getenv('GAP_WARN_SEC', '') or '').strip() or 240)
 except ValueError:
-    GAP_WARN_SEC = 420           # тишина дежурства дольше этого — варнинг в General
+    GAP_WARN_SEC = 240           # тишина дежурства дольше этого — варнинг в General
+                                # (240: ловит аварийные зазоры от 300с, чистые
+                                # передачи через retiring — секунды — молчат)
 
 
 def handoff_enabled():

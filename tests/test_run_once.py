@@ -792,9 +792,9 @@ def test_duty_gap():
     check('гэп: 3 мин — тихо', (gap, warn) == (180, False), (gap, warn))
     gap, warn = run_once.duty_gap_info('2026-10-04T17:52:00Z', now)
     check('гэп: 8 мин — варнинг', (gap, warn) == (480, True), (gap, warn))
-    gap, warn = run_once.duty_gap_info('2026-10-04T17:53:00Z', now)
+    gap, warn = run_once.duty_gap_info('2026-10-04T17:56:00Z', now)
     check('гэп: ровно порог — тихо (строго больше)',
-          (gap, warn) == (420, False), (gap, warn))
+          (gap, warn) == (240, False), (gap, warn))
     for bad in (None, 'xx', '2026-10-04T18:05:00Z'):
         gap, warn = run_once.duty_gap_info(bad, now)
         check(f'гэп: {bad} — молчим', (gap, warn) == (None, False), (gap, warn))

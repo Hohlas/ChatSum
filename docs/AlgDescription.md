@@ -129,7 +129,8 @@ A run never exits nonzero over state trouble — worst case the trailing
 `Persist state` workflow step carries the local file.
 Самодиагностика пропусков: новый лидер читает последний чужой heartbeat
 (лидер+standby, свой run_id исключён) ДО claim'а; тишина дольше `GAP_WARN_SEC`
-(дефолт 420с, env) — варнинг с длительностью в General (`_notify_inbox`, topic 1).
+(дефолт 240с, env; временно снижен с 420, чтобы видеть частоту аварийных
+зазоров 5–7 мин) — варнинг с длительностью в General (`_notify_inbox`, topic 1).
 
 ## Load-bearing numbers (Actions mode only — VPS timing is just the APScheduler clock)
 
