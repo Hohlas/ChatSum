@@ -16,5 +16,10 @@
   "google_key_cursor": 19,
   "last_run_utc": "2026-10-05T04:23:04Z",
   "inbox_attempts": {},
-  "due_fails": {}
+  "due_fails": {
+    "-1001369370434|06:55|1d+": {
+      "n": 1,
+      "first_utc": "2026-10-05T16:41:55Z"
+    }
+  }
 }
