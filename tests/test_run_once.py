@@ -124,6 +124,8 @@ def main():
     test_rotate_advances_cursor()
     test_duty_gap()
     test_work_wedge()
+    test_leader_watch_inherit()
+    test_timeout_budget()
     test_handoff()
     test_duty()
     test_heartbeat_loop()
@@ -850,6 +852,32 @@ def test_work_wedge():
     ts = run_once._parse_utc(run_once._last_work_utc)
     check('маркер: note ставит свежую метку', ts is not None)
     run_once._last_work_utc = None
+
+
+def test_leader_watch_inherit():
+    """Наследование дедлайна: свежий лидер — полный вотч, promoted — остаток."""
+    check('наследование: свежий лидер берёт полный вотч',
+          run_once.leader_watch_seconds(None, 19800) == 19800)
+    check('наследование: promotion берёт остаток',
+          run_once.leader_watch_seconds(10380.5, 19800) == 10380.5)
+    check('наследование: нулевой остаток — сразу retiring',
+          run_once.leader_watch_seconds(0, 19800) == 0)
+    check('наследование: отрицательный остаток — в ноль, не в минус',
+          run_once.leader_watch_seconds(-42, 19800) == 0)
+
+
+def test_timeout_budget():
+    """Бюджет джоба: вотч + хвост + установка ≤ таймаут (урок ночи 05.10)."""
+    yml = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       '.github', 'workflows', 'summarize.yml')
+    text = open(yml, encoding='utf-8').read()
+    timeout = int(re.search(r'timeout-minutes:\s*(\d+)', text).group(1))
+    watch = int(re.search(r'WATCH_SECONDS="\$\{WATCH_SECONDS:-(\d+)\}"', text).group(1))
+    tail, setup = 900, 60  # допущение «хвост ≤15 мин» + замер установки ~47с
+    check('бюджет: вотч+хвост+установка влезают в таймаут',
+          (watch + tail + setup) <= timeout * 60, (watch, timeout))
+    check('бюджет: запас не меньше 5 мин',
+          timeout * 60 - (watch + tail + setup) >= 300, timeout)
 
 
 def test_handoff():

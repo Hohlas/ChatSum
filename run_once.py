@@ -373,6 +373,20 @@ def now_or_age(raw, now=None):
     return age if age > 0 else None
 
 
+def leader_watch_seconds(watch_remaining, watch_seconds):
+    """Сколько секунд ведёт лидер: остаток своего вотча или полный вотч.
+
+    Чистая логика, тестируется. Свежий лидер (remaining=None) берёт полный
+    вотч; promoted standby наследует остаток собственного дедлайна (сессия 13):
+    иначе свежий полный вотч переживает джоб и ротация идёт через килл.
+    Остаток ≤0 — сразу retiring (но через одну полезную итерацию: цикл
+    проверяет дедлайн после inbox+due, а не до).
+    """
+    if watch_remaining is None:
+        return watch_seconds
+    return max(0.0, watch_remaining)
+
+
 def standby_should_promote(remote, consec_stale_reads, now=None,
                            required=PROMOTE_CONFIRM_READS):
     """Пора ли standby забирать лидерство (чистая логика, тестируется).
@@ -1768,8 +1782,13 @@ async def _heartbeat_loop(me, path):
         pass
 
 
-async def _run_leader_loop(main, args, state, path, me, poll, use_handoff):
-    """Дежурный цикл лидера: due + inbox до дедлайна. Возвращает exit-код."""
+async def _run_leader_loop(main, args, state, path, me, poll, use_handoff,
+                         watch_remaining=None):
+    """Дежурный цикл лидера: due + inbox до дедлайна. Возвращает exit-код.
+
+    watch_remaining — остаток вотча при promotion (сессия 12); None — свежий
+    лидер берёт полный args.watch_seconds.
+    """
     failed_total = 0
     last_seen = None
     inbox_mem = new_inbox_mem()
@@ -1780,7 +1799,8 @@ async def _run_leader_loop(main, args, state, path, me, poll, use_handoff):
     if use_handoff:
         hb_task = asyncio.create_task(_heartbeat_loop(me, path))
     try:
-        deadline = time.monotonic() + args.watch_seconds
+        deadline = time.monotonic() + leader_watch_seconds(watch_remaining,
+                                                             args.watch_seconds)
         while True:
             iteration += 1
             print(f"─── Итерация {iteration} ───")
@@ -1886,7 +1906,11 @@ async def _run_standby_loop(main, args, state, path, me, poll):
                     print(f"🛡️ Лидер {takeover_why} — принимаю дежурство.")
                     res = await _leader_startup(main, args, state, path, me, poll)
                     if res == 'leader':
-                        return await _run_leader_loop(main, args, state, path, me, poll, True)
+                        # Наследуем остаток СОБСТВЕННОГО вотча, а не полный заново:
+                        # свежий дедлайн пережил бы джоб → килл по таймауту.
+                        remaining = max(0.0, deadline - time.monotonic())
+                        return await _run_leader_loop(main, args, state, path,
+                                                      me, poll, True, remaining)
                     if res == 'standby':
                         stale_reads = 0  # кто-то успел раньше — снова наблюдаем
                         wedge_reads = 0

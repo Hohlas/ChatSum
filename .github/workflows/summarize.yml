@@ -19,9 +19,9 @@ on:
         required: false
         default: '30'
       watch_seconds:
-        description: 'Длительность цикла --watch, сек (по умолч. 18000 = 5 ч)'
+        description: 'Длительность цикла --watch, сек (по умолч. 19800 = 5.5 ч)'
         required: false
-        default: '18000'
+        default: '19800'
 
 permissions:
   contents: write
@@ -34,8 +34,8 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 355   # почти платформенный максимум 360: вотч 5ч + хвост ~30мин
-                           # + установка укладываются с запасом ~24мин; топор один,
+    timeout-minutes: 355   # почти платформенный максимум 360: вотч 330 + хвост 15
+                           # + установка укладываются с запасом ~9мин; топор один,
                            # держим его ближе к максимуму осознанно и явно
     steps:
       - uses: actions/checkout@v4
@@ -93,8 +93,11 @@ jobs:
             # от schedule-событий иначе проскочила бы в argparse как ''.
             POLL_INTERVAL="${POLL_INTERVAL:-30}"
             case "$POLL_INTERVAL" in ''|*[!0-9]*) POLL_INTERVAL=30 ;; esac
-            WATCH_SECONDS="${WATCH_SECONDS:-18000}"
-            case "$WATCH_SECONDS" in ''|*[!0-9]*) WATCH_SECONDS=18000 ;; esac
+            # Формула: вотч 330 + хвост 15 + установка 1 = 346 ≤ 355, запас 9 мин.
+            # Хвост ≤15 — допущение (типовые задачи 5–12 мин на 300K-чанках);
+            # патология (~24 мин) упрётся в килл, но громко: варнинг + Persist-сейв.
+            WATCH_SECONDS="${WATCH_SECONDS:-19800}"
+            case "$WATCH_SECONDS" in ''|*[!0-9]*) WATCH_SECONDS=19800 ;; esac
             python run_once.py --watch --poll-interval "$POLL_INTERVAL" --watch-seconds "$WATCH_SECONDS"
           fi
 
