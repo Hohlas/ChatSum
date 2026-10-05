@@ -153,6 +153,20 @@ A run never exits nonzero over state trouble — worst case the trailing
 heartbeat (120с). Standby свергает живого по heartbeat лидера, если маркер
 его же run_id протух дольше `WORK_STALE_SEC` (2 подтверждающих чтения).
 Нет маркера (старый код) / чужой run_id — не свергаем.
+Маяк дежурства в General (сессия 20): одно сообщение, две строки —
+`heartbeat DD.MM HH:MM` + `next leader: DD.MM HH:MM`, всё МСК
+(`format_liveness_text`, pure; без конца вахты — одна строка).
+Новый лидер при заступлении подхватывает последний маяк поиском
+(`liveness_find`: max id среди своих сообщений с префиксом, глубина
+`LIVENESS_SCAN_LIMIT`) и правит его каждый `LIVENESS_EVERY`-й тик heartbeat;
+нечего подхватить / правка упала (удалён вручную) — один перепост.
+`msg_id` только in-memory (`_liveness_msg_id`; в `me` не кладём, иначе
+утечёт во флаг `leader.json`). Ожидаемый конец вахты считает лидерский цикл
+из своего дедлайна (стена = now + остаток; in-memory `_liveness_next_utc`) —
+это ориентир передачи, не гарантия: при дропах тиков фактический преемник
+встанет позже. Standby ничего не пишет (нет Telegram),
+на время дыры маяк честно протухает. Пин ставит владелец вручную.
+Для inbox безвреден (`parse` → None → `skip`).
 
 ## Load-bearing numbers (Actions mode only — VPS timing is just the APScheduler clock)
 
@@ -167,6 +181,7 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
 | `INBOX_MAX_ATTEMPTS` | 5 | command retries before deletion |
 | `DUE_FAIL_THRESHOLD` / `DUE_FAIL_SKIP_SEC` | 3 / 10800 | skip poisoned slot 3h |
 | `MAX_DUE_PER_ITERATION` | 1 | inbox-first latency bound |
+| `LIVENESS_EVERY` / `LIVENESS_SCAN_LIMIT` | 5 / 50 | маяк в General: правка каждый 5-й тик (120с × 5 = 10 мин) / глубина подхвата |
 
 ## Incidents that shaped the design (don't re-learn)
 
@@ -196,10 +211,10 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
   live in GitHub Secrets + locally only. Never commit, never print.
 - `docs/CONTEXT_HANDOFF.md` = the *now* (live run ids, today's observations);
   stable knowledge lives HERE, not there. One source of truth each.
-- Tests: `./venv/bin/python tests/test_run_once.py` must stay green (184 PASS as of
+- Tests: `./venv/bin/python tests/test_run_once.py` must stay green (197 PASS as of
   2026-10-05; incl. `test_duty`, `test_heartbeat_loop`, `test_due_cap`,
   `test_inbox_retry_flow`, `test_duty_gap`, `test_work_wedge`,
-  `test_leader_watch_inherit`, `test_timeout_budget`). The last one parses
+  `test_leader_watch_inherit`, `test_timeout_budget`, `test_liveness`). The last one parses
   `summarize.yml` with plain regex (no new deps) and asserts
   watch + tail + setup ≤ timeout — the exact inequality that killed three
   leaders on 2026-10-05.

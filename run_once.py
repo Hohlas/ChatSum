@@ -303,6 +303,124 @@ def format_gap_warning(gap_sec, last_hb_iso):
     return f"⚠️ Дежурство прерывалось на {mins} мин.\nПоследний heartbeat {stamp}"
 
 
+LIVENESS_PREFIX = 'heartbeat '  # префикс маяка дежурства в General
+LIVENESS_EVERY = 5              # каждый 5-й тик heartbeat (120с × 5 = 10 мин)
+LIVENESS_SCAN_LIMIT = 50        # глубина поиска маяка при заступлении
+
+_liveness_msg_id = None  # in-memory id маяка текущего лидера (сессия 20).
+                         # В me не кладём: leader_claim сериализует весь me
+                         # во флаг, чужеродное поле там не нужно.
+_liveness_next_utc = None  # ISO UTC ожидаемого конца вахты (строка next leader).
+
+
+def format_liveness_text(now=None, next_utc=None):
+    """Текст маяка дежурства: время + ожидаемый конец вахты, всё МСК.
+
+    Чистая логика, тестируется. Без next_utc — одна строка (старт лидера,
+    конец вахты ещё не посчитан). next_utc — ISO UTC или aware datetime.
+    """
+    dt = now or _utc_now()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    lines = [f"heartbeat {dt.astimezone(MSK).strftime('%d.%m %H:%M')}"]
+    nxt = _parse_utc(next_utc) if isinstance(next_utc, str) else next_utc
+    if nxt is not None:
+        if nxt.tzinfo is None:
+            nxt = nxt.replace(tzinfo=timezone.utc)
+        lines.append(f"next leader: {nxt.astimezone(MSK).strftime('%d.%m %H:%M')}")
+    return '\n'.join(lines)
+
+
+def liveness_set_next(end_utc_iso):
+    """Запомнить ожидаемый конец вахты (in-memory, для строки next leader)."""
+    global _liveness_next_utc
+    _liveness_next_utc = end_utc_iso
+
+
+def is_liveness_text(text):
+    """Свой ли это маяк (по префиксу). Для inbox безвреден и так:
+    parse_chat_command_args вернёт None → 'skip', сообщение не трогаем."""
+    return isinstance(text, str) and text.startswith(LIVENESS_PREFIX)
+
+
+async def liveness_find(main, dest=None):
+    """Найти id последнего маяка в General (подхват при смене дежурного).
+
+    Возвращает max id среди своих сообщений с префиксом, иначе None.
+    Best-effort: неуспех — None, вызыватель запостит новый.
+    """
+    try:
+        dest = dest or main.RESULTS_DESTINATION
+        best = None
+        async for m in main.telegram_client.iter_messages(dest, limit=LIVENESS_SCAN_LIMIT):
+            if is_liveness_text(getattr(m, 'text', None)) and getattr(m, 'id', 0):
+                if best is None or m.id > best:
+                    best = m.id
+        return best
+    except Exception as e:
+        print(f"⚠️ Маяк: не удалось найти прошлое сообщение: {e}")
+        return None
+
+
+async def liveness_post(main, dest=None):
+    """Опубликовать новый маяк. Возвращает msg_id|None. Best-effort."""
+    try:
+        dest = dest or main.RESULTS_DESTINATION
+        msg = await main.telegram_client.send_message(
+            dest, format_liveness_text(next_utc=_liveness_next_utc))
+        mid = getattr(msg, 'id', None)
+        print(f"💓 Маяк: опубликован ({mid})")
+        return mid
+    except Exception as e:
+        print(f"⚠️ Маяк: не удалось опубликовать: {e}")
+        return None
+
+
+async def liveness_ensure(main, dest=None):
+    """Подхват поиском или пост нового при заступлении. Возвращает msg_id|None.
+
+    Новое сообщение — только если старого нет (первый запуск, удалено
+    вручную): обычный handoff подхватывает чужой маяк и правит его.
+    """
+    global _liveness_msg_id
+    try:
+        found = await liveness_find(main, dest)
+        if found:
+            print(f"💓 Маяк: подхватил {found}")
+            _liveness_msg_id = found
+            return found
+        _liveness_msg_id = await liveness_post(main, dest)
+        return _liveness_msg_id
+    except Exception as e:
+        print(f"⚠️ Маяк: не удалось подняться: {e}")
+        return None
+
+
+async def liveness_tick(main, dest=None):
+    """Одна плановая правка маяка (каждый N-й тик heartbeat).
+
+    Возвращает актуальный msg_id. Правка упала (сообщение удалили) —
+    один перепост вместо правки. Ран не роняем никогда.
+    """
+    global _liveness_msg_id
+    try:
+        dest = dest or main.RESULTS_DESTINATION
+        if _liveness_msg_id:
+            try:
+                await main.telegram_client.edit_message(
+                    dest, _liveness_msg_id,
+                    format_liveness_text(next_utc=_liveness_next_utc))
+                return _liveness_msg_id
+            except Exception as e:
+                print(f"⚠️ Маяк {_liveness_msg_id}: не удалось править "
+                      f"({e}) — перепощу")
+        _liveness_msg_id = await liveness_post(main, dest)
+        return _liveness_msg_id
+    except Exception as e:
+        print(f"⚠️ Маяк: тик не удался: {e}")
+        return _liveness_msg_id
+
+
 def prev_duty_heartbeat(exclude_run_id):
     """Последний ЧУЖОЙ heartbeat дежурства: (hb_iso|None, run_id|None).
 
@@ -1767,10 +1885,11 @@ async def _leader_startup(main, args, state, path, me, poll):
             await _notify_inbox(
                 main, main.RESULTS_DESTINATION, 1,
                 format_gap_warning(gap_sec, prev_hb))
+    await liveness_ensure(main)  # маяк дежурства: подхват поиском или новый
     return 'leader'
 
 
-async def _heartbeat_loop(me, path):
+async def _heartbeat_loop(me, path, main=None):
     """Фоновый heartbeat лидера каждые LEADER_HEARTBEAT_SEC (best-effort).
 
     Отдельной задачей — осознанно: итерация лидера с тяжёлым саммари длится
@@ -1778,7 +1897,10 @@ async def _heartbeat_loop(me, path):
     задачи и standby объявлял живого мёртвым (наблюдалось в проде 2026-10-04).
     Фоновая задача interleaves на await'ах (Telegram/Gemini HTTP) и бьёт
     ровно по времени. Останавливается отменой от вызывателя.
+    Каждый LIVENESS_EVERY-й тик — правка маяка в General (сессия 20).
+    Без main (тесты, сольный режим) — только heartbeat, без маяка.
     """
+    tick = 0
     try:
         while True:
             await asyncio.sleep(LEADER_HEARTBEAT_SEC)
@@ -1786,6 +1908,10 @@ async def _heartbeat_loop(me, path):
             leader_claim(me)
             push_state_best_effort(path)
             push_work_best_effort(me['run_id'])  # маркер прогресса едет тем же ритмом
+            if main is not None:
+                tick += 1
+                if tick % LIVENESS_EVERY == 0:
+                    await liveness_tick(main)
     except asyncio.CancelledError:
         pass
 
@@ -1805,10 +1931,15 @@ async def _run_leader_loop(main, args, state, path, me, poll, use_handoff,
     iteration = 0
     hb_task = None
     if use_handoff:
-        hb_task = asyncio.create_task(_heartbeat_loop(me, path))
+        hb_task = asyncio.create_task(_heartbeat_loop(me, path, main))
     try:
         deadline = time.monotonic() + leader_watch_seconds(watch_remaining,
                                                              args.watch_seconds)
+        try:
+            liveness_set_next(_utc_str(
+                _utc_now() + timedelta(seconds=max(0.0, deadline - time.monotonic()))))
+        except Exception as e:
+            print(f"⚠️ Маяк: не удалось посчитать конец вахты: {e}")
         while True:
             iteration += 1
             print(f"─── Итерация {iteration} ───")

@@ -127,6 +127,7 @@ def main():
     test_leader_watch_inherit()
     test_timeout_budget()
     test_gap_warning_format()
+    test_liveness()
     test_handoff()
     test_duty()
     test_heartbeat_loop()
@@ -891,6 +892,142 @@ def test_gap_warning_format():
     check('варнинг: мусор не роняет, строка как есть',
           text == '⚠️ Дежурство прерывалось на 5 мин.\n'
                   'Последний heartbeat мусор', repr(text))
+
+
+def test_liveness():
+    """Маяк дежурства: формат МСК, подхват поиском, правка, перепост при сносе."""
+    from datetime import timezone
+    now = datetime(2026, 10, 5, 9, 46, tzinfo=timezone.utc)  # 12:46 МСК
+    check('маяк: одна строка без конца вахты',
+          run_once.format_liveness_text(now) == 'heartbeat 05.10 12:46',
+          repr(run_once.format_liveness_text(now)))
+    check('маяк: две строки с next leader (всё МСК)',
+          run_once.format_liveness_text(now, '2026-10-05T12:13:00Z')
+          == 'heartbeat 05.10 12:46\nnext leader: 05.10 15:13',
+          repr(run_once.format_liveness_text(now, '2026-10-05T12:13:00Z')))
+    check('маяк: префикс свой/чужой',
+          run_once.is_liveness_text('heartbeat 05.10 12:46\nnext leader: 05.10 15:13') is True
+          and run_once.is_liveness_text('hello') is False
+          and run_once.is_liveness_text(None) is False)
+
+    class FakeMsg:
+        def __init__(self, id, text):
+            self.id = id
+            self.text = text
+
+    class FakeClient:
+        def __init__(self, msgs):
+            self.msgs = list(msgs)
+            self.sent = []
+            self.edited = []
+            self.fail_edit = False
+            self._next = 100
+
+        async def iter_messages(self, dest, limit=None):
+            msgs = self.msgs[-int(limit):] if limit else self.msgs
+            for m in msgs:
+                yield m
+
+        async def send_message(self, dest, text):
+            self._next += 1
+            m = FakeMsg(self._next, text)
+            self.msgs.append(m)
+            self.sent.append(text)
+            return m
+
+        async def edit_message(self, dest, msg_id, text):
+            if self.fail_edit:
+                raise RuntimeError('deleted')
+            self.edited.append((msg_id, text))
+            for m in self.msgs:
+                if m.id == msg_id:
+                    m.text = text
+
+    class FakeMain:
+        RESULTS_DESTINATION = 'test-general'
+
+        def __init__(self, client):
+            self.telegram_client = client
+
+    loop = asyncio.get_event_loop()
+    try:
+        # Подхват: максимальный id среди маяков, чужое игнорируем, поста нет
+        c1 = FakeClient([FakeMsg(1, 'hello'),
+                         FakeMsg(7, 'heartbeat 05.10 09:00 (по москве)'),
+                         FakeMsg(9, '📄 саммари'),
+                         FakeMsg(12, 'heartbeat 05.10 10:00 (по москве)')])
+        run_once._liveness_msg_id = None
+        got = loop.run_until_complete(run_once.liveness_ensure(FakeMain(c1)))
+        check('маяк: подхват последнего маяка без поста',
+              got == 12 and c1.sent == [], (got, c1.sent))
+
+        # Нечего подхватить — постим новый
+        c2 = FakeClient([FakeMsg(1, 'hello')])
+        run_once._liveness_msg_id = None
+        got = loop.run_until_complete(run_once.liveness_ensure(FakeMain(c2)))
+        check('маяк: без истории — пост нового',
+              got == 101 and len(c2.sent) == 1, (got, c2.sent))
+
+        # Тик правит in-memory id
+        run_once._liveness_msg_id = 12
+        run_once._liveness_next_utc = None
+        got = loop.run_until_complete(run_once.liveness_tick(FakeMain(c1)))
+        check('маяк: тик правит in-memory id',
+              got == 12 and c1.edited and c1.edited[-1][0] == 12,
+              (got, c1.edited))
+
+        # Тик несёт строку next leader, если конец вахты известен
+        run_once._liveness_msg_id = 12
+        run_once._liveness_next_utc = '2026-10-05T12:13:00Z'
+        got = loop.run_until_complete(run_once.liveness_tick(FakeMain(c1)))
+        check('маяк: тик пишет next leader',
+              got == 12 and c1.edited and c1.edited[-1][1].endswith(
+                  '\nnext leader: 05.10 15:13'),
+              (got, c1.edited[-1] if c1.edited else None))
+        run_once._liveness_next_utc = None
+
+        # Правка упала (удалён вручную) — перепост + новый id запомнен
+        c1.fail_edit = True
+        run_once._liveness_msg_id = 12
+        got = loop.run_until_complete(run_once.liveness_tick(FakeMain(c1)))
+        check('маяк: снос лечится перепостом',
+              got == 101 and len(c1.sent) == 1, (got, c1.sent))
+        check('маяк: новый id запомнен', run_once._liveness_msg_id == 101,
+              run_once._liveness_msg_id)
+
+        # Ритм: heartbeat-loop правит маяк каждый 5-й тик
+        saved = (run_once.LEADER_HEARTBEAT_SEC, run_once.leader_claim,
+                 run_once.push_state_best_effort, run_once.work_claim)
+        try:
+            run_once.LEADER_HEARTBEAT_SEC = 0.05
+            run_once.leader_claim = lambda doc: True
+            run_once.push_state_best_effort = lambda path: True
+            run_once.work_claim = lambda doc: True
+            c3 = FakeClient([FakeMsg(5, 'heartbeat 05.10 08:00 (по москве)')])
+            run_once._liveness_msg_id = 5
+            fm = FakeMain(c3)
+
+            async def run_ticks():
+                me = {'run_id': 't', 'ready': True, 'heartbeat_utc': 'old',
+                      'watch_started_utc': '2026-10-05T09:00:00Z'}
+                task = asyncio.create_task(
+                    run_once._heartbeat_loop(me, '/tmp/x.json', fm))
+                await asyncio.sleep(0.4)  # ~8 тиков → правка на 5-м
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            loop.run_until_complete(run_ticks())
+            check('маяк: heartbeat-loop правит каждый 5-й тик',
+                  len(c3.edited) >= 1 and c3.edited[0][0] == 5, c3.edited)
+        finally:
+            (run_once.LEADER_HEARTBEAT_SEC, run_once.leader_claim,
+             run_once.push_state_best_effort, run_once.work_claim) = saved
+    finally:
+        run_once._liveness_msg_id = None
+        run_once._liveness_next_utc = None
 
 
 def test_handoff():
