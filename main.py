@@ -1987,10 +1987,10 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
             print(f"   👥 Приоритетные пользователи: {priority_list}")
     else:
         if PRIORITY_USERS:
-            prompt_with_priority = prompt_with_priority.replace('{PRIORITY_USERS}', 'приоритетных пользователей (нет в текущем чате)')
+            prompt_with_priority = prompt_with_priority.replace('{PRIORITY_USERS}', 'priority users (none present in this chat)')
             print(f"   👥 Приоритетные пользователи: нет в текущем чате (из {len(PRIORITY_USERS)} заданных)")
         else:
-            prompt_with_priority = prompt_with_priority.replace('{PRIORITY_USERS}', 'приоритетных пользователей (не заданы)')
+            prompt_with_priority = prompt_with_priority.replace('{PRIORITY_USERS}', 'priority users (none set)')
             print(f"   👥 Приоритетные пользователи: не заданы")
     system_content = safe_str(prompt_with_priority)
     
