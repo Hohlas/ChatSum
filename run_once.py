@@ -182,7 +182,7 @@ SCHEDULE_REFRESH_SEC = 600   # период обновления SCHEDULE.txt и
 PROMOTE_CONFIRM_READS = 2    # подряд протухших чтений перед promotion
 INBOX_MAX_ATTEMPTS = 5       # попыток inbox-команды, дальше — удалить
 DUE_FAIL_THRESHOLD = 3       # подряд провалов due-ключа до пропуска
-DUE_FAIL_SKIP_SEC = 10800    # пропуск падающего due-ключа: 3 часа
+DUE_FAIL_SKIP_SEC = 3600     # пропуск падающего due-ключа: 1 час
 MAX_DUE_PER_ITERATION = 1    # due-саммари за итерацию: inbox опрашивается первым
                              # каждую итерацию, догон расписания идёт по одному —
                              # иначе шторм догона (4–6 слотов) хоронит команды

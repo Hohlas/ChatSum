@@ -15,12 +15,26 @@ do not "tune" them without the owner.
    next analysis starts past dead keys instead of re-walking them).
    Flat quota rule (2026-10-06): 429-quota → instant rotate, ONE hit per key,
    no same-key retries/sleeps (a dry key won't get wet from retries; 9 keys ×
-   30s of sleeps was ~5 min of dead waiting per circle). 503/timeout keep the
-   old path with retries — retries demonstrably heal storms. Pause
+   30s of sleeps was ~5 min of dead waiting per circle). Pause
    (`FULL_CIRCLE_FAIL_PAUSE_SEC=60`) happens ONLY after a fully lost circle
-   (all keys refused), never per rotation. TG 429 line carries quotaId + retry
-   (`format_quota_diagnostic`; retry also parsed from message text
-   'Please retry in 17h1m40s').
+   (all keys refused), never per rotation. 503/UNAVAILABLE: hold the SAME key
+   with growing pauses (`SERVER_RETRY_PAUSES_SEC=60/180/540`), NO key walk.
+   Why: (1) the storm is backend-wide — the next key hits the same wall;
+   (2) a 503 is charged against the daily limit — чужой замер через дашборд
+   AI Studio: 31 из 50 засчитанных запросов были 503 «The model is overloaded»
+   («Every time you send a request and receive a 503 response, Google records
+   it as successful and counts your quota», dev forum Nov 2025; no official
+   line in the docs — secondary data, but two independent observations plus
+   the «503 lands AFTER key authentication» mechanics agree — do NOT redesign
+   back into key-walking); (3) official guidance for 503 is «backoff and retry
+   with a long maximum delay» (Gemini team reply, dev forum Feb 2026) —
+   waiting is literally what is asked. After 3 tries the chunk fails outward.
+   Sustained 503 also stops remaining chunks (`stop_due_to_overload`, mirror
+   of the quota stop), so a multi-chunk summary doesn't sleep 13 min per
+   chunk. 500/502/504 and timeouts deliberately stay on the old short-retry
+   path (second-long blips; timeouts are ambiguous client/network-side).
+   TG 429 line carries quotaId + retry (`format_quota_diagnostic`; retry also
+   parsed from message text 'Please retry in 17h1m40s').
 - `run_once.py` — scheduler + duty wrapper. Imports `main.py`. Entry points:
   `--due` (manual drain), `--watch` (duty loop). All times in slots are
   **MSK = UTC+3** (`MSK`, `run_once.py:39`).
@@ -47,7 +61,7 @@ do not "tune" them without the owner.
 
 ## VPS mode (long-lived userbot, the original mode)
 
-Entry: `python3 main.py` → `main()` (`main.py:4555`) → Telethon client
+Entry: `python3 main.py` → `main()` (`main.py:4771`) → Telethon client
 `run_until_disconnected()`. One process holds one Telegram session
 (`session_name.session` file; `telegram_session.txt` holds the StringSession
 copy). Config is local `private.txt` (+ `PROMPT.txt`, `EXCLUDED_USERS.txt`,
@@ -55,14 +69,14 @@ copy). Config is local `private.txt` (+ `PROMPT.txt`, `EXCLUDED_USERS.txt`,
 
 - Commands are **outgoing slash-commands from the owner's own account**
   (`@telegram_client.on(events.NewMessage(outgoing=True, ...))`,
-  `main.py:3904+`): `/sum` (`3h` / `45` / `600-800` / `2d-3d` / `1d+` — the
+  `main.py:4120+`): `/sum` (`3h` / `45` / `600-800` / `2d-3d` / `1d+` — the
   `+` also posts the result back into the source chat), `/copy` (same ranges,
   no AI = no API cost), `/config` family (`/show_model`, `/set_model`,
   `/add_excluded`, `/reload_config`, …), `/sch HH:MM period` + `/sch_list` +
   `/unsch`, `/help`. Send `/sum …` in any chat, the userbot answers there.
-- Schedule: APScheduler `AsyncIOScheduler` (`main.py:3851`); `reload_schedule()`
-  (`main.py:3889`) registers one `CronTrigger` per slot in MSK
-  (`scheduled_analysis_job`, `main.py:3854` → `run_analysis(…, scheduled=True)`).
+- Schedule: APScheduler `AsyncIOScheduler` (`main.py:4067`); `reload_schedule()`
+  (`main.py:4105`) registers one `CronTrigger` per slot in MSK
+  (`scheduled_analysis_job`, `main.py:4070` → `run_analysis(…, scheduled=True)`).
 - No dedup layer: a trigger fires once by the clock. If the process is down
   at fire time, **that slot is silently missed** — no catch-up (this exact
   weakness is why the Actions mode uses per-key `completed` marks instead).
@@ -73,17 +87,17 @@ copy). Config is local `private.txt` (+ `PROMPT.txt`, `EXCLUDED_USERS.txt`,
 ## GitHub Actions mode (duty on cron, current production mode)
 
 No long-lived process: short-lived workflow runs form a relay — cron tick
-`*/11` UTC starts a run, the run works as leader or standby for up to 5.5h,
+`*/31` UTC starts a run, the run works as leader or standby for up to 5.5h,
 then the next tick takes over.
 
-## Leader iteration (the hot loop, `_run_leader_loop`, `run_once.py:1785`)
+## Leader iteration (the hot loop, `_run_leader_loop`, `run_once.py:1940`)
 
 Each iteration, strictly in this order:
 
-1. **Inbox first** — `poll_inbox_first` (`run_once.py:1621`): deep first pass
+1. **Inbox first** — `poll_inbox_first` (`run_once.py:1771`): deep first pass
 with `offset_id` pagination (10×100) so commands buried under summaries
 during a gap are not skipped. Processing via `_process_batch` /
-`process_inbox_message` (`run_once.py:1594`/`1402`). Before starting an
+`process_inbox_message` (`run_once.py:1744`/`1552`). Before starting an
    analysis the message is re-read (claim-check vs double-take by a rival).
    Failure does NOT delete the command: `inbox_attempts` counter up to
    `INBOX_MAX_ATTEMPTS=5` with "🔁 Попытка N/5" progress; `last_seen` rolls
@@ -92,35 +106,35 @@ during a gap are not skipped. Processing via `_process_batch` /
 2. **At most one due task** — `run_due_once(..., max_tasks=1)`
     (`MAX_DUE_PER_ITERATION`, `run_once.py:186`; manual `--due` passes
     None = drain all). Per-key dedup: `compute_due(entries, now, completed)`
-    (`run_once.py:718`) — a slot fires once per key `chat|HH:MM|limit` per
-    occurrence date. After 3 consecutive failures a slot is skipped for 3h
-    (`due_skip_info`, `run_once.py:815`; quota protection). Success clears.
+    (`run_once.py:847`) — a slot fires once per key `chat|HH:MM|limit` per
+    occurrence date. After 3 consecutive failures a slot is skipped for 1h
+    (`due_skip_info`, `run_once.py:968`; quota protection). Success clears.
     Worst inbox delay ≈ one summary duration.
-3. Background: `_heartbeat_loop` (`run_once.py:1765`, own asyncio task)
+3. Background: `_heartbeat_loop` (`run_once.py:1913`, own asyncio task)
     re-claims + pushes every `LEADER_HEARTBEAT_SEC` (interleaves on Gemini/
     Telegram awaits — a long summary must NOT look like a dead leader).
     State + work-marker push ride the same 120s rhythm,
     `SCHEDULE.txt` refresh from `origin/main` every
     `SCHEDULE_REFRESH_SEC` (a 5.5h run would otherwise go stale).
 
-Cleanup (`_watch_cleanup`, `run_once.py:1674`) ALWAYS pull-merges first,
+Cleanup (`_watch_cleanup`, `run_once.py:1824`) ALWAYS pull-merges first,
 then saves/pushes. The workflow's trailing `Persist state` step does the
 same. Rationale: a silent standby or a yielding leader must only ever write
 a **superset** — never wipe чужой прогресс.
 
 ## Duty protocol (leader ↔ standby, all via Contents API files)
 
-- Claim: `leader_claim` (`run_once.py:496`) — check-then-PUT, last-writer-wins
+- Claim: `leader_claim` (`run_once.py:625`) — check-then-PUT, last-writer-wins
   + one retry on sha race. New run claims `ready:false`, then `ready:true`
   only after Telegram connect succeeds (a run that can't reach Telegram
   must never look like a leader).
-- Newcomer vs live leader → `_run_standby_loop` (`run_once.py:1849`): no
+- Newcomer vs live leader → `_run_standby_loop` (`run_once.py:2009`): no
   Telegram, only GETs the flag every 30s; single shared `standby.json`.
   Older standby yields to a newer one ("newer wins" — the promoter is
-  normally ≤11 min old, so inherited reigns stay long).
+  normally ≤31 min old, so inherited reigns stay long).
 - `leader_should_yield` (`run_once.py:254`): yield only to a live + ready +
   strictly newer leader; equal start time → bigger `run_id` wins.
-- `standby_should_promote` (`run_once.py:390`): missing flag, stale heartbeat,
+- `standby_should_promote` (`run_once.py:519`): missing flag, stale heartbeat,
   or `retiring` leader — confirmed over `PROMOTE_CONFIRM_READS` consecutive
   reads (no flapping on one slow GET). A leader near its deadline writes
   `retiring` + pushes → handoff is instant.
@@ -139,15 +153,15 @@ a **superset** — never wipe чужой прогресс.
 
 ## State merge — the one invariant that matters
 
-`merge_states(local, remote)` (`run_once.py:546`) is a **union**, never an
+`merge_states(local, remote)` (`run_once.py:675`) is a **union**, never an
 intersection: `completed` keeps the fresher date per key, counters take
 `max()` (incl. `google_key_cursor` — a local value must never roll the
 rotation back), `last_run_utc` takes max. `prune_state` (`run_once.py:93`)
 drops counters older than 3 days. Consequence: under a single writer,
 pushed content is monotonically non-decreasing in keys.
 
-`push_state_best_effort` (`run_once.py:594`): GET → merge → PUT → on sha
-conflict one re-GET/merge/PUT. Then `_verify_push` (`run_once.py:619`):
+`push_state_best_effort` (`run_once.py:723`): GET → merge → PUT → on sha
+conflict one re-GET/merge/PUT. Then `_verify_push` (`run_once.py:748`):
 re-read the branch, confirm all local `completed` keys are present;
 on mismatch one more PUT + loud `🚨` log (tripwire, see Incidents §4).
 A run never exits nonzero over state trouble — worst case the trailing
@@ -188,7 +202,7 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
 | `SCHEDULE_REFRESH_SEC` | 600 | schedule staleness inside a 5.5h run |
 | `PROMOTE_CONFIRM_READS` | 2 | anti-flap on promotion |
 | `INBOX_MAX_ATTEMPTS` | 5 | command retries before deletion |
-| `DUE_FAIL_THRESHOLD` / `DUE_FAIL_SKIP_SEC` | 3 / 10800 | скип падающего слота 3ч, возобновляемый: окно меряется от `last_utc`, по истечении — новый эпизод 3 попытки + 3ч тишины (`due_fail_record`, сессия 22) |
+| `DUE_FAIL_THRESHOLD` / `DUE_FAIL_SKIP_SEC` | 3 / 3600 | скип падающего слота 1ч, возобновляемый: окно меряется от `last_utc`, по истечении — новый эпизод 3 попытки + 1ч тишины (`due_fail_record`, сессии 22/25) |
 | `MAX_DUE_PER_ITERATION` | 1 | inbox-first latency bound |
 | `LIVENESS_EVERY` / `LIVENESS_SCAN_LIMIT` | 5 / 50 | маяк в General: правка каждый 5-й тик (120с × 5 = 10 мин) / глубина подхвата |
 
@@ -218,11 +232,13 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
    новый ключ без метки догоняется тем же вечером, даже если слот утренний
    (`compute_due`: опоздание любой длины догоняется). 4 «новых» слота +
    исчерпанная free-tier квота Gemini (429) дали 46 провалов одного слота
-   за ночь тремя лидерами. `due_fails.first_utc` не обновляется — скип 3ч
-   срабатывает один раз, дальше повторы каждые ~8 мин до успеха. Урок:
+   за ночь тремя лидерами. Тогда `due_fails.first_utc` не обновлялся — скип 3ч
+   срабатывал один раз, дальше повторы каждые ~8 мин до успеха. С тех пор
+   скип возобновляемый (окно от `last_utc`, сессии 22/25) и укорочен до 1ч:
+   ритм сухого слота теперь «3 попытки → 1ч тишины → …». Урок:
    смену периода/суффикса уже отработанного слота делать осознанно
-   (это плановый перезапуск, не баг); при исчерпанной квоте тишину даёт
-   только успех или правка расписания.
+   (это плановый перезапуск, не баг); тишину при исчерпанной квоте держит
+   возобновляемый скип, успех не обязателен.
 
 ## Do-not-touch / discipline
 
@@ -230,11 +246,12 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
   live in GitHub Secrets + locally only. Never commit, never print.
 - `docs/CONTEXT_HANDOFF.md` = the *now* (live run ids, today's observations);
   stable knowledge lives HERE, not there. One source of truth each.
-- Tests: `./venv/bin/python tests/test_run_once.py` must stay green (227 PASS as of
+- Tests: `./venv/bin/python tests/test_run_once.py` must stay green (241 PASS as of
   2026-10-06; incl. `test_duty`, `test_heartbeat_loop`, `test_due_cap`,
   `test_inbox_retry_flow`, `test_duty_gap`, `test_work_wedge`,
   `test_leader_watch_inherit`, `test_timeout_budget`, `test_liveness`,
-  `test_due_fail_renew`, `test_quota_diag`, `test_flat_rotation`). The last one parses
+  `test_due_fail_renew`, `test_quota_diag`, `test_flat_rotation`,
+  `test_503_holds_key`). The last one parses
   `summarize.yml` with plain regex (no new deps) and asserts
   watch + tail + setup ≤ timeout — the exact inequality that killed three
   leaders on 2026-10-05.

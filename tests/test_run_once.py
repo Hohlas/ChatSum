@@ -120,7 +120,7 @@ def main():
     test_inbox_retry_flow()
     test_sched_flows()
     test_key_cursor()
-    test_503_rotates_key()
+    test_503_holds_key()
     test_rotate_advances_cursor()
     test_duty_gap()
     test_work_wedge()
@@ -700,14 +700,15 @@ def test_key_cursor():
          bot.GOOGLE_API_KEYS, bot.google_client) = saved
 
 
-def test_503_rotates_key():
-    """503 после same-key ретраев уводит на следующий ключ; 429 — нет."""
+def test_503_holds_key():
+    """503 держит ТОТ ЖЕ ключ с растущими паузами 1/3/9 мин, без обхода;
+    после 3 попыток — провал наружу. 429 plain-Exception — старый путь."""
     saved = (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
              bot.google_analysis_counter, bot.google_client, bot.asyncio.sleep)
     saved_set_index = bot.set_google_api_key_index
     sleeps = []
     calls = {'n': 0}
-    err503 = {'raise': True}
+    mode = {'fails': 2}  # сколько первых вызовов валятся с 503
 
     async def fake_sleep(sec):
         sleeps.append(sec)
@@ -715,11 +716,9 @@ def test_503_rotates_key():
     class FakeCompletions:
         async def create(self, **kw):
             calls['n'] += 1
-            if err503['raise'] and calls['n'] <= 3:
+            if calls['n'] <= mode['fails']:
                 raise Exception(
                     "Error code: 503 - high demand, status UNAVAILABLE")
-            if not err503['raise']:
-                raise Exception("Error code: 429 - rate limit exceeded")
             return 'OK'
 
     class FakeClient:
@@ -737,27 +736,30 @@ def test_503_rotates_key():
         bot.google_client = FakeClient()
         bot.set_google_api_key_index = fake_set_index
 
+        # 503×2 → успех с 3-й: тот же ключ, без ротации, паузы 60+180
         with _quiet():
             result = loop.run_until_complete(bot.execute_gemini_request({}))
-        check('503: успех со второго ключа', result == 'OK', result)
-        check('503: ротация на ключ 2/3',
-              bot.current_google_key_index == 1, bot.current_google_key_index)
-        check('503: попыток 4 (3×503 + успех)', calls['n'] == 4, calls)
-        check('503: паузы same-key ретраев', sleeps == [10, 20], sleeps)
+        check('503: успех с того же ключа', result == 'OK', result)
+        check('503: ротации НЕТ (ключ 1/3)',
+              bot.current_google_key_index == 0, bot.current_google_key_index)
+        check('503: попыток 3 (2×503 + успех)', calls['n'] == 3, calls)
+        check('503: растущие паузы 1/3 мин', sleeps == [60, 180], sleeps)
 
-        # 429: same-key ретраи, ротации НЕТ (все вызовы падают → raise)
+        # 503 всегда: провал наружу после 3 попыток, ключ не сменился
         calls['n'] = 0
         sleeps.clear()
-        err503['raise'] = False
-        bot.current_google_key_index = 0
+        mode['fails'] = 99
         try:
             with _quiet():
                 loop.run_until_complete(bot.execute_gemini_request({}))
-            check('429: должен был raise', False)
-        except Exception:
-            check('429: без ротации — raise после ретраев',
-                  bot.current_google_key_index == 0 and calls['n'] == 3,
-                  (bot.current_google_key_index, calls))
+            check('503: должен был raise', False)
+        except Exception as e:
+            check('503: raise после 3 попыток без обхода',
+                  '503' in str(e) and bot.current_google_key_index == 0
+                  and calls['n'] == 3,
+                  (str(e)[:40], bot.current_google_key_index, calls))
+        check('503: паузы только 1/3 мин (9-й минуты нет — сдались)',
+              sleeps == [60, 180], sleeps)
     finally:
         (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
          bot.google_analysis_counter, bot.google_client,
@@ -1043,22 +1045,22 @@ def test_due_fail_renew():
     check('скип: первый провал — n=1, метки свежие',
           r == {'n': 1, 'first_utc': iso(now), 'last_utc': iso(now)}, r)
 
-    r2 = run_once.due_fail_record({'k': r}, 'k', now + timedelta(hours=1))
+    r2 = run_once.due_fail_record({'k': r}, 'k', now + timedelta(minutes=20))
     check('скип: повтор в окне — n=2, first kept, last движется',
           r2['n'] == 2 and r2['first_utc'] == iso(now)
-          and r2['last_utc'] == iso(now + timedelta(hours=1)), r2)
+          and r2['last_utc'] == iso(now + timedelta(minutes=20)), r2)
     check('скип: 2 провала — работаем',
-          run_once.due_skip_info({'k': r2}, 'k', now + timedelta(hours=1)) is False)
-    r3 = run_once.due_fail_record({'k': r2}, 'k', now + timedelta(hours=2))
+          run_once.due_skip_info({'k': r2}, 'k', now + timedelta(minutes=20)) is False)
+    r3 = run_once.due_fail_record({'k': r2}, 'k', now + timedelta(minutes=40))
     check('скип: 3 свежих провала — пропуск',
-          run_once.due_skip_info({'k': r3}, 'k', now + timedelta(hours=2)) is True)
+          run_once.due_skip_info({'k': r3}, 'k', now + timedelta(minutes=40)) is True)
 
-    r4 = run_once.due_fail_record({'k': r3}, 'k', now + timedelta(hours=6))
+    r4 = run_once.due_fail_record({'k': r3}, 'k', now + timedelta(hours=2))
     check('скип: окно истекло — новый эпизод n=1',
-          r4 == {'n': 1, 'first_utc': iso(now + timedelta(hours=6)),
-                 'last_utc': iso(now + timedelta(hours=6))}, r4)
+          r4 == {'n': 1, 'first_utc': iso(now + timedelta(hours=2)),
+                 'last_utc': iso(now + timedelta(hours=2))}, r4)
     check('скип: новый эпизод — работаем',
-          run_once.due_skip_info({'k': r4}, 'k', now + timedelta(hours=6)) is False)
+          run_once.due_skip_info({'k': r4}, 'k', now + timedelta(hours=2)) is False)
 
     stale = {'k': {'n': 46, 'first_utc': '2026-10-05T17:12:34Z'}}
     check('скип: stale без last_utc — не скипаем (fallback first_utc)',
@@ -1141,6 +1143,19 @@ def test_flat_rotation():
                       ('45s', '45s'), ('24445s', '6h47m'), ('xx', 'xx')):
         check(f'плоская: retry {raw} → {want}',
               bot._short_retry_delay(raw) == want, bot._short_retry_delay(raw))
+    check('503: паузы 1/3/9 мин',
+          bot.SERVER_RETRY_PAUSES_SEC == (60, 180, 540), bot.SERVER_RETRY_PAUSES_SEC)
+    for text in ('Error code: 503 - Service Unavailable',
+                 'UNAVAILABLE: server overloaded',
+                 'HTTP 503: upstream overloaded'):
+        check(f'503: держим ключ ({text[:24]}…)',
+              bot.is_server_overloaded(text) is True, '')
+    for text in ('Error code: 429 - quota exceeded',
+                 'GenerateRequestsPerDayPerProjectPerModel-FreeTier',
+                 'timeout awaiting response', 'Error code: 500',
+                 'Error code: 502', 'Error code: 504', '', None):
+        check(f'503: чужое ({str(text)[:24]}) — не держим',
+              bot.is_server_overloaded(text) is False, '')
 
 
 def test_handoff():
@@ -1255,13 +1270,16 @@ def test_duty():
     check('duty: 2-е протухшее чтение — promote',
           run_once.standby_should_promote(stale, 2, now) is True)
 
-    # Due-backoff: <3 провалов — работаем; 3 свежих — пропуск; старые (>3ч) — снова работаем
+    # Due-backoff: <3 провалов — работаем; 3 свежих — пропуск 1ч; старые (>1ч) — снова работаем
     fresh_ts = (now - timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    hour2_ts = (now - timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%SZ')
     old_ts = (now - timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M:%SZ')
     check('duty: 2 провала — работаем',
           run_once.due_skip_info({'k': {'n': 2, 'first_utc': fresh_ts}}, 'k', now) is False)
     check('duty: 3 свежих провала — пропуск',
           run_once.due_skip_info({'k': {'n': 3, 'first_utc': fresh_ts}}, 'k', now) is True)
+    check('duty: 3 провала 2ч назад — снова работаем (скип 1ч, не 3ч)',
+          run_once.due_skip_info({'k': {'n': 3, 'first_utc': hour2_ts}}, 'k', now) is False)
     check('duty: 3 старых провала — снова работаем',
           run_once.due_skip_info({'k': {'n': 3, 'first_utc': old_ts}}, 'k', now) is False)
     check('duty: нет записи — работаем',
