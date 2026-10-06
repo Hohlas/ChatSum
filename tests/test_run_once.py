@@ -130,6 +130,7 @@ def main():
     test_liveness()
     test_due_fail_renew()
     test_quota_diag()
+    test_flat_rotation()
     test_handoff()
     test_duty()
     test_heartbeat_loop()
@@ -1101,6 +1102,45 @@ def test_quota_diag():
               repr(bot.format_quota_diagnostic(err(bad))))
     check('диагностика: нет response → пусто',
           bot.format_quota_diagnostic(SimpleNamespace(status_code=429)) == '')
+
+
+def test_flat_rotation():
+    """Плоская ротация: квота → сразу дальше; retry-время из текста message."""
+    import httpx
+    from openai import APIStatusError
+
+    def _resp(status, payload):
+        req = httpx.Request('POST', 'https://generativelanguage.googleapis.com/x')
+        return httpx.Response(status, json=payload, request=req)
+
+    msg = ('You exceeded your current quota, please check your plan and billing details. '
+           '* Quota exceeded for metric: generativelanguage.googleapis.com/'
+           'generate_content_free_tier_requests, limit: 20, model: gemini-3.6-flash'
+           '\nPlease retry in 17h1m40.176678811s.')
+    payload = {'error': {'code': 429, 'message': msg, 'status': 'RESOURCE_EXHAUSTED',
+               'details': [{'@type': 'type.googleapis.com/google.rpc.Help', 'links': []},
+                           {'@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+                            'violations': [{'quotaId': 'GenerateRequestsPerDayPerProjectPerModel-FreeTier'}]}]}}
+    quota_err = APIStatusError(message='429', response=_resp(429, payload), body=payload)
+    check('плоская: 429-квота опознана',
+          bot.is_quota_rate_limit(quota_err) is True, '')
+    check('плоская: retry из текста трейса → TG',
+          bot.format_quota_diagnostic(quota_err)
+          == 'HTTP 429 · GenerateRequestsPerDayPerProjectPerModel · retry 17h01m',
+          bot.format_quota_diagnostic(quota_err))
+    storm = APIStatusError(message='503',
+                           response=_resp(503, {'error': {'message': 'Service Unavailable'}}),
+                           body={})
+    check('плоская: 503 — не квота (идёт путём с повторами)',
+          bot.is_quota_rate_limit(storm) is False, '')
+    check('плоская: обычное исключение — не квота',
+          bot.is_quota_rate_limit(ValueError('x')) is False, '')
+    check('плоская: пауза проигранного круга 60с',
+          bot.FULL_CIRCLE_FAIL_PAUSE_SEC == 60, bot.FULL_CIRCLE_FAIL_PAUSE_SEC)
+    for raw, want in (('17h1m40.176678811s', '17h01m'), ('1m30s', '1m'),
+                      ('45s', '45s'), ('24445s', '6h47m'), ('xx', 'xx')):
+        check(f'плоская: retry {raw} → {want}',
+              bot._short_retry_delay(raw) == want, bot._short_retry_delay(raw))
 
 
 def test_handoff():

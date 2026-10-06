@@ -10,16 +10,25 @@ do not "tune" them without the owner.
 
 - `main.py` — core: Telegram client, `scheduled_analysis_job` (scheduled slot),
   `run_analysis` (one inbox command; returns True only if ALL `send_*` passed),
-  Gemini key rotation (`select_google_api_key_for_new_analysis`, round-robin;
-  `rotate_*` on 503/quota — rotate also advances the persistent counter, so the
-  next analysis starts past dead keys instead of re-walking them).
+   Gemini key rotation (`select_google_api_key_for_new_analysis`, round-robin;
+   `rotate_*` on 503/quota — rotate also advances the persistent counter, so the
+   next analysis starts past dead keys instead of re-walking them).
+   Flat quota rule (2026-10-06): 429-quota → instant rotate, ONE hit per key,
+   no same-key retries/sleeps (a dry key won't get wet from retries; 9 keys ×
+   30s of sleeps was ~5 min of dead waiting per circle). 503/timeout keep the
+   old path with retries — retries demonstrably heal storms. Pause
+   (`FULL_CIRCLE_FAIL_PAUSE_SEC=60`) happens ONLY after a fully lost circle
+   (all keys refused), never per rotation. TG 429 line carries quotaId + retry
+   (`format_quota_diagnostic`; retry also parsed from message text
+   'Please retry in 17h1m40s').
 - `run_once.py` — scheduler + duty wrapper. Imports `main.py`. Entry points:
   `--due` (manual drain), `--watch` (duty loop). All times in slots are
   **MSK = UTC+3** (`MSK`, `run_once.py:39`).
 - `SCHEDULE.txt` (on `main`) — slots `chat_id|HH:MM|limit`, one per line.
   Leading `+` is stripped. Limit `10` = cheap probe, `1d` = full summary.
-- `.github/workflows/summarize.yml` — cron `*/11 * * * *` UTC (11 is coprime
-  with 60, ticks drift away from the :00 load peak), `timeout-minutes: 355`
+- `.github/workflows/summarize.yml` — cron `*/31 * * * *` UTC (31 is coprime
+  with 60, ticks drift away from the :00 load peak; sparser than the old */11 —
+  GitHub silently thins out frequent crons), `timeout-minutes: 355`
   (platform max 360; the kill is identical to GitHub's — ours only lands
   earlier and predictably), **no `concurrency`** (overlap is the design,
   not an accident). Budget: watch 330 + tail 15 + setup 1 = 346 ≤ 355.
@@ -172,7 +181,7 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
 
 | Symbol | Value | Meaning |
 |---|---|---|
-| cron / timeout | `*/11`, 355 min | schedule drift; 330 watch + 15 tail + 1 setup (platform max 360) |
+| cron / timeout | `*/31`, 355 min | schedule drift; 330 watch + 15 tail + 1 setup (platform max 360) |
 | watch / poll defaults | 19800s / 30s | duty length / inbox latency while leader lives |
 | `LEADER_HEARTBEAT_SEC` / `LEADER_STALE_SEC` | 120 / 300 | liveness bound ≈ 2 missed beats |
 | `WORK_STALE_SEC` (`work.json`) | 900 | wedge bound: fresh heartbeat + no progress 15 min → takeover |
@@ -221,11 +230,11 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
   live in GitHub Secrets + locally only. Never commit, never print.
 - `docs/CONTEXT_HANDOFF.md` = the *now* (live run ids, today's observations);
   stable knowledge lives HERE, not there. One source of truth each.
-- Tests: `./venv/bin/python tests/test_run_once.py` must stay green (217 PASS as of
+- Tests: `./venv/bin/python tests/test_run_once.py` must stay green (227 PASS as of
   2026-10-06; incl. `test_duty`, `test_heartbeat_loop`, `test_due_cap`,
   `test_inbox_retry_flow`, `test_duty_gap`, `test_work_wedge`,
   `test_leader_watch_inherit`, `test_timeout_budget`, `test_liveness`,
-  `test_due_fail_renew`, `test_quota_diag`). The last one parses
+  `test_due_fail_renew`, `test_quota_diag`, `test_flat_rotation`). The last one parses
   `summarize.yml` with plain regex (no new deps) and asserts
   watch + tail + setup ≤ timeout — the exact inequality that killed three
   leaders on 2026-10-05.

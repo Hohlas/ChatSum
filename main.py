@@ -409,18 +409,48 @@ def is_quota_exceeded_error(error_message):
     )
 
 
-def _short_retry_delay(raw):
-    """'24445s' → '6h47m'. Best-effort, мусор — как есть (обрезанный)."""
+def _retry_to_seconds(raw):
+    """'24445s' / '25s' / '1m30s' / '17h1m40.17s' → секунды (int). Мусор → None."""
     try:
-        secs = int(float(str(raw).rstrip('s')))
+        text = str(raw).strip().rstrip('.').lower()
+    except Exception:
+        return None
+    m = re.fullmatch(r'(?:(\d+)h)?(?:(\d+)m)?([\d.]+)?s', text)
+    if not m or not any(m.groups()):
+        return None
+    try:
+        total = int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 \
+            + float(m.group(3) or 0)
     except (TypeError, ValueError):
-        return str(raw)[:16]
+        return None
+    return int(total) if total >= 0 else None
+
+
+def _short_retry_delay(raw):
+    """Секунды/смешанный формат → '45s' / '1m' / '6h47m'. Best-effort."""
+    secs = _retry_to_seconds(raw)
+    if secs is None:
+        try:
+            return str(raw)[:16]
+        except Exception:
+            return ''
     if secs < 90:
         return f"{secs}s"
     mins = secs // 60
     if mins < 90:
         return f"{mins}m"
     return f"{mins // 60}h{mins % 60:02d}m"
+
+
+def _retry_from_message(message):
+    """Вытаскивает 'Please retry in 17h1m40s' из текста ошибки → '17h01m'."""
+    if not message or not isinstance(message, str):
+        return ''
+    m = re.search(r'retry in\s+((?:\d+h)?(?:\d+m)?[\d.]+s)',
+                    message, re.IGNORECASE)
+    if not m:
+        return ''
+    return _short_retry_delay(m.group(1))
 
 
 def format_quota_diagnostic(error):
@@ -445,7 +475,7 @@ def format_quota_diagnostic(error):
         err = payload.get('error') or {}
         if not isinstance(err, dict):
             return ''
-        quota_id, retry = '', ''
+        quota_id, retry, message = '', '', ''
         for d in err.get('details') or []:
             if not isinstance(d, dict):
                 continue
@@ -454,6 +484,13 @@ def format_quota_diagnostic(error):
                     quota_id = str(v['quotaId']).replace('-FreeTier', '')
             if d.get('retryDelay') and not retry:
                 retry = _short_retry_delay(d['retryDelay'])
+        raw_message = err.get('message')
+        if isinstance(raw_message, str):
+            message = raw_message
+        if not retry:
+            # RetryInfo структурой приходит не всегда; в живом 429 время
+            # сброса лежит прямо в тексте ('Please retry in 17h1m40s').
+            retry = _retry_from_message(message)
         code = getattr(error, 'status_code', None) or 'HTTP ?'
         if isinstance(code, int):
             code = f"HTTP {code}"
@@ -514,6 +551,28 @@ def is_transient_server_error(error_str):
 # на 9 ключах внутри 12-минутного джоба).
 MAX_SERVER_ROTATIONS = 3
 
+# Пауза после полностью проигранного круга (все ключи отказали) — и только
+# там: при каждой ротации пауз нет. Даёт минутным лимитам шанс отойти
+# до следующей попытки вызывателя; дневную квоту не вернёт, лишь сдаёмся
+# быстро и тихо вместо минут пустого ожидания.
+FULL_CIRCLE_FAIL_PAUSE_SEC = 60
+
+
+def is_quota_rate_limit(error):
+    """429-квота/доступ: повтор в тот же ключ бессмыслен — только ротация.
+
+    Сухой ключ от повторов не мокреет, а сон 10с/20с растягивал круг
+    (9 ключей × 30с сна ≈ 5 мин пустого ожидания). 503/таймауты сюда
+    НЕ входят: там повтор лечит (наблюдалось в проде), они идут старым
+    путём с повторами. Чистая логика, исключений не бросает.
+    """
+    if not isinstance(error, APIStatusError):
+        return False
+    try:
+        return is_quota_exceeded_error(extract_api_error_message(error))
+    except Exception:
+        return False
+
 
 async def execute_gemini_request(request_params):
     """
@@ -532,13 +591,21 @@ async def execute_gemini_request(request_params):
                 last_error = e
                 error_str = str(e)
 
-                # Временные сбои сервера / лимиты — retry с задержкой на том же ключе
+                # Квота/доступ (429): плоская ротация — один удар в ключ,
+                # сразу следующий, без повторов и сна. Сухой ключ от повторов
+                # не мокреет; 503/таймауты идут ниже старым путём с повторами.
+                if is_quota_rate_limit(e):
+                    if attempt_idx < attempts - 1:
+                        rotate_google_api_key("квота исчерпана, сразу следующий ключ")
+                    break
+
+                # Временные сбои сервера — retry с задержкой на том же ключе
                 is_retryable = any(
                     code in error_str for code in ('503', '429', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED')
                 ) or 'timeout' in error_str.lower()
                 if is_retryable and retry < max_retries_per_key - 1:
                     delay = (retry + 1) * 10
-                    print(f"   ⚠️  Сервер перегружен/таймаут. Повтор через {delay}с (попытка {retry + 2}/{max_retries_per_key})...")
+                    print(f"   ⚠️  Временный сбой, повтор через {delay}с (попытка {retry + 2}/{max_retries_per_key})...")
                     await asyncio.sleep(delay)
                     continue
 
@@ -570,6 +637,10 @@ async def execute_gemini_request(request_params):
                 raise
 
     if last_error:
+        # Круг проигран (все ключи отказали): пауза — только здесь,
+        # не при каждой ротации. Дальше ошибку несёт вызыватель
+        # (чанк-цикл гасит остальные чанки, due уходит в skip на 3 ч).
+        await asyncio.sleep(FULL_CIRCLE_FAIL_PAUSE_SEC)
         raise last_error
 
 # Пути к конфигурационным файлам
