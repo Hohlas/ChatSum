@@ -941,11 +941,38 @@ def cmd_list(main):
     return 0
 
 
-def due_skip_info(due_fails, key, now=None):
-    """Пропустить ли due-ключ: 3+ подряд провалов и не прошло 3 ч с первого.
+def due_fail_record(due_fails, key, now=None):
+    """Записать провал due-ключа; вернуть обновлённую запись {n, first_utc, last_utc}.
 
-    Без этого постоянно падающий чат жёг бы Gemini каждые 30 сек весь 5-часовой
-    ран. Успех сбрасывает счётчик (см. run_due_once). Чистая логика.
+    Возобновляемый скип (сессия 22): окно DUE_FAIL_SKIP_SEC от последнего
+    провала истекло — начинаем новый эпизод (n=1, свежий first_utc), иначе
+    серия продолжается (n+1, first_utc kept, last_utc=now). Без этого first_utc
+    замерзал навсегда и после первого окна повторы шли каждые ~8 мин
+    до упора (ночь 05→06.10: 46 провалов). Чистая логика, тестируется.
+    """
+    now = now or _utc_now()
+    rec = (due_fails or {}).get(key)
+    if not isinstance(rec, dict):
+        rec = {}
+    last = _parse_utc(rec.get('last_utc') or rec.get('first_utc'))
+    if last is None or (now - last).total_seconds() >= DUE_FAIL_SKIP_SEC:
+        stamp = _utc_str(now)
+        return {'n': 1, 'first_utc': stamp, 'last_utc': stamp}
+    try:
+        n = int(rec.get('n', 0)) + 1
+    except (TypeError, ValueError):
+        n = 1
+    return {'n': n, 'first_utc': rec.get('first_utc'), 'last_utc': _utc_str(now)}
+
+
+def due_skip_info(due_fails, key, now=None):
+    """Пропустить ли due-ключ: 3+ подряд провалов и не прошло 3 ч с последнего.
+
+    Окно меряется от last_utc (fallback на first_utc для старых записей) —
+    пара к due_fail_record: каждый новый эпизод снова даёт 3 попытки + 3ч
+    тишины вместо повторов каждые ~8 мин. Без этого постоянно падающий чат
+    жёг бы Gemini каждые 30 сек весь 5-часовой ран. Успех сбрасывает счётчик
+    (см. run_due_once). Чистая логика.
     """
     rec = (due_fails or {}).get(key)
     if not isinstance(rec, dict):
@@ -956,11 +983,11 @@ def due_skip_info(due_fails, key, now=None):
         return False
     if n < DUE_FAIL_THRESHOLD:
         return False
-    first = _parse_utc(rec.get('first_utc'))
-    if first is None:
+    last = _parse_utc(rec.get('last_utc') or rec.get('first_utc'))
+    if last is None:
         return False
     now = now or _utc_now()
-    return (now - first).total_seconds() < DUE_FAIL_SKIP_SEC
+    return (now - last).total_seconds() < DUE_FAIL_SKIP_SEC
 
 
 async def run_due_once(main, args, state, path, max_tasks=None):
@@ -1030,14 +1057,8 @@ async def run_due_once(main, args, state, path, max_tasks=None):
             print(f"✅ {key} выполнено, записано в state")
         else:
             failed += 1
-            rec = due_fails.get(key)
-            if not isinstance(rec, dict) or not rec.get('first_utc'):
-                rec = {'n': 0, 'first_utc': _utc_str(_utc_now())}
-            try:
-                rec['n'] = int(rec.get('n', 0)) + 1
-            except (TypeError, ValueError):
-                rec['n'] = 1
-            due_fails[key] = rec
+            due_fails[key] = due_fail_record(due_fails, key)
+            rec = due_fails[key]
             save_state(path, state)
             if handoff_enabled():
                 push_state_best_effort(path)

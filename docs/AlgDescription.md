@@ -179,7 +179,7 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
 | `SCHEDULE_REFRESH_SEC` | 600 | schedule staleness inside a 5.5h run |
 | `PROMOTE_CONFIRM_READS` | 2 | anti-flap on promotion |
 | `INBOX_MAX_ATTEMPTS` | 5 | command retries before deletion |
-| `DUE_FAIL_THRESHOLD` / `DUE_FAIL_SKIP_SEC` | 3 / 10800 | skip poisoned slot 3h |
+| `DUE_FAIL_THRESHOLD` / `DUE_FAIL_SKIP_SEC` | 3 / 10800 | скип падающего слота 3ч, возобновляемый: окно меряется от `last_utc`, по истечении — новый эпизод 3 попытки + 3ч тишины (`due_fail_record`, сессия 22) |
 | `MAX_DUE_PER_ITERATION` | 1 | inbox-first latency bound |
 | `LIVENESS_EVERY` / `LIVENESS_SCAN_LIMIT` | 5 / 50 | маяк в General: правка каждый 5-й тик (120с × 5 = 10 мин) / глубина подхвата |
 
@@ -197,13 +197,23 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
 4. Due-drain storm (all unmarked slots in a row, tens of minutes) starved a
    valid inbox command → inbox-first + `MAX_DUE_PER_ITERATION=1`.
 5. **CLOSED as one-off (2026-10-04 → 2026-10-05):** E2E run logged 5× `✅ выполнено, записано в state`
-   (save runs strictly before that print) yet branch pushes + final Persist
-   contained only 1 mark; no errors, single writer, all write paths
-   union-safe. Static analysis found no loss path; live re-test with current
-   code persisted 6/6 marks. Residual hypothesis: transient Contents-API
-    inconsistency on rapid successive PUTs. Tripwire: `_verify_push` + `🚨`.
-    Repro harness (ephemeral, NOT in repo): `/tmp/opencode/repro/replay.py`.
-    No recurrence as of 2026-10-05 (all morning slots marked).
+    (save runs strictly before that print) yet branch pushes + final Persist
+    contained only 1 mark; no errors, single writer, all write paths
+    union-safe. Static analysis found no loss path; live re-test with current
+    code persisted 6/6 marks. Residual hypothesis: transient Contents-API
+     inconsistency on rapid successive PUTs. Tripwire: `_verify_push` + `🚨`.
+     Repro harness (ephemeral, NOT in repo): `/tmp/opencode/repro/replay.py`.
+     No recurrence as of 2026-10-05 (all morning slots marked).
+6. **Одноразовый backoff + шторм смены ключа (2026-10-05→06):** правка
+   `SCHEDULE.txt` `1d`→`1d+` меняет ключ задачи (суффикс входит в ключ) —
+   новый ключ без метки догоняется тем же вечером, даже если слот утренний
+   (`compute_due`: опоздание любой длины догоняется). 4 «новых» слота +
+   исчерпанная free-tier квота Gemini (429) дали 46 провалов одного слота
+   за ночь тремя лидерами. `due_fails.first_utc` не обновляется — скип 3ч
+   срабатывает один раз, дальше повторы каждые ~8 мин до успеха. Урок:
+   смену периода/суффикса уже отработанного слота делать осознанно
+   (это плановый перезапуск, не баг); при исчерпанной квоте тишину даёт
+   только успех или правка расписания.
 
 ## Do-not-touch / discipline
 
@@ -211,10 +221,11 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
   live in GitHub Secrets + locally only. Never commit, never print.
 - `docs/CONTEXT_HANDOFF.md` = the *now* (live run ids, today's observations);
   stable knowledge lives HERE, not there. One source of truth each.
-- Tests: `./venv/bin/python tests/test_run_once.py` must stay green (197 PASS as of
-  2026-10-05; incl. `test_duty`, `test_heartbeat_loop`, `test_due_cap`,
+- Tests: `./venv/bin/python tests/test_run_once.py` must stay green (208 PASS as of
+  2026-10-06; incl. `test_duty`, `test_heartbeat_loop`, `test_due_cap`,
   `test_inbox_retry_flow`, `test_duty_gap`, `test_work_wedge`,
-  `test_leader_watch_inherit`, `test_timeout_budget`, `test_liveness`). The last one parses
+  `test_leader_watch_inherit`, `test_timeout_budget`, `test_liveness`,
+  `test_due_fail_renew`). The last one parses
   `summarize.yml` with plain regex (no new deps) and asserts
   watch + tail + setup ≤ timeout — the exact inequality that killed three
   leaders on 2026-10-05.

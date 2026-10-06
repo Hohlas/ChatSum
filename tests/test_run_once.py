@@ -128,6 +128,7 @@ def main():
     test_timeout_budget()
     test_gap_warning_format()
     test_liveness()
+    test_due_fail_renew()
     test_handoff()
     test_duty()
     test_heartbeat_loop()
@@ -1028,6 +1029,43 @@ def test_liveness():
     finally:
         run_once._liveness_msg_id = None
         run_once._liveness_next_utc = None
+
+
+def test_due_fail_renew():
+    """Возобновляемый скип: окно истекло — новый эпизод, иначе серия растёт."""
+    from datetime import timezone, timedelta
+    now = datetime(2026, 10, 6, 0, 0, tzinfo=timezone.utc)
+    iso = lambda dt: dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    r = run_once.due_fail_record({}, 'k', now)
+    check('скип: первый провал — n=1, метки свежие',
+          r == {'n': 1, 'first_utc': iso(now), 'last_utc': iso(now)}, r)
+
+    r2 = run_once.due_fail_record({'k': r}, 'k', now + timedelta(hours=1))
+    check('скип: повтор в окне — n=2, first kept, last движется',
+          r2['n'] == 2 and r2['first_utc'] == iso(now)
+          and r2['last_utc'] == iso(now + timedelta(hours=1)), r2)
+    check('скип: 2 провала — работаем',
+          run_once.due_skip_info({'k': r2}, 'k', now + timedelta(hours=1)) is False)
+    r3 = run_once.due_fail_record({'k': r2}, 'k', now + timedelta(hours=2))
+    check('скип: 3 свежих провала — пропуск',
+          run_once.due_skip_info({'k': r3}, 'k', now + timedelta(hours=2)) is True)
+
+    r4 = run_once.due_fail_record({'k': r3}, 'k', now + timedelta(hours=6))
+    check('скип: окно истекло — новый эпизод n=1',
+          r4 == {'n': 1, 'first_utc': iso(now + timedelta(hours=6)),
+                 'last_utc': iso(now + timedelta(hours=6))}, r4)
+    check('скип: новый эпизод — работаем',
+          run_once.due_skip_info({'k': r4}, 'k', now + timedelta(hours=6)) is False)
+
+    stale = {'k': {'n': 46, 'first_utc': '2026-10-05T17:12:34Z'}}
+    check('скип: stale без last_utc — не скипаем (fallback first_utc)',
+          run_once.due_skip_info(stale, 'k', now) is False)
+    r5 = run_once.due_fail_record(stale, 'k', now)
+    check('скип: stale самозалечивается новым эпизодом', r5['n'] == 1, r5)
+
+    r6 = run_once.due_fail_record({'k': {'n': 'xx'}}, 'k', now)
+    check('скип: мусор — новый эпизод', r6['n'] == 1, r6)
 
 
 def test_handoff():
