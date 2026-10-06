@@ -131,6 +131,7 @@ def main():
     test_due_fail_renew()
     test_quota_diag()
     test_flat_rotation()
+    test_collect_order_and_parents()
     test_handoff()
     test_duty()
     test_heartbeat_loop()
@@ -1156,6 +1157,53 @@ def test_flat_rotation():
                  'Error code: 502', 'Error code: 504', '', None):
         check(f'503: чужое ({str(text)[:24]}) — не держим',
               bot.is_server_overloaded(text) is False, '')
+
+
+def test_collect_order_and_parents():
+    """К1/К2: ключ сортировки (date, id); родители по r не вылетают как шум."""
+    msgs = [
+        {'sender': 'B', 'text': 'второе', 'date': '2026-10-06 10:00:00',
+         'message_id': 5, 'reply_to': None},
+        {'sender': 'A', 'text': 'первое', 'date': '2026-10-06 10:00:00',
+         'message_id': 3, 'reply_to': None},
+        {'sender': 'C', 'text': 'раннее', 'date': '2026-10-06 09:59:59',
+         'message_id': 7, 'reply_to': None},
+    ]
+    ordered = sorted(msgs, key=bot._message_sort_key)
+    check('сортировка: (date, id)',
+          [m['message_id'] for m in ordered] == [7, 3, 5],
+          [m['message_id'] for m in ordered])
+    # Родитель-шум, на который есть ссылка, сохраняется как контекст
+    noisy = [
+        {'sender': 'A', 'text': 'ok', 'date': '2026-10-06 10:00:00',
+         'message_id': 10, 'reply_to': None},
+        {'sender': 'B', 'text': 'развёрнутый ответ по существу вопроса', 'date': '2026-10-06 10:00:01',
+         'message_id': 11, 'reply_to': 10},
+        {'sender': 'C', 'text': 'ok', 'date': '2026-10-06 10:00:02',
+         'message_id': 12, 'reply_to': None},
+    ]
+    with _quiet():
+        kept = bot.optimize_messages([dict(m) for m in noisy], '193')
+    kept_ids = sorted(m['message_id'] for m in kept)
+    check('родитель по r не вылетает как шум', 10 in kept_ids, kept_ids)
+    check('несвязанный шум вылетает', 12 not in kept_ids, kept_ids)
+    # Родитель из списка исключённых тоже сохраняется как контекст
+    saved = bot.EXCLUDED_USERS
+    bot.EXCLUDED_USERS = ['Spammer']
+    try:
+        excl = [
+            {'sender': 'Spammer', 'text': 'длинный пост с разбором по существу темы',
+             'date': '2026-10-06 10:00:00', 'message_id': 20, 'reply_to': None},
+            {'sender': 'B', 'text': 'возражение с аргументами по пунктам',
+             'date': '2026-10-06 10:00:01', 'message_id': 21, 'reply_to': 20},
+        ]
+        with _quiet():
+            kept2 = bot.optimize_messages([dict(m) for m in excl], '193')
+        check('родитель-исключённый не вылетает',
+              any(m['message_id'] == 20 for m in kept2),
+              [m['message_id'] for m in kept2])
+    finally:
+        bot.EXCLUDED_USERS = saved
 
 
 def test_handoff():

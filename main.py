@@ -1172,16 +1172,30 @@ def optimize_messages(messages_data, chat_id_str):
     
     # Собираем уникальные имена отправителей для диагностики
     unique_senders = set()
-    
+
+    # ID сообщений, на которые есть ссылки (поле reply_to): их храним
+    # как контекст даже при срабатывании фильтров, иначе r повиснет.
+    referenced_ids = set()
+    for msg in messages_data:
+        parent_id = msg.get('reply_to')
+        if parent_id is not None:
+            referenced_ids.add(parent_id)
+
     for msg in messages_data:
         sender = msg.get('sender')
         unique_senders.add(sender)
-        
+
+        # Родитель чужой цепочки — только контекст, фильтры не применяем
+        if msg.get('message_id') in referenced_ids:
+            msg['chat_id'] = chat_id_str
+            optimized.append(msg)
+            continue
+
         # Фильтруем исключенных пользователей
         if sender and sender in EXCLUDED_USERS:
             excluded_count += 1
             continue
-        
+
         # Фильтруем бессодержательные сообщения
         if is_noise_message(msg['text']):
             noise_count += 1
@@ -1239,6 +1253,11 @@ def count_messages_with_urls(messages_data):
             })
     
     return count, urls
+
+
+def _message_sort_key(msg):
+    """Ключ хронологического порядка: дата, затем ID (сообщения в одну секунду)."""
+    return (msg.get('date', ''), msg.get('message_id', 0))
 
 
 async def collect_messages(chat_id, hours=None, days=None, limit=None, range_start=None, range_end=None, time_range_start=None, time_range_end=None):
@@ -1408,8 +1427,8 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None, range_sta
                     'reply_to': reply_to
                 })
     
-    # Сортируем по времени (от старых к новым)
-    messages_data.reverse()
+    # Сортируем по времени (от старых к новым), при равной дате — по ID
+    messages_data.sort(key=_message_sort_key)
     
     # Проверяем, есть ли сообщения перед доступом к messages_data[0]
     if not messages_data:
@@ -1426,7 +1445,7 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None, range_sta
     missing_ids = reply_to_ids - loaded_ids
     if missing_ids:
         # Ограничиваем до 50 сообщений
-        missing_ids_limited = list(missing_ids)[:50]
+        missing_ids_limited = sorted(missing_ids)[:50]
         print(f"🔄 Догрузка {len(missing_ids_limited)} родительских сообщений для контекста...")
         
         try:
@@ -1453,7 +1472,7 @@ async def collect_messages(chat_id, hours=None, days=None, limit=None, range_sta
                     loaded_ids.add(msg.id)
             
             # Пересортировываем с учетом догруженных
-            messages_data.sort(key=lambda x: x['date'])
+            messages_data.sort(key=_message_sort_key)
             print(f"✅ Догружено {len([m for m in missing_messages if m and m.text])} родительских сообщений")
             
         except Exception as e:
