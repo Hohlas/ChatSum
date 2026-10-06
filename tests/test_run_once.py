@@ -129,6 +129,7 @@ def main():
     test_gap_warning_format()
     test_liveness()
     test_due_fail_renew()
+    test_quota_diag()
     test_handoff()
     test_duty()
     test_heartbeat_loop()
@@ -1066,6 +1067,40 @@ def test_due_fail_renew():
 
     r6 = run_once.due_fail_record({'k': {'n': 'xx'}}, 'k', now)
     check('скип: мусор — новый эпизод', r6['n'] == 1, r6)
+
+
+def test_quota_diag():
+    """Диагностика 429: видно измерение квоты и время сброса; мусор — ''."""
+    from types import SimpleNamespace
+
+    def err(payload):
+        return SimpleNamespace(
+            status_code=429,
+            response=SimpleNamespace(json=lambda: payload))
+
+    daily = {'error': {'message': 'quota',
+                       'details': [{'@type': 'x/QuotaFailure',
+                                    'violations': [{'quotaId': 'GenerateRequestsPerDayPerProjectPerModel-FreeTier'}]},
+                                   {'@type': 'x/RetryInfo', 'retryDelay': '24445s'}]}}
+    check('диагностика: дневная квота + сброс',
+          bot.format_quota_diagnostic(err(daily))
+          == 'HTTP 429 · GenerateRequestsPerDayPerProjectPerModel · retry 6h47m',
+          bot.format_quota_diagnostic(err(daily)))
+    per_min = {'error': {'details': [{'@type': 'x/QuotaFailure',
+                                      'violations': [{'quotaId': 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier'}]},
+                                     {'@type': 'x/RetryInfo', 'retryDelay': '25s'}]}}
+    check('диагностика: поминутная квота отличима',
+          bot.format_quota_diagnostic(err(per_min))
+          == 'HTTP 429 · GenerateRequestsPerMinutePerProjectPerModel · retry 25s',
+          bot.format_quota_diagnostic(err(per_min)))
+    check('диагностика: retry 90с → минуты',
+          bot._short_retry_delay('90s') == '1m', bot._short_retry_delay('90s'))
+    for bad in (None, 'xx', {}, {'error': {}}, {'error': {'details': 'xx'}}):
+        check(f'диагностика: мусор {bad} → пусто',
+              bot.format_quota_diagnostic(err(bad)) == '',
+              repr(bot.format_quota_diagnostic(err(bad))))
+    check('диагностика: нет response → пусто',
+          bot.format_quota_diagnostic(SimpleNamespace(status_code=429)) == '')
 
 
 def test_handoff():

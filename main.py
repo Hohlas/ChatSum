@@ -409,6 +409,64 @@ def is_quota_exceeded_error(error_message):
     )
 
 
+def _short_retry_delay(raw):
+    """'24445s' → '6h47m'. Best-effort, мусор — как есть (обрезанный)."""
+    try:
+        secs = int(float(str(raw).rstrip('s')))
+    except (TypeError, ValueError):
+        return str(raw)[:16]
+    if secs < 90:
+        return f"{secs}s"
+    mins = secs // 60
+    if mins < 90:
+        return f"{mins}m"
+    return f"{mins // 60}h{mins % 60:02d}m"
+
+
+def format_quota_diagnostic(error):
+    """Короткая диагностика квоты из тела 429 для логов и Telegram.
+
+    Возвращает строку вида "HTTP 429 · GenerateRequestsPerDayPerProjectPerModel
+    · retry 6h47m" — видно, КАКАЯ квота (дневная/поминутная) и когда сброс.
+    Вытащить нечего — ''. Best-effort, исключений не бросает. Чистая логика.
+    """
+    try:
+        response = getattr(error, 'response', None)
+        if response is None:
+            return ''
+        try:
+            payload = response.json()
+        except Exception:
+            return ''
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            payload = payload[0]
+        if not isinstance(payload, dict):
+            return ''
+        err = payload.get('error') or {}
+        if not isinstance(err, dict):
+            return ''
+        quota_id, retry = '', ''
+        for d in err.get('details') or []:
+            if not isinstance(d, dict):
+                continue
+            for v in d.get('violations') or []:
+                if isinstance(v, dict) and v.get('quotaId') and not quota_id:
+                    quota_id = str(v['quotaId']).replace('-FreeTier', '')
+            if d.get('retryDelay') and not retry:
+                retry = _short_retry_delay(d['retryDelay'])
+        code = getattr(error, 'status_code', None) or 'HTTP ?'
+        if isinstance(code, int):
+            code = f"HTTP {code}"
+        parts = [str(code)]
+        if quota_id:
+            parts.append(quota_id)
+        if retry:
+            parts.append(f"retry {retry}")
+        return ' · '.join(parts) if len(parts) > 1 else ''
+    except Exception:
+        return ''
+
+
 def trim_text_for_telegram(text, max_length=3500):
     """
     Ограничивает длину текста для безопасной отправки в Telegram.
@@ -2099,6 +2157,12 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         else:
             code_text = status_code if status_code is not None else "неизвестен"
             error_msg = f"❌ Ошибка Google AI Studio (HTTP {code_text})."
+            if status_code == 429:
+                # Какая квота и когда сброс — прямо в текст для топика:
+                # иначе дневной и поминутный 429 неразличимы.
+                diag = format_quota_diagnostic(e)
+                if diag:
+                    error_msg = f"❌ Ошибка Google AI Studio ({diag})."
         
         print(error_msg)
         print(f"   Модель: {actual_model}")

@@ -221,11 +221,11 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
   live in GitHub Secrets + locally only. Never commit, never print.
 - `docs/CONTEXT_HANDOFF.md` = the *now* (live run ids, today's observations);
   stable knowledge lives HERE, not there. One source of truth each.
-- Tests: `./venv/bin/python tests/test_run_once.py` must stay green (208 PASS as of
+- Tests: `./venv/bin/python tests/test_run_once.py` must stay green (217 PASS as of
   2026-10-06; incl. `test_duty`, `test_heartbeat_loop`, `test_due_cap`,
   `test_inbox_retry_flow`, `test_duty_gap`, `test_work_wedge`,
   `test_leader_watch_inherit`, `test_timeout_budget`, `test_liveness`,
-  `test_due_fail_renew`). The last one parses
+  `test_due_fail_renew`, `test_quota_diag`). The last one parses
   `summarize.yml` with plain regex (no new deps) and asserts
   watch + tail + setup ≤ timeout — the exact inequality that killed three
   leaders on 2026-10-05.
