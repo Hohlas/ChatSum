@@ -131,6 +131,7 @@ def main():
     test_due_fail_renew()
     test_quota_diag()
     test_server_overload_diag()
+    test_api_error_diag()
     test_flat_rotation()
     test_collect_order_and_parents()
     test_handoff()
@@ -1135,6 +1136,45 @@ def test_server_overload_diag():
         bot._log_response_headers(SimpleNamespace(status_code=503))
     check('503-лог: нет заголовков — строка, без исключения',
           'недоступны' in buf.getvalue(), repr(buf.getvalue()))
+
+
+def test_api_error_diag():
+    """Диагностика LLM-ошибок: дословный текст Google для любого статуса."""
+    from types import SimpleNamespace
+    import contextlib
+    import io
+
+    def err(status, message, text=None):
+        resp = SimpleNamespace(
+            json=lambda: {'error': {'message': message}},
+            headers={'x-request-id': f'r{status}'})
+        if text is not None:
+            resp.text = text
+        return SimpleNamespace(status_code=status, response=resp)
+
+    check('диагностика API: 400 отдаёт текст Google',
+          bot.format_api_error_diagnostic(err(400, 'API key not valid.'))
+          == 'API key not valid.',
+          bot.format_api_error_diagnostic(err(400, 'API key not valid.')))
+    check('диагностика API: 500 отдаёт текст Google',
+          bot.format_api_error_diagnostic(err(500, 'Internal error')) == 'Internal error',
+          bot.format_api_error_diagnostic(err(500, 'Internal error')))
+    check('диагностика API: пустое сообщение → пусто',
+          bot.format_api_error_diagnostic(err(403, '')) == '',
+          repr(bot.format_api_error_diagnostic(err(403, ''))))
+    check('диагностика API: нет response → пусто',
+          bot.format_api_error_diagnostic(SimpleNamespace(status_code=500)) == '',
+          repr(bot.format_api_error_diagnostic(SimpleNamespace(status_code=500))))
+    check('диагностика API: 503 тег — алиас',
+          bot.format_server_overload_diagnostic(err(503, 'overloaded')) == 'overloaded',
+          bot.format_server_overload_diagnostic(err(503, 'overloaded')))
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        bot.format_api_error_diagnostic(err(500, 'boom'), 'HTTP 500')
+    check('диагностика API: заголовки дампятся в лог по тегу',
+          'HTTP 500' in buf.getvalue() and 'x-request-id=r500' in buf.getvalue(),
+          repr(buf.getvalue()))
 
 
 def test_flat_rotation():

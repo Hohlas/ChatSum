@@ -474,12 +474,12 @@ def _retry_from_message(message):
     return _short_retry_delay(m.group(1))
 
 
-def _log_response_headers(error, tag='503'):
-    """Best-effort дамп ВСЕХ заголовков ответа Google в лог (разбор 503).
+def _log_response_headers(error, tag='API'):
+    """Best-effort дамп ВСЕХ заголовков ответа Google в лог (разбор ошибок).
 
     Квоту не тратит — заголовки уже получены вместе с ошибкой. Нужно, чтобы
-    понять, присылает ли Google хоть какой-то признак окончания перегрузки
-    (Retry-After и пр.). Исключений не бросает.
+    понять, присылает ли Google служебные заголовки (Retry-After и пр.).
+    Исключений не бросает.
     """
     try:
         response = getattr(error, 'response', None)
@@ -497,17 +497,16 @@ def _log_response_headers(error, tag='503'):
         pass
 
 
-def format_server_overload_diagnostic(error):
-    """Текст 503/UNAVAILABLE для Telegram — дословная копия ответа Google.
+def format_api_error_diagnostic(error, tag='API'):
+    """Дословный текст ошибки Google для Telegram — копия ответа источника.
 
     Ничего своего не сочиняем: берём error.message из тела ответа как есть
-    (например, «This model is currently experiencing high demand...»), иначе
-    response.text. Нет ни того ни другого — '' (не подменяем repr исключения).
-    Заодно дампит заголовки ответа в лог (`_log_response_headers`) — чтобы
-    искать признак окончания перегрузки. Best-effort, исключений не бросает.
+    (401/402/403/400/500/502/503/504 и пр.), иначе response.text. Нет ни того
+    ни другого — '' (не подменяем repr исключения). Заодно дампит ВСЕ заголовки
+    ответа в лог (`_log_response_headers`). Best-effort, исключений не бросает.
     """
     try:
-        _log_response_headers(error, '503')
+        _log_response_headers(error, tag)
         response = getattr(error, 'response', None)
         if response is None:
             return ''
@@ -529,6 +528,11 @@ def format_server_overload_diagnostic(error):
         return ''
     except Exception:
         return ''
+
+
+def format_server_overload_diagnostic(error):
+    """503/UNAVAILABLE: дословный текст ответа Google (тег лога '503')."""
+    return format_api_error_diagnostic(error, '503')
 
 
 def format_quota_diagnostic(error):
@@ -2269,7 +2273,10 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                 
             except AuthenticationError as e:
                 api_message = extract_api_error_message(e)
-                error_msg = f"❌ Ошибка доступа к API: {api_message}"
+                # Дословный текст Google, если он есть; шаблон — фолбэк.
+                text = format_api_error_diagnostic(e)
+                error_msg = (f"❌ {text}" if text
+                             else f"❌ Ошибка доступа к API: {api_message}")
                 print(f"   {error_msg}")
                 chunk_summaries.append((start_idx, end_idx, error_msg, True))
                 total_usage['errors'].append(error_msg)
@@ -2278,7 +2285,17 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
             except APIStatusError as e:
                 status_code = getattr(e, 'status_code', 'неизвестен')
                 api_message = extract_api_error_message(e)
-                error_msg = f"❌ Ошибка API (HTTP {status_code}): {api_message}"
+                if status_code == 429:
+                    diag = format_quota_diagnostic(e)
+                    error_msg = (f"❌ Ошибка API ({diag})" if diag
+                                 else f"❌ Ошибка API (HTTP {status_code}): {api_message}")
+                else:
+                    # Дословный текст Google, если он есть; шаблон — фолбэк.
+                    tag = ('503' if is_server_overloaded(api_message)
+                           else f'HTTP {status_code}')
+                    text = format_api_error_diagnostic(e, tag)
+                    error_msg = (f"❌ {text}" if text
+                                 else f"❌ Ошибка API (HTTP {status_code}): {api_message}")
                 print(f"   {error_msg}")
                 chunk_summaries.append((start_idx, end_idx, error_msg, True))
                 total_usage['errors'].append(error_msg)
@@ -2423,7 +2440,11 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         return summary, usage_info
         
     except AuthenticationError as e:
-        error_msg = "❌ Ошибка доступа к Google AI Studio: ключ недействителен или доступ ограничен."
+        # Дословный текст Google, если он есть; шаблон — только фолбэк.
+        text = format_api_error_diagnostic(e)
+        error_msg = (f"❌ {text}" if text
+                     else "❌ Ошибка доступа к Google AI Studio: "
+                          "ключ недействителен или доступ ограничен.")
         print(error_msg)
         print(f"   Модель: {actual_model}")
         print(f"   Размер данных: {len(messages_json)} символов")
@@ -2443,19 +2464,19 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
             error_msg = "❌ Ошибка оплаты или лимитов Google AI Studio."
         else:
             code_text = status_code if status_code is not None else "неизвестен"
-            error_msg = f"❌ Ошибка Google AI Studio (HTTP {code_text})."
             if status_code == 429:
                 # Какая квота и когда сброс — прямо в текст для топика:
                 # иначе дневной и поминутный 429 неразличимы.
                 diag = format_quota_diagnostic(e)
-                if diag:
-                    error_msg = f"❌ Ошибка Google AI Studio ({diag})."
-            elif is_server_overloaded(str(e)):
-                # 503/UNAVAILABLE: в Telegram — дословный текст ответа Google
-                # (плюс ❌); заголовки ответа дампятся в лог для разбора.
-                text = format_server_overload_diagnostic(e)
-                if text:
-                    error_msg = f"❌ {text}"
+                error_msg = (f"❌ Ошибка Google AI Studio ({diag})." if diag
+                             else f"❌ Ошибка Google AI Studio (HTTP {code_text}).")
+            else:
+                # Все прочие статусы: дословный текст ответа Google, если он
+                # есть; шаблон — только фолбэк (единый путь с 503).
+                tag = '503' if is_server_overloaded(str(e)) else f'HTTP {code_text}'
+                text = format_api_error_diagnostic(e, tag)
+                error_msg = (f"❌ {text}" if text
+                             else f"❌ Ошибка Google AI Studio (HTTP {code_text}).")
         
         print(error_msg)
         print(f"   Модель: {actual_model}")
