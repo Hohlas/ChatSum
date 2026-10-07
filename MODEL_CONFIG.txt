@@ -2,7 +2,7 @@
 # File wins over env; env is fallback only.
 # REASONING_EFFORT: none low medium high.
 
-GEMINI_MODEL=gemini-3.8-flash
+GEMINI_MODEL=gemini-3.6-flash
 GEMINI_TEMPERATURE=0           # 0 = детерминированный (рекомендуется), 0.3 = вариативный
-GEMINI_REASONING_EFFORT=medium     # none low medium high (none — детерминизм, medium — глубже анализ но нестабилен)
+GEMINI_REASONING_EFFORT=none     # none low medium high (none — детерминизм, medium — глубже анализ но нестабилен)
 GEMINI_CHUNK_MAX_CHARS=300000     # это ~155 тыс. токенов входа + ответ, итого ~165–175 тыс. на вызов
