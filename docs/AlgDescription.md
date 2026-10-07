@@ -17,8 +17,10 @@ do not "tune" them without the owner.
    no same-key retries/sleeps (a dry key won't get wet from retries; 9 keys ×
    30s of sleeps was ~5 min of dead waiting per circle). Pause
    (`FULL_CIRCLE_FAIL_PAUSE_SEC=60`) happens ONLY after a fully lost circle
-   (all keys refused), never per rotation. 503/UNAVAILABLE: hold the SAME key
-   with growing pauses (`SERVER_RETRY_PAUSES_SEC=60/180`), NO key walk.
+   (all keys refused), never per rotation. 503/UNAVAILABLE: ONE request on
+   the SAME key, then a 3-min pause (`SERVER_OVERLOAD_PAUSE_SEC=180`) and the
+   call fails outward — NO internal retry, NO key walk. The repeat is the outer
+   loop (inbox «Попытка N/5» / due «провал N»), so one request per attempt.
    Why: (1) the storm is backend-wide — the next key hits the same wall;
    (2) a 503 is charged against the daily limit — чужой замер через дашборд
    AI Studio: 31 из 50 засчитанных запросов были 503 «The model is overloaded»
@@ -28,15 +30,18 @@ do not "tune" them without the owner.
    the «503 lands AFTER key authentication» mechanics agree — do NOT redesign
    back into key-walking); (3) official guidance for 503 is «backoff and retry
    with a long maximum delay» (Gemini team reply, dev forum Feb 2026) —
-   waiting is literally what is asked. After 3 tries the chunk fails outward.
-   Sustained 503 also stops remaining chunks (`stop_due_to_overload`, mirror
-   of the quota stop), so a multi-chunk summary doesn't sleep 4 min per
-   chunk. 500/502/504 and timeouts deliberately stay on the old short-retry
+   waiting is literally what is asked. Reduced from 3 tries/1+3 min
+   (session 26) — each 503 burns the daily 20, and the outer inbox loop
+   retries the command ×5, so one command could burn ~15 requests. Sustained
+   503 also stops remaining chunks (`stop_due_to_overload`, mirror of the
+   quota stop), so a multi-chunk summary doesn't sleep 3 min per chunk.
+   500/502/504 and timeouts deliberately stay on the old short-retry
    path (second-long blips; timeouts are ambiguous client/network-side).
    TG 429 line carries quotaId + retry (`format_quota_diagnostic`; retry also
-   parsed from message text 'Please retry in 17h1m40s'). TG 503 line carries
-   the model + 'high demand' marker (`format_server_overload_diagnostic`),
-   so an overload is not mistaken for a quota.
+   parsed from message text 'Please retry in 17h1m40s'). TG 503 line is the
+   **verbatim** Google error text (`format_server_overload_diagnostic`, `❌`
+   prefix only); its response headers are dumped to the log
+   (`_log_response_headers`) to look for an overload-end signal.
 - `run_once.py` — scheduler + duty wrapper. Imports `main.py`. Entry points:
   `--due` (manual drain), `--watch` (duty loop). All times in slots are
   **MSK = UTC+3** (`MSK`, `run_once.py:39`).

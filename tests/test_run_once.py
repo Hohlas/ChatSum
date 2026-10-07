@@ -704,14 +704,13 @@ def test_key_cursor():
 
 
 def test_503_holds_key():
-    """503 держит ТОТ ЖЕ ключ с растущими паузами 1/3 мин, без обхода;
-    после 3 попыток — провал наружу. 429 plain-Exception — старый путь."""
+    """503: один запрос, пауза 3 мин, выход наружу (внутреннего повтора нет,
+    поэтому успех в тесте недостижим). Ключ не меняется. 429 — старый путь."""
     saved = (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
              bot.google_analysis_counter, bot.google_client, bot.asyncio.sleep)
     saved_set_index = bot.set_google_api_key_index
     sleeps = []
     calls = {'n': 0}
-    mode = {'fails': 2}  # сколько первых вызовов валятся с 503
 
     async def fake_sleep(sec):
         sleeps.append(sec)
@@ -719,10 +718,8 @@ def test_503_holds_key():
     class FakeCompletions:
         async def create(self, **kw):
             calls['n'] += 1
-            if calls['n'] <= mode['fails']:
-                raise Exception(
-                    "Error code: 503 - high demand, status UNAVAILABLE")
-            return 'OK'
+            raise Exception(
+                "Error code: 503 - high demand, status UNAVAILABLE")
 
     class FakeClient:
         chat = type('C', (), {'completions': FakeCompletions()})()
@@ -739,30 +736,17 @@ def test_503_holds_key():
         bot.google_client = FakeClient()
         bot.set_google_api_key_index = fake_set_index
 
-        # 503×2 → успех с 3-й: тот же ключ, без ротации, паузы 60+180
-        with _quiet():
-            result = loop.run_until_complete(bot.execute_gemini_request({}))
-        check('503: успех с того же ключа', result == 'OK', result)
-        check('503: ротации НЕТ (ключ 1/3)',
-              bot.current_google_key_index == 0, bot.current_google_key_index)
-        check('503: попыток 3 (2×503 + успех)', calls['n'] == 3, calls)
-        check('503: растущие паузы 1/3 мин', sleeps == [60, 180], sleeps)
-
-        # 503 всегда: провал наружу после 3 попыток, ключ не сменился
-        calls['n'] = 0
-        sleeps.clear()
-        mode['fails'] = 99
+        # 503: один запрос, пауза 180, выход наружу — без повтора на ключе
         try:
             with _quiet():
                 loop.run_until_complete(bot.execute_gemini_request({}))
             check('503: должен был raise', False)
         except Exception as e:
-            check('503: raise после 3 попыток без обхода',
+            check('503: raise после 1 запроса без обхода',
                   '503' in str(e) and bot.current_google_key_index == 0
-                  and calls['n'] == 3,
+                  and calls['n'] == 1,
                   (str(e)[:40], bot.current_google_key_index, calls))
-        check('503: паузы только 1/3 мин (9-й минуты нет — сдались)',
-              sleeps == [60, 180], sleeps)
+        check('503: пауза 3 мин, повтора нет', sleeps == [180], sleeps)
     finally:
         (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
          bot.google_analysis_counter, bot.google_client,
@@ -1110,39 +1094,47 @@ def test_quota_diag():
 
 
 def test_server_overload_diag():
-    """Диагностика 503: видно модель и перегрузку, не путается с квотой."""
+    """Диагностика 503: в TG — дословный текст Google; заголовки — в лог."""
     from types import SimpleNamespace
-
-    def err(status, message):
-        return SimpleNamespace(
-            status_code=status,
-            response=SimpleNamespace(json=lambda: {'error': {'message': message}}))
+    import contextlib
+    import io
 
     demand = ('This model is currently experiencing high demand. '
               'Spikes in demand are usually temporary. Please try again later.')
-    check('503-диагностика: модель + high demand',
-          bot.format_server_overload_diagnostic(err(503, demand), 'gemini-3.6-flash')
-          == 'HTTP 503 · gemini-3.6-flash · high demand',
-          bot.format_server_overload_diagnostic(err(503, demand), 'gemini-3.6-flash'))
-    check('503-диагностика: без признака — только код и модель',
-          bot.format_server_overload_diagnostic(err(503, 'Service Unavailable'),
-                                                'gemini-3.6-flash')
-          == 'HTTP 503 · gemini-3.6-flash',
-          bot.format_server_overload_diagnostic(err(503, 'Service Unavailable'),
-                                                'gemini-3.6-flash'))
-    check('503-диагностика: без модели — код + признак',
-          bot.format_server_overload_diagnostic(err(503, demand), '')
-          == 'HTTP 503 · high demand',
-          bot.format_server_overload_diagnostic(err(503, demand), ''))
-    check('503-диагностика: нет response → всё равно строка',
+
+    def err(message):
+        return SimpleNamespace(
+            status_code=503,
+            response=SimpleNamespace(
+                json=lambda: {'error': {'message': message}},
+                headers={'retry-after': '5', 'x-request-id': 'abc'}))
+
+    check('503-диагностика: дословный текст Google',
+          bot.format_server_overload_diagnostic(err(demand)) == demand,
+          bot.format_server_overload_diagnostic(err(demand)))
+    check('503-диагностика: пустое сообщение → пусто',
+          bot.format_server_overload_diagnostic(err('')) == '',
+          repr(bot.format_server_overload_diagnostic(err(''))))
+    check('503-диагностика: нет response → пусто (без исключения)',
           bot.format_server_overload_diagnostic(
-              SimpleNamespace(status_code=503), 'gemini-3.6-flash')
-          == 'HTTP 503 · gemini-3.6-flash',
-          bot.format_server_overload_diagnostic(
-              SimpleNamespace(status_code=503), 'gemini-3.6-flash'))
+              SimpleNamespace(status_code=503)) == '',
+          repr(bot.format_server_overload_diagnostic(
+              SimpleNamespace(status_code=503))))
     check('503-диагностика: 429 не выдаёт себя за перегрузку',
           bot.is_server_overloaded(
               'Error code: 429 - quota exceeded') is False, '')
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        bot._log_response_headers(err(demand))
+    out = buf.getvalue()
+    check('503-лог: заголовки пишутся в stdout',
+          'retry-after=5' in out and 'x-request-id=abc' in out, repr(out))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        bot._log_response_headers(SimpleNamespace(status_code=503))
+    check('503-лог: нет заголовков — строка, без исключения',
+          'недоступны' in buf.getvalue(), repr(buf.getvalue()))
 
 
 def test_flat_rotation():
@@ -1182,8 +1174,8 @@ def test_flat_rotation():
                       ('45s', '45s'), ('24445s', '6h47m'), ('xx', 'xx')):
         check(f'плоская: retry {raw} → {want}',
               bot._short_retry_delay(raw) == want, bot._short_retry_delay(raw))
-    check('503: паузы 1/3 мин',
-          bot.SERVER_RETRY_PAUSES_SEC == (60, 180), bot.SERVER_RETRY_PAUSES_SEC)
+    check('503: пауза 3 мин',
+          bot.SERVER_OVERLOAD_PAUSE_SEC == 180, bot.SERVER_OVERLOAD_PAUSE_SEC)
     for text in ('Error code: 503 - Service Unavailable',
                  'UNAVAILABLE: server overloaded',
                  'HTTP 503: upstream overloaded'):

@@ -453,28 +453,59 @@ def _retry_from_message(message):
     return _short_retry_delay(m.group(1))
 
 
-def format_server_overload_diagnostic(error, model=''):
-    """Короткая диагностика 503/UNAVAILABLE для логов и Telegram.
+def _log_response_headers(error, tag='503'):
+    """Best-effort дамп ВСЕХ заголовков ответа Google в лог (разбор 503).
 
-    Возвращает строку вида "HTTP 503 · gemini-3.6-flash · high demand" —
-    видно, что это ПЕРЕГРУЗКА модели, а не квота (429), и какой именно модели.
-    Признак «high demand» берём из текста ошибки, если он есть. Модель
-    передаём аргументом — в теле 503 её нет. Вытащить нечего — ''.
-    Best-effort, исключений не бросает. Чистая логика.
+    Квоту не тратит — заголовки уже получены вместе с ошибкой. Нужно, чтобы
+    понять, присылает ли Google хоть какой-то признак окончания перегрузки
+    (Retry-After и пр.). Исключений не бросает.
     """
     try:
-        code = getattr(error, 'status_code', None)
+        response = getattr(error, 'response', None)
+        headers = getattr(response, 'headers', None)
+        if not headers:
+            print(f"   🧾 {tag}: заголовки ответа недоступны")
+            return
         try:
-            raw = extract_api_error_message(error)
+            pairs = [f"{k}={v}" for k, v in headers.items()]
         except Exception:
-            raw = ''
-        has_demand = 'high demand' in (raw or '').lower()
-        parts = [f"HTTP {code}" if isinstance(code, int) else 'HTTP 503']
-        if model:
-            parts.append(str(model))
-        if has_demand:
-            parts.append('high demand')
-        return ' · '.join(parts)
+            pairs = []
+        print(f"   🧾 {tag}: заголовки ответа: "
+              + (', '.join(pairs) if pairs else 'нет'))
+    except Exception:
+        pass
+
+
+def format_server_overload_diagnostic(error):
+    """Текст 503/UNAVAILABLE для Telegram — дословная копия ответа Google.
+
+    Ничего своего не сочиняем: берём error.message из тела ответа как есть
+    (например, «This model is currently experiencing high demand...»), иначе
+    response.text. Нет ни того ни другого — '' (не подменяем repr исключения).
+    Заодно дампит заголовки ответа в лог (`_log_response_headers`) — чтобы
+    искать признак окончания перегрузки. Best-effort, исключений не бросает.
+    """
+    try:
+        _log_response_headers(error, '503')
+        response = getattr(error, 'response', None)
+        if response is None:
+            return ''
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            payload = payload[0]
+        if isinstance(payload, dict):
+            err = payload.get('error')
+            if isinstance(err, dict):
+                message = err.get('message')
+                if isinstance(message, str) and message.strip():
+                    return message.strip()
+        text = getattr(response, 'text', None)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        return ''
     except Exception:
         return ''
 
@@ -600,7 +631,12 @@ def is_quota_rate_limit(error):
         return False
 
 
-# Паузы повторов при перегрузке сервера: 1/3 мин, на том же ключе.
+# 503/UNAVAILABLE: пауза 3 мин на том же ключе и сразу выход наружу.
+# Внутреннего повтора для 503 НЕТ — при провале команда вернётся внешним
+# циклом (inbox «Попытка N/5» / due «провал N»), т.е. один запрос на вызов.
+# Сокращено с «3 запроса, паузы 1/3 мин» (сессия 26): каждый 503, по
+# наблюдению владельца, засчитан в дневной лимит (20/сутки), а внешний цикл
+# повторял команду до 5 раз — одна команда могла сжечь ~15 запросов.
 # Почему не обход ключей: (1) шторм общий на бэкенд — соседний ключ упрётся
 # в ту же стену; (2) 503 засчитывается в дневной лимит — чужой замер через
 # дашборд AI Studio: 31/50 засчитанных запросов были 503 «The model is
@@ -611,7 +647,7 @@ def is_quota_rate_limit(error):
 # (3) Официальная рекомендация при 503 — «backoff and retry with a long
 # maximum delay» (ответ команды Gemini, форум, фев 2026): ждать — буквально
 # то, о чём просят. Не переделывать обратно в обход ключей.
-SERVER_RETRY_PAUSES_SEC = (60, 180)
+SERVER_OVERLOAD_PAUSE_SEC = 180
 
 
 def is_server_overloaded(error_str):
@@ -655,19 +691,15 @@ async def execute_gemini_request(request_params):
                         rotate_google_api_key("квота исчерпана, сразу следующий ключ")
                     break
 
-                # 503/UNAVAILABLE: сервер перегружен — ждём на ТОМ ЖЕ ключе
-                # с растущей паузой (1/3 мин), без обхода ключей: шторм
-                # общий на бэкенд, соседний ключ упрётся в ту же стену,
-                # а 503-запрос, вероятно, уже засчитан в дневной лимит.
-                # После исчерпания — сразу провал наружу (без добивания
-                # флота; круговая пауза ниже не нужна — уже ждали 4 мин).
+                # 503/UNAVAILABLE: сервер перегружен — пауза 3 мин на ТОМ ЖЕ
+                # ключе и сразу выход наружу. Без обхода ключей: шторм общий
+                # на бэкенд, соседний ключ упрётся в ту же стену, а 503-запрос,
+                # вероятно, уже засчитан в дневной лимит. Повтор сделает
+                # внешний цикл (inbox «Попытка N/5» / due «провал N»).
                 if is_server_overloaded(error_str):
-                    if retry < len(SERVER_RETRY_PAUSES_SEC):
-                        delay = SERVER_RETRY_PAUSES_SEC[retry]
-                        print(f"   ⏳ Сервер перегружен, ждём {delay // 60} мин "
-                              f"(попытка {retry + 2}/{max_retries_per_key})...")
-                        await asyncio.sleep(delay)
-                        continue
+                    _log_response_headers(e)
+                    print(f"   ⏳ Сервер перегружен, ждём {SERVER_OVERLOAD_PAUSE_SEC // 60} мин...")
+                    await asyncio.sleep(SERVER_OVERLOAD_PAUSE_SEC)
                     raise
 
                 # Временные сбои сервера — retry с задержкой на том же ключе
@@ -2051,7 +2083,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                     pass
             if stop_due_to_quota or stop_due_to_overload:
                 reason = ("исчерпания квоты Gemini API" if stop_due_to_quota
-                          else "затяжной перегрузки сервера Gemini (4 мин ожидания не помогли)")
+                          else "затяжной перегрузки сервера Gemini (3 мин ожидания не помогли)")
                 skipped_msg = f"⚠️ Чанк пропущен: обработка остановлена после {reason}"
                 chunk_summaries.append((start_idx, end_idx, skipped_msg, True))
                 errors_count += 1
@@ -2171,9 +2203,9 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                     stop_due_to_quota = True
                     print("   ⛔ Обработка следующих чанков остановлена: исчерпана квота Gemini API")
                 elif is_server_overloaded(api_message):
-                    # Затяжной 503 (4 мин ожидания на чанке не помогли):
+                    # Затяжной 503 (3 мин ожидания на чанке не помогли):
                     # остальные чанки упрутся в тот же шторм — не ждём
-                    # по 4 мин на каждый, гасим сразу.
+                    # по 3 мин на каждый, гасим сразу.
                     stop_due_to_overload = True
                     print("   ⛔ Обработка следующих чанков остановлена: затяжная перегрузка сервера")
                 
@@ -2334,11 +2366,11 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                 if diag:
                     error_msg = f"❌ Ошибка Google AI Studio ({diag})."
             elif is_server_overloaded(str(e)):
-                # 503/UNAVAILABLE: показать, что это перегрузка модели и какой
-                # (не спутать с квотой 429); модель — аргументом, в теле нет.
-                diag = format_server_overload_diagnostic(e, actual_model)
-                if diag:
-                    error_msg = f"❌ Ошибка Google AI Studio ({diag})."
+                # 503/UNAVAILABLE: в Telegram — дословный текст ответа Google
+                # (плюс ❌); заголовки ответа дампятся в лог для разбора.
+                text = format_server_overload_diagnostic(e)
+                if text:
+                    error_msg = f"❌ {text}"
         
         print(error_msg)
         print(f"   Модель: {actual_model}")
