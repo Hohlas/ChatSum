@@ -453,6 +453,32 @@ def _retry_from_message(message):
     return _short_retry_delay(m.group(1))
 
 
+def format_server_overload_diagnostic(error, model=''):
+    """Короткая диагностика 503/UNAVAILABLE для логов и Telegram.
+
+    Возвращает строку вида "HTTP 503 · gemini-3.6-flash · high demand" —
+    видно, что это ПЕРЕГРУЗКА модели, а не квота (429), и какой именно модели.
+    Признак «high demand» берём из текста ошибки, если он есть. Модель
+    передаём аргументом — в теле 503 её нет. Вытащить нечего — ''.
+    Best-effort, исключений не бросает. Чистая логика.
+    """
+    try:
+        code = getattr(error, 'status_code', None)
+        try:
+            raw = extract_api_error_message(error)
+        except Exception:
+            raw = ''
+        has_demand = 'high demand' in (raw or '').lower()
+        parts = [f"HTTP {code}" if isinstance(code, int) else 'HTTP 503']
+        if model:
+            parts.append(str(model))
+        if has_demand:
+            parts.append('high demand')
+        return ' · '.join(parts)
+    except Exception:
+        return ''
+
+
 def format_quota_diagnostic(error):
     """Короткая диагностика квоты из тела 429 для логов и Telegram.
 
@@ -2305,6 +2331,12 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                 # Какая квота и когда сброс — прямо в текст для топика:
                 # иначе дневной и поминутный 429 неразличимы.
                 diag = format_quota_diagnostic(e)
+                if diag:
+                    error_msg = f"❌ Ошибка Google AI Studio ({diag})."
+            elif is_server_overloaded(str(e)):
+                # 503/UNAVAILABLE: показать, что это перегрузка модели и какой
+                # (не спутать с квотой 429); модель — аргументом, в теле нет.
+                diag = format_server_overload_diagnostic(e, actual_model)
                 if diag:
                     error_msg = f"❌ Ошибка Google AI Studio ({diag})."
         

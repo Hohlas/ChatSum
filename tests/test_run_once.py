@@ -130,6 +130,7 @@ def main():
     test_liveness()
     test_due_fail_renew()
     test_quota_diag()
+    test_server_overload_diag()
     test_flat_rotation()
     test_collect_order_and_parents()
     test_handoff()
@@ -1106,6 +1107,42 @@ def test_quota_diag():
               repr(bot.format_quota_diagnostic(err(bad))))
     check('диагностика: нет response → пусто',
           bot.format_quota_diagnostic(SimpleNamespace(status_code=429)) == '')
+
+
+def test_server_overload_diag():
+    """Диагностика 503: видно модель и перегрузку, не путается с квотой."""
+    from types import SimpleNamespace
+
+    def err(status, message):
+        return SimpleNamespace(
+            status_code=status,
+            response=SimpleNamespace(json=lambda: {'error': {'message': message}}))
+
+    demand = ('This model is currently experiencing high demand. '
+              'Spikes in demand are usually temporary. Please try again later.')
+    check('503-диагностика: модель + high demand',
+          bot.format_server_overload_diagnostic(err(503, demand), 'gemini-3.6-flash')
+          == 'HTTP 503 · gemini-3.6-flash · high demand',
+          bot.format_server_overload_diagnostic(err(503, demand), 'gemini-3.6-flash'))
+    check('503-диагностика: без признака — только код и модель',
+          bot.format_server_overload_diagnostic(err(503, 'Service Unavailable'),
+                                                'gemini-3.6-flash')
+          == 'HTTP 503 · gemini-3.6-flash',
+          bot.format_server_overload_diagnostic(err(503, 'Service Unavailable'),
+                                                'gemini-3.6-flash'))
+    check('503-диагностика: без модели — код + признак',
+          bot.format_server_overload_diagnostic(err(503, demand), '')
+          == 'HTTP 503 · high demand',
+          bot.format_server_overload_diagnostic(err(503, demand), ''))
+    check('503-диагностика: нет response → всё равно строка',
+          bot.format_server_overload_diagnostic(
+              SimpleNamespace(status_code=503), 'gemini-3.6-flash')
+          == 'HTTP 503 · gemini-3.6-flash',
+          bot.format_server_overload_diagnostic(
+              SimpleNamespace(status_code=503), 'gemini-3.6-flash'))
+    check('503-диагностика: 429 не выдаёт себя за перегрузку',
+          bot.is_server_overloaded(
+              'Error code: 429 - quota exceeded') is False, '')
 
 
 def test_flat_rotation():

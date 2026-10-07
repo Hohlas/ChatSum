@@ -34,7 +34,9 @@ do not "tune" them without the owner.
    chunk. 500/502/504 and timeouts deliberately stay on the old short-retry
    path (second-long blips; timeouts are ambiguous client/network-side).
    TG 429 line carries quotaId + retry (`format_quota_diagnostic`; retry also
-   parsed from message text 'Please retry in 17h1m40s').
+   parsed from message text 'Please retry in 17h1m40s'). TG 503 line carries
+   the model + 'high demand' marker (`format_server_overload_diagnostic`),
+   so an overload is not mistaken for a quota.
 - `run_once.py` — scheduler + duty wrapper. Imports `main.py`. Entry points:
   `--due` (manual drain), `--watch` (duty loop). All times in slots are
   **MSK = UTC+3** (`MSK`, `run_once.py:39`).
