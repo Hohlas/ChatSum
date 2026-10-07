@@ -17,21 +17,21 @@ Follow these steps in order.
 
 Step 1: Cluster by topic.
 Group messages discussing the same subject/question/event based on:
-- A reply chain (field "r") is a strong signal: it must form its own separate 💡 topic.
+- A message that received 2+ replies forms its own separate 💡 topic together with its replies; never merge it into another topic.
 - Shared entities (repeated mentions of the same named items or domain-specific terms)
-- URL-based discussions: a standalone message sharing an external link (not part of a reply chain) forms its own topic even with minimal text
+- A message sharing an external link together with its accompanying text (a comment or caption) forms its own topic.
 
-Each resulting topic must have a subject summarizable in 3-5 words.
+Each resulting topic must have a short title (a few words).
 
 Minimum cluster requirements:
 - messages from at least 2 different participants, OR
-- a single author with substantial argumentation (2+ substantive sentences) or external links
+- a single author with substantial argumentation (2+ substantive sentences) or an external link with the author's comment
 
 Granularity: one topic = one question/entity/event; split an adjacent question into a separate cluster only if it discusses a different subject (a topic may conclude with no consensus).
 Cover ALL material topics found in the input. Do not stop after the largest themes.
+Treat each distinct entity/event/news item as its own topic; do not fold them into one broad theme.
 MUST EXCLUDE from topic formation:
-- messages without substantive arguments (e.g., bot messages, off-topic spam).
-- single unreplied one-liners, jokes, or brief remarks — a lone comment without replies or substantial argumentation is NOT a discussion topic.
+- spam, bot messages, and non-substantive one-liners (even inside reply chains).
 
 Step 2: Formulate key idea.
 For each topic, write 1-2 sentence summary reflecting dominant opinion, consensus, or main conclusion (note disagreements if no consensus).
@@ -57,11 +57,11 @@ Use this template:
 
 ---
 
-💡 **<Topic Title>**
+💡 **<Topic Title: short, a few words>**
 *<key idea of the topic (1-2 sentences)>*
 
 [{s}](https://t.me/c/{chat_id}/{id}): one-sentence gist
-[{s}](https://t.me/c/{chat_id}/{id}): one-sentence gist
+... (up to 5 participants, up to 2 lines per participant)
 
 ---
 
