@@ -136,6 +136,7 @@ def main():
     test_duty()
     test_heartbeat_loop()
     test_due_cap()
+    test_telegraph_toc()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")
@@ -1499,6 +1500,70 @@ def test_due_cap():
         check('due-кап: без капа всё сразу', calls == [-101, -102, -103] and r == 0, calls)
     finally:
         run_once.handoff_enabled = saved_handoff
+
+
+def test_telegraph_toc():
+    md_two = (
+        '💡 **Вспышка кори в США**\n'
+        '*Ключевая идея.*\n'
+        '\n'
+        '[User](https://t.me/c/123/1): суть\n'
+        '\n'
+        '---\n'
+        '\n'
+        '💡 **Токен LayerZero (ZRO) & рынок**\n'
+        '*Ключевая идея.*\n'
+        '\n'
+        '[User](https://t.me/c/123/2): суть\n'
+    )
+    titles = bot.extract_topic_titles(md_two)
+    check('toc: разбор двух заголовков',
+          titles == ['Вспышка кори в США', 'Токен LayerZero (ZRO) & рынок'], titles)
+    check('toc: пустой ввод — пусто', bot.extract_topic_titles('') == [])
+    check('toc: строки без эмодзи — мимо',
+          bot.extract_topic_titles('Просто текст\n---\n') == [])
+    check('toc: снятие разметки зеркалит ветку h3',
+          bot.extract_topic_titles('💡 **A *B* C**') == ['A B C'],
+          bot.extract_topic_titles('💡 **A *B* C**'))
+
+    check('toc: слаг пробелы->дефисы',
+          bot.telegraph_slug('Вспышка кори в США') == '💡-Вспышка-кори-в-США',
+          bot.telegraph_slug('Вспышка кори в США'))
+    check('toc: слаг держит «ёлочки» и скобки',
+          bot.telegraph_slug('Угроза «жизни» (ZRO)') == '💡-Угроза-«жизни»-(ZRO)',
+          bot.telegraph_slug('Угроза «жизни» (ZRO)'))
+    check('toc: слаг экранирует &',
+          bot.telegraph_slug('Слеш & проверка') == '💡-Слеш-&amp;-проверка',
+          bot.telegraph_slug('Слеш & проверка'))
+
+    check('toc: один топик — без содержания', bot.build_toc_html(['Один']) == '')
+    check('toc: пусто — без содержания', bot.build_toc_html([]) == '')
+    toc = bot.build_toc_html(titles)
+    check('toc: два пункта', toc.count('<li>') == 2, toc)
+    check('toc: href первого', 'href="#💡-Вспышка-кори-в-США"' in toc, toc)
+    check('toc: & в href с двойным экранированием',
+          'href="#💡-Токен-LayerZero-(ZRO)-&amp;amp;-рынок"' in toc, toc)
+    check('toc: текст пункта экранирован',
+          'ZRO) &amp; рынок' in toc, toc)
+    check('toc: только разрешённые API теги',
+          all(bad not in toc for bad in ('<div', '<span', '<h1', '<h2', 'id=')), toc)
+
+    html_two = bot.convert_markdown_to_html(md_two)
+    check('toc: содержание в Telegraph-вёрстке',
+          '<h4>Содержание</h4>' in html_two and '<ol>' in html_two, html_two[:200])
+    check('toc: href пережил санитарку',
+          'href="#💡-Вспышка-кори-в-США"' in html_two, html_two[:400])
+    check('toc: содержание до первого топика',
+          html_two.index('Содержание') < html_two.index('<h3>'))
+    md_one = '💡 **Один топик**\n*Идея.*\n'
+    check('toc: один топик — без содержания',
+          'Содержание' not in bot.convert_markdown_to_html(md_one))
+    tg_html = bot.convert_markdown_to_html(md_two, for_telegram=True)
+    check('toc: Telegram-ветка — без содержания',
+          'Содержание' not in tg_html and '<ol>' not in tg_html, tg_html[:200])
+    dup = bot.build_toc_html(['Повтор', 'Повтор'])
+    check('toc: дубли — одинаковый href (прыжок на первое вхождение)',
+          dup.count('href="#💡-Повтор"') == 2, dup)
 
 
 def _now_utc():

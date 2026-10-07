@@ -2546,6 +2546,70 @@ def _preprocess_for_telegram(content):
     return '\n'.join(p.strip() for p in parts if p.strip())
 
 
+# Кликабельное содержание для telegra.ph (проверено живым тестом 2026-10-07):
+# фронтенд telegra.ph сам дописывает каждому <h3> id-якорь вида
+# "текст-заголовка-через-дефисы", а API хранит только href/src. Поэтому
+# ссылки <a href="#слаг"> прыгают к разделам, если слаг повторяет правило
+# фронтенда один в один: пробелы -> дефисы поверх экранированного текста.
+
+
+def extract_topic_titles(markdown_text):
+    """Заголовки топиков из Markdown-саммари (строки на 💡) чистым текстом.
+
+    Разметка снимается теми же выражениями и в том же порядке, что в ветке
+    <h3> у convert_markdown_to_html, — иначе слаг разойдётся с якорем.
+    """
+    titles = []
+    for line in (markdown_text or '').split('\n'):
+        stripped = line.strip()
+        if not stripped.startswith('💡'):
+            continue
+        title = stripped[1:].strip()
+        title = MD_BOLD_RE.sub(r'\1', title)
+        title = MD_ITALIC_RE.sub(r'\1', title)
+        title = title.strip()
+        if title:
+            titles.append(title)
+    return titles
+
+
+def telegraph_slug(title):
+    """Слаг якоря так, как его соберёт фронтенд telegra.ph.
+
+    Экранирование (& < >) — то же, что делает convert_markdown_to_html до
+    разметки, пробелы — в дефисы. Проверено живым тестом на кириллице,
+    эмодзи, «ёлочках», скобках, слеше, амперсанде и дублях.
+    """
+    escaped = title.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    return '💡-' + escaped.replace(' ', '-')
+
+
+def _escape_attr(value):
+    # Текст ноды хранится с лишним слоем экранирования, а атрибут — без
+    # него, поэтому слаг в href экранируем ещё раз: stored href == stored id.
+    return (value.replace('&', '&amp;').replace('"', '&quot;')
+            .replace('<', '&lt;').replace('>', '&gt;'))
+
+
+def build_toc_html(titles):
+    """Блок содержания из заголовков топиков. Только разрешённые API теги
+    (h4/ol/li/a). Меньше 2 топиков — пустая строка (содержание не нужно).
+    Дубли заголовков получают одинаковый href (якоря у фронтенда тоже
+    одинаковые) — обе ссылки ведут на первое вхождение.
+    """
+    titles = [t for t in (titles or []) if t]
+    if len(titles) < 2:
+        return ''
+    parts = ['<h4>Содержание</h4>', '<ol>']
+    for t in titles:
+        href = _escape_attr('#' + telegraph_slug(t))
+        text = t.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        parts.append(f'<li><a href="{href}">{text}</a></li>')
+    parts.append('</ol>')
+    parts.append('<hr>')
+    return ''.join(parts)
+
+
 def convert_markdown_to_html(content, for_telegram=False):
     """
     Конвертирует Markdown текст в HTML.
@@ -2560,6 +2624,11 @@ def convert_markdown_to_html(content, for_telegram=False):
     """
     if for_telegram:
         content = _preprocess_for_telegram(content)
+    # Содержание для Telegraph: заголовки читаем из сырого Markdown (до
+    # экранирования ниже), вставляем перед первым топиком. Telegram-ветка —
+    # без содержания (лимит длины сообщений).
+    toc_html = '' if for_telegram else build_toc_html(extract_topic_titles(content))
+    toc_pending = bool(toc_html)
     # Экранируем HTML-спецсимволы, чтобы предотвратить поломку вёрстки
     # из-за ников пользователей с символами < > & (например, sprintf(username, "id%04d", 1<<9))
     content = content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
@@ -2618,6 +2687,9 @@ def convert_markdown_to_html(content, for_telegram=False):
         if line_stripped.startswith('💡'):
             flush_paragraph()
             flush_list()
+            if toc_pending:
+                html_paragraphs.append(toc_html)
+                toc_pending = False
             text = line_stripped
             text = MD_BOLD_RE.sub(r'<b>\1</b>', text)
             text = MD_ITALIC_RE.sub(r'<i>\1</i>', text)
