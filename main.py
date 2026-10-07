@@ -574,7 +574,7 @@ def is_quota_rate_limit(error):
         return False
 
 
-# Паузы повторов при перегрузке сервера: 1/3/9 мин, на том же ключе.
+# Паузы повторов при перегрузке сервера: 1/3 мин, на том же ключе.
 # Почему не обход ключей: (1) шторм общий на бэкенд — соседний ключ упрётся
 # в ту же стену; (2) 503 засчитывается в дневной лимит — чужой замер через
 # дашборд AI Studio: 31/50 засчитанных запросов были 503 «The model is
@@ -585,7 +585,7 @@ def is_quota_rate_limit(error):
 # (3) Официальная рекомендация при 503 — «backoff and retry with a long
 # maximum delay» (ответ команды Gemini, форум, фев 2026): ждать — буквально
 # то, о чём просят. Не переделывать обратно в обход ключей.
-SERVER_RETRY_PAUSES_SEC = (60, 180, 540)
+SERVER_RETRY_PAUSES_SEC = (60, 180)
 
 
 def is_server_overloaded(error_str):
@@ -630,16 +630,16 @@ async def execute_gemini_request(request_params):
                     break
 
                 # 503/UNAVAILABLE: сервер перегружен — ждём на ТОМ ЖЕ ключе
-                # с растущей паузой (1/3/9 мин), без обхода ключей: шторм
+                # с растущей паузой (1/3 мин), без обхода ключей: шторм
                 # общий на бэкенд, соседний ключ упрётся в ту же стену,
                 # а 503-запрос, вероятно, уже засчитан в дневной лимит.
                 # После исчерпания — сразу провал наружу (без добивания
-                # флота; круговая пауза ниже не нужна — уже ждали 13 мин).
+                # флота; круговая пауза ниже не нужна — уже ждали 4 мин).
                 if is_server_overloaded(error_str):
-                    if retry < len(SERVER_RETRY_PAUSES_SEC) - 1:
+                    if retry < len(SERVER_RETRY_PAUSES_SEC):
                         delay = SERVER_RETRY_PAUSES_SEC[retry]
                         print(f"   ⏳ Сервер перегружен, ждём {delay // 60} мин "
-                              f"(попытка {retry + 2}/{len(SERVER_RETRY_PAUSES_SEC)})...")
+                              f"(попытка {retry + 2}/{max_retries_per_key})...")
                         await asyncio.sleep(delay)
                         continue
                     raise
@@ -2025,7 +2025,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                     pass
             if stop_due_to_quota or stop_due_to_overload:
                 reason = ("исчерпания квоты Gemini API" if stop_due_to_quota
-                          else "затяжной перегрузки сервера Gemini (13 мин ожидания не помогли)")
+                          else "затяжной перегрузки сервера Gemini (4 мин ожидания не помогли)")
                 skipped_msg = f"⚠️ Чанк пропущен: обработка остановлена после {reason}"
                 chunk_summaries.append((start_idx, end_idx, skipped_msg, True))
                 errors_count += 1
@@ -2145,9 +2145,9 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                     stop_due_to_quota = True
                     print("   ⛔ Обработка следующих чанков остановлена: исчерпана квота Gemini API")
                 elif is_server_overloaded(api_message):
-                    # Затяжной 503 (13 мин ожидания на чанке не помогли):
+                    # Затяжной 503 (4 мин ожидания на чанке не помогли):
                     # остальные чанки упрутся в тот же шторм — не ждём
-                    # по 13 мин на каждый, гасим сразу.
+                    # по 4 мин на каждый, гасим сразу.
                     stop_due_to_overload = True
                     print("   ⛔ Обработка следующих чанков остановлена: затяжная перегрузка сервера")
                 

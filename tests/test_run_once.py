@@ -702,7 +702,7 @@ def test_key_cursor():
 
 
 def test_503_holds_key():
-    """503 держит ТОТ ЖЕ ключ с растущими паузами 1/3/9 мин, без обхода;
+    """503 держит ТОТ ЖЕ ключ с растущими паузами 1/3 мин, без обхода;
     после 3 попыток — провал наружу. 429 plain-Exception — старый путь."""
     saved = (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
              bot.google_analysis_counter, bot.google_client, bot.asyncio.sleep)
@@ -1144,8 +1144,8 @@ def test_flat_rotation():
                       ('45s', '45s'), ('24445s', '6h47m'), ('xx', 'xx')):
         check(f'плоская: retry {raw} → {want}',
               bot._short_retry_delay(raw) == want, bot._short_retry_delay(raw))
-    check('503: паузы 1/3/9 мин',
-          bot.SERVER_RETRY_PAUSES_SEC == (60, 180, 540), bot.SERVER_RETRY_PAUSES_SEC)
+    check('503: паузы 1/3 мин',
+          bot.SERVER_RETRY_PAUSES_SEC == (60, 180), bot.SERVER_RETRY_PAUSES_SEC)
     for text in ('Error code: 503 - Service Unavailable',
                  'UNAVAILABLE: server overloaded',
                  'HTTP 503: upstream overloaded'):

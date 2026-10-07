@@ -18,7 +18,7 @@ do not "tune" them without the owner.
    30s of sleeps was ~5 min of dead waiting per circle). Pause
    (`FULL_CIRCLE_FAIL_PAUSE_SEC=60`) happens ONLY after a fully lost circle
    (all keys refused), never per rotation. 503/UNAVAILABLE: hold the SAME key
-   with growing pauses (`SERVER_RETRY_PAUSES_SEC=60/180/540`), NO key walk.
+   with growing pauses (`SERVER_RETRY_PAUSES_SEC=60/180`), NO key walk.
    Why: (1) the storm is backend-wide — the next key hits the same wall;
    (2) a 503 is charged against the daily limit — чужой замер через дашборд
    AI Studio: 31 из 50 засчитанных запросов были 503 «The model is overloaded»
@@ -30,7 +30,7 @@ do not "tune" them without the owner.
    with a long maximum delay» (Gemini team reply, dev forum Feb 2026) —
    waiting is literally what is asked. After 3 tries the chunk fails outward.
    Sustained 503 also stops remaining chunks (`stop_due_to_overload`, mirror
-   of the quota stop), so a multi-chunk summary doesn't sleep 13 min per
+   of the quota stop), so a multi-chunk summary doesn't sleep 4 min per
    chunk. 500/502/504 and timeouts deliberately stay on the old short-retry
    path (second-long blips; timeouts are ambiguous client/network-side).
    TG 429 line carries quotaId + retry (`format_quota_diagnostic`; retry also
