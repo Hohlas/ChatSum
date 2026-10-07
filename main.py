@@ -75,6 +75,26 @@ def validate_config():
         k for k in re.split(r'[\s,;]+', os.getenv('GOOGLE_API_KEYS', '')) if k.strip()
     ]
     gemini_model = os.getenv('GEMINI_MODEL', '').strip()
+    if not gemini_model:
+        # Model now lives in MODEL_CONFIG.txt (one push updates all modes);
+        # env/private.txt is fallback only. Accept file value here so moving
+        # GEMINI_* out of private.txt does not fail validation.
+        try:
+            cfg_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), 'MODEL_CONFIG.txt')
+            with open(cfg_path, 'r', encoding='utf-8') as fh:
+                for raw in fh.read().splitlines():
+                    s = raw.strip()
+                    if not s or s.startswith('#') or '=' not in s:
+                        continue
+                    k, v = s.split('=', 1)
+                    if k.strip().upper() in ('MODEL', 'GEMINI_MODEL'):
+                        v = v.split('#', 1)[0].strip()
+                        if v:
+                            gemini_model = v
+                            break
+        except OSError:
+            pass
     
     # Список заглушек, которые могут быть в шаблоне
     placeholders = [
@@ -302,8 +322,9 @@ def get_model_generation_config(model_name):
     """
     Возвращает параметры генерации и чанкования для выбранной модели.
 
-    Модель продолжает задаваться через private.txt, а эта функция лишь
-    подбирает безопасные дефолты и точечные overrides.
+    Модель задается через MODEL_CONFIG.txt (MODEL=), env GEMINI_MODEL —
+    только запасной вариант. Эта функция лишь подбирает безопасные
+    дефолты и точечные overrides.
     """
     config = {
         'context_limit_tokens': 128000,
@@ -901,62 +922,111 @@ def update_env_value(filename, key, value):
 def load_model_config(filename):
     """
     Загружает конфигурацию модели из файла
-    
+
+    Generic provider-agnostic keys (file wins over env, env is fallback):
+    MODEL (or GEMINI_MODEL), TEMPERATURE (or GEMINI_TEMPERATURE),
+    REASONING_EFFORT (or GEMINI_REASONING_EFFORT), CHUNK_MAX_CHARS
+    (or GEMINI_CHUNK_MAX_CHARS). Legacy USE_REASONING / USE_HTML_EXPORT kept.
+
     Args:
         filename: Путь к файлу с конфигурацией модели
-    
+
     Returns:
         Кортеж (model_name, use_reasoning, use_html_export)
     """
-    default_model = GEMINI_DEFAULT_MODEL  # Модель из private.txt (GEMINI_MODEL)
+    global GEMINI_DEFAULT_MODEL, GEMINI_REASONING_EFFORT, GEMINI_CHUNK_MAX_CHARS
+    global GEMINI_TEMPERATURE, GEMINI_TEMPERATURE_STR
+    default_model = GEMINI_DEFAULT_MODEL  # fallback: env GEMINI_MODEL
     default_reasoning = False
     default_html_export = True  # По умолчанию используем HTML
-    
+
     if not os.path.exists(filename):
         # Не выводим предупреждение, если модель уже задана в private.txt
         if not GEMINI_DEFAULT_MODEL:
             print(f"⚠️  Файл {filename} не найден и GEMINI_MODEL не задан в private.txt")
         return default_model, default_reasoning, default_html_export
-    
+
     try:
         with open(filename, 'r', encoding='utf-8') as f:
             content = f.read()
-        
-        model = default_model
+
+        model = None
         use_reasoning = default_reasoning
         use_html_export = default_html_export
-        
+        file_effort = None
+        file_chunk = None
+        file_temp = None
+
         for line in content.split('\n'):
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
-            
+
             if '=' in line:
                 key, value = line.split('=', 1)
                 key = key.strip().upper()
-                value = value.strip()
-                
-                if key == 'MODEL':
-                    model = value
+                # Strip trailing " # comment" (dotenv-style, same as push script).
+                value = value.split('#', 1)[0].strip()
+
+                if key in ('MODEL', 'GEMINI_MODEL'):
+                    if value:
+                        model = value
+                elif key in ('TEMPERATURE', 'GEMINI_TEMPERATURE'):
+                    if value:
+                        file_temp = value
+                elif key in ('REASONING_EFFORT', 'GEMINI_REASONING_EFFORT'):
+                    if value:
+                        file_effort = value.strip().lower()
+                elif key in ('CHUNK_MAX_CHARS', 'GEMINI_CHUNK_MAX_CHARS'):
+                    if value:
+                        file_chunk = value.strip()
                 elif key == 'USE_REASONING':
                     use_reasoning = value.lower() in ('true', 'yes', '1', 'on')
                 elif key == 'USE_HTML_EXPORT':
                     use_html_export = value.lower() in ('true', 'yes', '1', 'on')
-        
-        # Если модель задана в private.txt, она имеет приоритет
-        if GEMINI_DEFAULT_MODEL:
-            model = GEMINI_DEFAULT_MODEL
-        
-        return model, use_reasoning, use_html_export
+
+        # File wins over env when set; otherwise env stays.
+        if model:
+            default_model = model
+            GEMINI_DEFAULT_MODEL = model
+        if file_effort:
+            GEMINI_REASONING_EFFORT = file_effort
+            if file_effort in ALLOWED_REASONING_EFFORTS or file_effort == 'none':
+                use_reasoning = (file_effort != 'none')
+        if file_chunk:
+            GEMINI_CHUNK_MAX_CHARS = file_chunk
+        if file_temp is not None:
+            GEMINI_TEMPERATURE_STR = file_temp
+            try:
+                GEMINI_TEMPERATURE = float(file_temp)
+            except ValueError:
+                print(
+                    f"⚠️  Неверное значение TEMPERATURE={file_temp} in {filename}. "
+                    f"Использую значение по умолчанию для модели."
+                )
+
+        return default_model, use_reasoning, use_html_export
     except Exception as e:
         print(f"❌ Ошибка при чтении {filename}: {e}")
         return default_model, default_reasoning, default_html_export
 
 
+def refresh_model_config():
+    """Re-read MODEL_CONFIG.txt into runtime globals (best-effort).
+
+    Used by run_once leader loop after fetching fresh file from origin/main,
+    and by /reload_config. Returns (model, reasoning, html).
+    """
+    global CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT
+    CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT = load_model_config(MODEL_CONFIG_FILE)
+    return CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT
+
+
 def save_model_config(filename, model, use_reasoning, use_html_export=True):
     """
-    Сохраняет конфигурацию модели в файл
-    
+    Сохраняет конфигурацию модели в файл, preserving TEMPERATURE /
+    REASONING_EFFORT / CHUNK_MAX_CHARS lines (read-modify-write).
+
     Args:
         filename: Путь к файлу
         model: Название модели
@@ -964,18 +1034,35 @@ def save_model_config(filename, model, use_reasoning, use_html_export=True):
         use_html_export: Использовать ли HTML вместо Telegraph
     """
     try:
+        existing = []
+        if os.path.exists(filename):
+            with open(filename, 'r', encoding='utf-8') as f:
+                existing = f.read().splitlines()
+        # Preserve existing key style (GEMINI_MODEL vs MODEL), keep the rest.
+        model_key = 'GEMINI_MODEL'
+        for line in existing:
+            s = line.strip()
+            if not s or s.startswith('#') or '=' not in s:
+                continue
+            k = s.split('=', 1)[0].strip().upper()
+            if k in ('MODEL', 'GEMINI_MODEL'):
+                model_key = k
+                break
+        kept = []
+        for line in existing:
+            s = line.strip()
+            if not s or s.startswith('#') or '=' not in s:
+                kept.append(line)
+                continue
+            k = s.split('=', 1)[0].strip().upper()
+            if k in ('MODEL', 'GEMINI_MODEL'):
+                continue
+            kept.append(line)
+        if kept and kept[-1].strip() != '':
+            kept.append('')
+        kept.append(f"{model_key}={model}")
         with open(filename, 'w', encoding='utf-8') as f:
-            f.write("# Конфигурация модели Google Gemini (Google AI Studio)\n")
-            f.write("# Автоматически обновлено ботом\n\n")
-            f.write(f"# Модель указывается строкой (например, {GEMINI_DEFAULT_MODEL})\n")
-            f.write("# Полный список моделей смотрите в Google AI Studio\n\n")
-            f.write(f"MODEL={model}\n\n")
-            f.write("# Использовать ли режим reasoning (может игнорироваться моделью)\n")
-            f.write(f"USE_REASONING={'true' if use_reasoning else 'false'}\n\n")
-            f.write("# Использовать HTML файлы вместо Telegraph\n")
-            f.write("# true - создавать локальные HTML файлы и отправлять в Telegram\n")
-            f.write("# false - публиковать на Telegraph (требует интернет-соединение)\n")
-            f.write(f"USE_HTML_EXPORT={'true' if use_html_export else 'false'}\n")
+            f.write('\n'.join(kept) + '\n')
         return True
     except Exception as e:
         print(f"❌ Ошибка при сохранении {filename}: {e}")
@@ -987,8 +1074,6 @@ EXCLUDED_USERS = load_users_from_file(EXCLUDED_USERS_FILE)
 PRIORITY_USERS = load_users_from_file(PRIORITY_USERS_FILE)
 ANALYSIS_PROMPT = load_prompt_from_file(PROMPT_FILE)
 CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT = load_model_config(MODEL_CONFIG_FILE)
-if GEMINI_DEFAULT_MODEL:
-    CURRENT_MODEL = GEMINI_DEFAULT_MODEL
 
 # Инициализация клиентов
 def build_session():
@@ -4513,28 +4598,28 @@ async def handle_show_model_command(event):
 async def handle_set_model_command(event):
     """Устанавливает модель для анализа"""
     global CURRENT_MODEL, GEMINI_DEFAULT_MODEL
-    
+
     chat = await event.get_chat()
     chat_name = chat.title if hasattr(chat, 'title') else "Private"
     model = event.pattern_match.group(1).strip()
     print(f"\n📥 Команда: /set_model {model} | Чат: {chat_name}")
-    
+
     # Валидируем название модели
     if not model:
         text = f"⚠️ Не указано название модели.\n\nПример: `/set_model {GEMINI_DEFAULT_MODEL}`"
     else:
         async with config_lock:
-            old_model = GEMINI_DEFAULT_MODEL or CURRENT_MODEL
-            
-            if update_env_value('private.txt', 'GEMINI_MODEL', model):
+            old_model = CURRENT_MODEL
+
+            if save_model_config(MODEL_CONFIG_FILE, model, USE_REASONING, USE_HTML_EXPORT):
                 GEMINI_DEFAULT_MODEL = model
                 CURRENT_MODEL = model
                 text = f"✅ Модель изменена: **{old_model}** → **{model}**\n\n"
                 text += "Изменения вступят в силу для следующего анализа.\n"
-                text += "Модель сохранена в `private.txt` (GEMINI_MODEL).\n"
+                text += f"Модель сохранена в `{MODEL_CONFIG_FILE}` (MODEL).\n"
                 text += "Используйте `/show_model` для просмотра деталей."
             else:
-                text = "❌ Ошибка при сохранении модели в private.txt"
+                text = f"❌ Ошибка при сохранении модели в {MODEL_CONFIG_FILE}"
     
     await event.delete()
     topic_id = await get_or_create_topic(chat_name)
@@ -4552,9 +4637,15 @@ async def handle_reload_config_command(event):
     
     async with config_lock:
         load_dotenv('private.txt', override=True)
+        # Env is fallback only; MODEL_CONFIG.txt wins when set.
         GEMINI_DEFAULT_MODEL = os.getenv('GEMINI_MODEL', '').strip()
         GEMINI_REASONING_EFFORT = os.getenv('GEMINI_REASONING_EFFORT', '').strip().lower()
         GEMINI_CHUNK_MAX_CHARS = os.getenv('GEMINI_CHUNK_MAX_CHARS', '').strip()
+        GEMINI_TEMPERATURE_STR = os.getenv('GEMINI_TEMPERATURE', '0').strip()
+        try:
+            GEMINI_TEMPERATURE = float(GEMINI_TEMPERATURE_STR)
+        except ValueError:
+            GEMINI_TEMPERATURE = 0.0
         GOOGLE_API_KEYS = load_google_api_keys()
         google_analysis_counter = 0
         if GOOGLE_API_KEYS:
@@ -4563,8 +4654,6 @@ async def handle_reload_config_command(event):
         PRIORITY_USERS = load_users_from_file(PRIORITY_USERS_FILE)
         ANALYSIS_PROMPT = load_prompt_from_file(PROMPT_FILE)
         CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT = load_model_config(MODEL_CONFIG_FILE)
-        if GEMINI_DEFAULT_MODEL:
-            CURRENT_MODEL = GEMINI_DEFAULT_MODEL
     
     reload_schedule()
     text = f"""

@@ -13,8 +13,7 @@ GOOGLE_API_KEY3=AIzaSy...
 # Ключей может быть сколько угодно (GOOGLE_API_KEY4, KEY5, ... KEY25):
 # push_github_secrets.sh заберёт все, бот ротирует их по кругу.
 
-# Google Gemini
-GEMINI_MODEL=gemini-3.6-flash
-GEMINI_TEMPERATURE=0           # 0 = детерминированный (рекомендуется), 0.3 = вариативный
-GEMINI_REASONING_EFFORT=medium     # none low medium high (none — детерминизм, medium — глубже анализ но нестабилен)
-GEMINI_CHUNK_MAX_CHARS=300000     # это ~155 тыс. токенов входа + ответ, итого ~165–175 тыс. на вызов
+# Model settings live in MODEL_CONFIG.txt (MODEL, TEMPERATURE,
+# REASONING_EFFORT, CHUNK_MAX_CHARS) — tracked in git, one push updates
+# both VPS and Actions modes, no Secrets/Variables change needed.
+

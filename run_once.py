@@ -770,6 +770,24 @@ def _verify_push(path, local):
     return False
 
 
+def _fetch_file_from_main(path):
+    """Fetch single tracked file text from origin/main (best-effort)."""
+    import subprocess
+    try:
+        f = subprocess.run(['git', 'fetch', '--quiet', '--depth=1', 'origin', 'main'],
+                           capture_output=True, text=True, timeout=60)
+        if f.returncode != 0:
+            return None
+        s = subprocess.run(['git', 'show', f'origin/main:{path}'],
+                           capture_output=True, text=True, timeout=30)
+        if s.returncode != 0 or not s.stdout.strip():
+            return None
+        text = s.stdout if s.stdout.endswith('\n') else s.stdout + '\n'
+        return text
+    except Exception:
+        return None
+
+
 def refresh_schedule_best_effort(main):
     """Обновить локальный SCHEDULE.txt из origin/main.
 
@@ -778,22 +796,50 @@ def refresh_schedule_best_effort(main):
     (_sched_add/_sched_unsch пушат сразу либо откатывают), так что
     перезапись безопасна. Возвращает True/False.
     """
-    import subprocess
+    text = _fetch_file_from_main('SCHEDULE.txt')
+    if text is None:
+        return False
     try:
-        f = subprocess.run(['git', 'fetch', '--quiet', '--depth=1', 'origin', 'main'],
-                           capture_output=True, text=True, timeout=60)
-        if f.returncode != 0:
-            return False
-        s = subprocess.run(['git', 'show', 'origin/main:SCHEDULE.txt'],
-                           capture_output=True, text=True, timeout=30)
-        if s.returncode != 0 or not s.stdout.strip():
-            return False
-        text = s.stdout if s.stdout.endswith('\n') else s.stdout + '\n'
         with open(main.SCHEDULE_FILE, 'w', encoding='utf-8') as fh:
             fh.write(text)
         return True
     except Exception:
         return False
+
+
+def refresh_model_config_best_effort(main):
+    """Обновить локальный MODEL_CONFIG.txt из origin/main + перечитать.
+
+    Один push в main меняет настройки модели без смены Secrets/Variables
+    и без перезапуска дежурства: следующий цикл лидера уже работает
+    с новыми значениями. Возвращает True/False.
+    """
+    text = _fetch_file_from_main('MODEL_CONFIG.txt')
+    if text is None:
+        return False
+    try:
+        with open(main.MODEL_CONFIG_FILE, 'w', encoding='utf-8') as fh:
+            fh.write(text)
+    except Exception:
+        return False
+    try:
+        refresh = getattr(main, 'refresh_model_config', None)
+        if callable(refresh):
+            refresh()
+        else:
+            main.CURRENT_MODEL, main.USE_REASONING, main.USE_HTML_EXPORT = \
+                main.load_model_config(main.MODEL_CONFIG_FILE)
+        return True
+    except Exception as e:
+        print(f"⚠️ Не удалось перечитать MODEL_CONFIG.txt: {e}")
+        return False
+
+
+def refresh_runtime_files_best_effort(main):
+    """Refresh SCHEDULE.txt + MODEL_CONFIG.txt together (one fetch each)."""
+    ok_sched = refresh_schedule_best_effort(main)
+    ok_model = refresh_model_config_best_effort(main)
+    return ok_sched and ok_model
 
 
 def git_push_schedule(message):
@@ -1891,7 +1937,7 @@ async def _leader_startup(main, args, state, path, me, poll):
     except Exception as e:
         print(f"⚠️ Не удалось перечитать state: {e}")
     restore_key_cursor(main, state)
-    refresh_schedule_best_effort(main)
+    refresh_runtime_files_best_effort(main)
     print(f"👑 Дежурство заявлено, пауза {poll}с перед проверкой флага...")
     await asyncio.sleep(poll)
     remote, _ = leader_read()
@@ -1973,7 +2019,7 @@ async def _run_leader_loop(main, args, state, path, me, poll, use_handoff,
                     print(f"👑 Обнаружен более новый лидер {remote.get('run_id')} — выхожу.")
                     break
                 if iteration % sched_every == 0:
-                    refresh_schedule_best_effort(main)
+                    refresh_runtime_files_best_effort(main)
             # Inbox всегда первый: команды не ждут догона расписания.
             try:
                 last_seen, inbox_failed = await poll_inbox_once(main, last_seen, inbox_mem)
