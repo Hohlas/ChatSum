@@ -24,7 +24,7 @@ Group messages discussing the same subject/question/event based on:
 Each resulting topic must have a subject summarizable in 3-5 words.
 
 Minimum cluster requirements:
-- substantive messages from at least 2 different participants, OR
+- messages from at least 2 different participants, OR
 - a single author with substantial argumentation (2+ substantive sentences) or external links
 
 Granularity: one topic = one question/entity/event; split an adjacent question into a separate cluster only if it discusses a different subject (a topic may conclude with no consensus).
@@ -37,7 +37,7 @@ Step 2: Formulate key idea.
 For each topic, write 1-2 sentence summary reflecting dominant opinion, consensus, or main conclusion (note disagreements if no consensus).
 
 Step 3: Select quotes and key arguments.
-- LIMIT: maximum 5 participants and maximum 2 quotes per participant within one topic.
+- LIMIT: Include quotes from maximum 5 participants per topic, maximum 2 quotes per participant.
 - Prioritize messages that:
   1) are from {PRIORITY_USERS} (key contributors, match by field "s")
   2) contain external URLs
