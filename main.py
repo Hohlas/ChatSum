@@ -2525,12 +2525,17 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         traceback.print_exc()
         
         return error_msg, None
-def enrich_summary_with_timestamps(summary_text, messages_data):
+def enrich_summary_with_timestamps(summary_text, messages_data, period_start_date=None):
     msg_date_map = {}
     for msg in messages_data:
         mid = msg.get('message_id')
         if mid is not None:
-            msg_date_map[mid] = msg.get('date', '')
+            d = msg.get('date', '')
+            # Родительские сообщения, догруженные для контекста, старше окна
+            # анализа — их даты не должны задавать метку темы и общий диапазон.
+            if period_start_date and d and d < period_start_date:
+                continue
+            msg_date_map[mid] = d
 
     if not msg_date_map:
         return summary_text
@@ -2544,14 +2549,18 @@ def enrich_summary_with_timestamps(summary_text, messages_data):
     for block in parts[1:]:
         block = '💡' + block
 
-        link_match = re.search(r'https://t\.me/c/\d+/(\d+)', block)
-        if not link_match:
-            enriched.append(block)
-            continue
-
-        message_id = int(link_match.group(1))
-        date_str = msg_date_map.get(message_id, '')
-        if not date_str:
+        # Первая ссылка темы может вести на старое родительское сообщение
+        # (контекст вне окна) — берём первую ссылку с датой внутри окна.
+        link_ids = re.findall(r'https://t\.me/c/\d+/(\d+)', block)
+        message_id = None
+        date_str = ''
+        for lid in link_ids:
+            cand = msg_date_map.get(int(lid), '')
+            if cand:
+                message_id = int(lid)
+                date_str = cand
+                break
+        if message_id is None:
             enriched.append(block)
             continue
 
@@ -2565,6 +2574,10 @@ def enrich_summary_with_timestamps(summary_text, messages_data):
 
         timestamp_line = f'\n- *{formatted_date}* -\n'
 
+        link_match = re.search(r'https://t\.me/c/\d+/(\d+)', block)
+        if not link_match:
+            enriched.append(block)
+            continue
         link_pos = link_match.start()
         newline_before_link = block.rfind('\n', 0, link_pos)
         if newline_before_link == -1:
@@ -3557,7 +3570,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                 )
                 return False
             
-            summary = enrich_summary_with_timestamps(summary, optimized_messages)
+            summary = enrich_summary_with_timestamps(summary, optimized_messages, period_start_date)
             
             analysis_filename = save_analysis(optimized_messages, summary)
             
