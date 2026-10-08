@@ -306,11 +306,22 @@ NOISE_PATTERNS = [
 # Базовая конфигурация разбиения на чанки (по символам)
 # Используется как fallback для моделей без специальных настроек.
 DEFAULT_CHUNK_MAX_CHARS = 60000
-# 5%: границы чанков не рвут связный разговор (ответ через десятки сообщений
-# остаётся в обоих чанках). ~50 сообщений при чанке 100 тыс. символов.
-DEFAULT_CHUNK_OVERLAP_RATIO = 0.05
+# Перехлёст задаётся в абсолютных символах, а не долей от лимита: объём
+# контекста, нужный чтобы не разорвать связный разговор на границе, не
+# зависит от размера чанка. ~3000 символов ≈ десятки коротких сообщений.
+DEFAULT_CHUNK_OVERLAP_CHARS = 3000
+# Потолок: перехлёст не должен занимать больше четверти чанка, иначе
+# на маленьких лимитах он съедает полезный объём.
+DEFAULT_CHUNK_OVERLAP_MAX_RATIO = 0.25
 CHUNK_MAX_CHARS = DEFAULT_CHUNK_MAX_CHARS
-CHUNK_OVERLAP_CHARS = int(DEFAULT_CHUNK_MAX_CHARS * DEFAULT_CHUNK_OVERLAP_RATIO)
+
+
+def chunk_overlap_for(max_chars):
+    """Абсолютный перехлёст с относительным потолком от размера чанка."""
+    return min(DEFAULT_CHUNK_OVERLAP_CHARS, int(max_chars * DEFAULT_CHUNK_OVERLAP_MAX_RATIO))
+
+
+CHUNK_OVERLAP_CHARS = chunk_overlap_for(DEFAULT_CHUNK_MAX_CHARS)
 CHUNK_DELAY_SECONDS = 10   # Задержка между запросами к API (для соблюдения RPM лимита)
 
 # Хук маркера прогресса (сессия 12): run_once ставит сюда колбэк, create_summary
@@ -330,7 +341,7 @@ def get_model_generation_config(model_name):
         'output_max_tokens': 10000,
         'reasoning_effort': None,
         'chunk_max_chars': DEFAULT_CHUNK_MAX_CHARS,
-        'chunk_overlap_chars': int(DEFAULT_CHUNK_MAX_CHARS * DEFAULT_CHUNK_OVERLAP_RATIO),
+        'chunk_overlap_chars': chunk_overlap_for(DEFAULT_CHUNK_MAX_CHARS),
     }
 
     if model_name in ('gemini-1.5-flash', 'gemini-1.5-flash-latest'):
@@ -345,14 +356,14 @@ def get_model_generation_config(model_name):
             'output_max_tokens': 65536,
             'chunk_max_chars': 100000,
         })
-        config['chunk_overlap_chars'] = int(config['chunk_max_chars'] * DEFAULT_CHUNK_OVERLAP_RATIO)
+        config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])
     elif model_name == 'gemini-2.5-flash':
         config.update({
             'context_limit_tokens': 1048576,
             'output_max_tokens': 65536,
             'chunk_max_chars': 60000,
         })
-        config['chunk_overlap_chars'] = int(config['chunk_max_chars'] * DEFAULT_CHUNK_OVERLAP_RATIO)
+        config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])
 
     if GEMINI_REASONING_EFFORT == 'none':
         pass  # явно отключено, оставляем None
@@ -371,7 +382,7 @@ def get_model_generation_config(model_name):
             if chunk_max_chars <= 0:
                 raise ValueError
             config['chunk_max_chars'] = chunk_max_chars
-            config['chunk_overlap_chars'] = int(chunk_max_chars * DEFAULT_CHUNK_OVERLAP_RATIO)
+            config['chunk_overlap_chars'] = chunk_overlap_for(chunk_max_chars)
         except ValueError:
             print(
                 f"⚠️  Неверное значение GEMINI_CHUNK_MAX_CHARS: {GEMINI_CHUNK_MAX_CHARS}. "
@@ -1821,6 +1832,69 @@ def estimate_message_json_size(message):
     return base_size + id_size + sender_size + text_size + reply_size
 
 
+def estimate_messages_size(messages):
+    """Суммарная оценка размера списка сообщений в символах."""
+    return sum(estimate_message_json_size(m) for m in messages)
+
+
+def take_overlap_tail(messages, overlap_chars):
+    """Хвост сообщений (в исходном порядке), покрывающий >= overlap_chars."""
+    picked = []
+    size = 0
+    for msg in reversed(messages):
+        picked.append(msg)
+        size += estimate_message_json_size(msg)
+        if size >= overlap_chars:
+            break
+    picked.reverse()
+    return picked
+
+
+def rebalance_last_two_chunks(chunks, messages_data, max_chars, overlap_chars):
+    """Выравнивает последние два чанка, если последний слишком мал.
+
+    Первые чанки не трогаются. Если последний чанк занимает меньше
+    половины лимита, последние два чанка пересобираются из общего хвоста
+    сообщений примерно поровну (с сохранением перехлёста). Возвращает
+    исходный список, если выравнивание неприменимо или нарушает max_chars.
+    """
+    if len(chunks) < 2:
+        return chunks
+    if estimate_messages_size(chunks[-1][0]) >= max_chars // 2:
+        return chunks
+
+    tail_start = chunks[-2][1] - 1  # 0-based начало предпоследнего чанка
+    tail = messages_data[tail_start:]
+    if len(tail) < 2:
+        return chunks
+
+    total = estimate_messages_size(tail)
+    target = (total + overlap_chars) // 2
+
+    first = []
+    acc = 0
+    for msg in tail:
+        if first and acc >= target:
+            break
+        first.append(msg)
+        acc += estimate_message_json_size(msg)
+
+    boundary = len(first)
+    if boundary >= len(tail):
+        return chunks
+
+    overlap_msgs = take_overlap_tail(first, overlap_chars)
+    second = overlap_msgs + tail[boundary:]
+
+    if estimate_messages_size(first) > max_chars or estimate_messages_size(second) > max_chars:
+        return chunks
+
+    second_start = tail_start + boundary - len(overlap_msgs)
+    new_first = (first, tail_start + 1, tail_start + boundary)
+    new_second = (second, second_start + 1, len(messages_data))
+    return chunks[:-2] + [new_first, new_second]
+
+
 def split_messages_by_chars(messages_data, max_chars=CHUNK_MAX_CHARS, overlap_chars=CHUNK_OVERLAP_CHARS):
     """
     Разбивает список сообщений на чанки по количеству символов с перехлестом.
@@ -1887,8 +1961,9 @@ def split_messages_by_chars(messages_data, max_chars=CHUNK_MAX_CHARS, overlap_ch
     # Добавляем последний чанк
     if current_chunk:
         chunks.append((current_chunk, chunk_start_index + 1, len(messages_data)))
-    
-    return chunks
+
+    # Последний чанк не должен быть огрызком: выравниваем последние два.
+    return rebalance_last_two_chunks(chunks, messages_data, max_chars, overlap_chars)
 
 
 def estimate_chunk_request_chars(chunk_messages):
@@ -2084,6 +2159,51 @@ def split_summary_into_parts(summary_text):
         parts.append((part_title, content, start_idx, end_idx))
     
     return parts
+
+
+def dedupe_topics_across_chunks(chunk_summaries):
+    """Removes duplicate topics that appear because adjacent chunks overlap.
+
+    One control per adjacent pair of chunks (chunks - 1 checks in total),
+    at most one duplicate removed per pair. A topic is a duplicate if its
+    non-empty set of citation ids is a subset of the previous chunk's
+    accepted ids; the later copy is dropped, the earlier one is kept.
+
+    Args:
+        chunk_summaries: list of (start_idx, end_idx, text, is_error)
+
+    Returns:
+        New list with duplicated topic blocks removed from later chunks.
+    """
+    if len(chunk_summaries) < 2:
+        return chunk_summaries
+
+    def _citation_ids(block):
+        return {int(x) for x in re.findall(r'https://t\.me/c/\d+/(\d+)', block)}
+
+    result = []
+    prev_ids = set()
+    for pos, (start_idx, end_idx, text, is_error) in enumerate(chunk_summaries):
+        if is_error:
+            result.append((start_idx, end_idx, text, is_error))
+            prev_ids = set()
+            continue
+
+        kept = []
+        removed = False
+        for block in text.split('\n---\n'):
+            ids = _citation_ids(block)
+            if pos > 0 and not removed and ids and ids <= prev_ids:
+                removed = True
+                continue
+            kept.append(block)
+
+        result.append((start_idx, end_idx, '\n---\n'.join(kept), is_error))
+        prev_ids = set()
+        for block in kept:
+            prev_ids |= _citation_ids(block)
+
+    return result
 
 
 async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, period_start_date=None):
@@ -2350,6 +2470,10 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         if errors_count > 0:
             print(f"   ⚠️  Ошибок при обработке: {errors_count}")
         
+        # Дедупликация тем, задвоенных перехлёстом соседних чанков
+        # (один контроль на пару чанков, не более одного удаления на пару).
+        chunk_summaries = dedupe_topics_across_chunks(chunk_summaries)
+
         # Формируем объединенный текст
         combined_parts = []
         combined_parts.append(f"📊 Обработано {total_messages} сообщений в {num_chunks} частях")

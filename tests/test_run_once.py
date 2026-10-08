@@ -140,6 +140,8 @@ def main():
     test_heartbeat_loop()
     test_due_cap()
     test_telegraph_toc()
+    test_dedupe_topics()
+    test_chunk_rebalance()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")
@@ -1653,6 +1655,98 @@ def test_telegraph_toc():
     dup = bot.build_toc_html(['Повтор', 'Повтор'])
     check('toc: дубли — одинаковый href (прыжок на первое вхождение)',
           dup.count('href="#💡-Повтор"') == 2, dup)
+
+
+def test_dedupe_topics():
+    def blk(name, *ids):
+        cites = '\n'.join(f'[{name}](https://t.me/c/1/{i}): суть' for i in ids)
+        return f'💡 **{name}**\n*Идея.*\n\n{cites}'
+
+    d = bot.dedupe_topics_across_chunks
+
+    one = [(1, 10, blk('A', 1) + '\n---\n' + blk('B', 2), False)]
+    check('dedupe: один чанк — без изменений', d(one) == one, d(one))
+
+    c1 = (1, 10, blk('A', 1) + '\n---\n' + blk('B', 2), False)
+    c2 = (8, 20, blk('A2', 1) + '\n---\n' + blk('C', 3), False)
+    out = d([c1, c2])
+    check('dedupe: дубль с подмножеством id удалён',
+          'A2' not in out[1][2] and 'C' in out[1][2], out[1][2])
+    check('dedupe: первая (ранняя) тема сохранена',
+          'B' in out[0][2] and 'A' in out[0][2], out[0][2])
+
+    # надмножество — не дубль, сохраняем
+    c3 = (8, 20, blk('A2', 1, 9) + '\n---\n' + blk('C', 3), False)
+    out3 = d([c1, c3])
+    check('dedupe: надмножество id сохранено', 'A2' in out3[1][2], out3[1][2])
+
+    # не более одного удаления на пару чанков
+    c4 = (8, 20,
+          blk('D1', 1) + '\n---\n' + blk('D2', 2) + '\n---\n' + blk('E', 3), False)
+    out4 = d([c1, c4])
+    check('dedupe: не более одного удаления на пару чанков',
+          'D1' not in out4[1][2] and 'D2' in out4[1][2] and 'E' in out4[1][2],
+          out4[1][2])
+
+    # три чанка: по одному контролю на каждую пару (2 удаления на 3 чанка)
+    t1 = (1, 10, blk('A', 1), False)
+    t2 = (8, 20, blk('dup1', 1) + '\n---\n' + blk('B', 2), False)
+    t3 = (18, 30, blk('dup2', 2) + '\n---\n' + blk('C', 3), False)
+    out5 = d([t1, t2, t3])
+    check('dedupe: 3 чанка — по одному контролю на пару',
+          'dup1' not in out5[1][2] and 'dup2' not in out5[2][2]
+          and 'B' in out5[1][2] and 'C' in out5[2][2], out5)
+
+    # тема без ссылок сохраняется (дедуп невозможен)
+    c5 = (8, 20, '💡 **Без ссылок**\n*Идея.*', False)
+    out6 = d([c1, c5])
+    check('dedupe: блок без ссылок сохранён', 'Без ссылок' in out6[1][2], out6[1][2])
+
+    # ошибочная часть не трогается
+    err = (8, 20, '⚠️ Чанк пропущен', True)
+    out7 = d([c1, err])
+    check('dedupe: ошибочный чанк не тронут', out7[1] == err, out7[1])
+
+
+def test_chunk_rebalance():
+    def m(mid, text_len):
+        return {'message_id': mid, 'text': 'x' * text_len}
+
+    check('overlap: абсолютный дефолт (60k -> 3000)',
+          bot.chunk_overlap_for(60000) == 3000, bot.chunk_overlap_for(60000))
+    check('overlap: не растёт с размером чанка',
+          bot.chunk_overlap_for(100000) == 3000, bot.chunk_overlap_for(100000))
+    check('overlap: потолок 1/4 на малых лимитах',
+          bot.chunk_overlap_for(8000) == 2000, bot.chunk_overlap_for(8000))
+    check('overlap: CHUNK_OVERLAP_CHARS абсолютный',
+          bot.CHUNK_OVERLAP_CHARS == 3000, bot.CHUNK_OVERLAP_CHARS)
+
+    # 9 сообщений по 100 символов + одно на 151 => жадная нарезка даёт
+    # чанки 900 и 251 символа; последний меньше половины лимита.
+    msgs = [m(i, 68) for i in range(1, 10)] + [m(10, 113)]
+    chunks = bot.split_messages_by_chars(msgs, max_chars=1000, overlap_chars=100)
+    check('rebalance: число чанков сохранено', len(chunks) == 2, len(chunks))
+    last_size = bot.estimate_messages_size(chunks[1][0])
+    first_size = bot.estimate_messages_size(chunks[0][0])
+    check('rebalance: последний чанк больше не огрызок', last_size >= 500, last_size)
+    check('rebalance: два чанка примерно равны', abs(first_size - last_size) <= 60,
+          (first_size, last_size))
+    check('rebalance: границы пересчитаны',
+          (chunks[0][1], chunks[0][2], chunks[1][1], chunks[1][2]) == (1, 6, 6, 10),
+          (chunks[0][1:], chunks[1][1:]))
+    check('rebalance: перехлёст между чанками сохранён',
+          chunks[1][0][0]['message_id'] == msgs[5]['message_id'],
+          chunks[1][0][0].get('message_id'))
+
+    # достаточно полный последний чанк не трогаем
+    ch_full = [
+        ([m(1, 68), m(2, 68)], 1, 3),
+        ([m(5, 68), m(6, 68), m(7, 68), m(8, 68), m(9, 68), m(10, 113)], 3, 9),
+    ]
+    check('rebalance: полный последний чанк не тронут',
+          bot.rebalance_last_two_chunks(ch_full, msgs, 1000, 100) is ch_full)
+    check('rebalance: один чанк не трогается',
+          bot.rebalance_last_two_chunks([(msgs, 1, 10)], msgs, 1000, 100)[0][0] is msgs)
 
 
 def _now_utc():
