@@ -3365,16 +3365,16 @@ async def send_summary_message(telegram_client, text, topic_id, post_to_source=F
 
 
 def model_display_label(model=None, effort=None):
-    """'model effort' для подписи в TG; effort добавляется только для reasoning.
+    """'model effort' для подписи в TG; пусто → показываем только модель.
 
-    effort='none'/пусто → показываем только модель. model=None → берём текущий
-    GEMINI_DEFAULT_MODEL, effort=None → текущий GEMINI_REASONING_EFFORT. Чистая.
+    effort=None → текущий GEMINI_REASONING_EFFORT. 'none' показываем явно,
+    чтобы выбор владельца был виден в шапке. Чистая.
     """
     name = (model if model is not None else GEMINI_DEFAULT_MODEL) or ''
     name = str(name).strip()
     eff = (effort if effort is not None else GEMINI_REASONING_EFFORT) or ''
     eff = str(eff).strip().lower()
-    if eff and eff != 'none':
+    if eff:
         return f"{name} {eff}".strip()
     return name
 

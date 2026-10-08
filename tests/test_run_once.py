@@ -1140,12 +1140,12 @@ def test_server_overload_diag():
 
 
 def test_model_display_label():
-    """Подпись модели: effort добавляется только для reasoning (не none/пусто)."""
+    """Подпись модели: effort показывается всегда, если задан (включая none)."""
     check('подпись: модель + effort',
           bot.model_display_label('gemini-3.8-flash', 'medium') == 'gemini-3.8-flash medium',
           bot.model_display_label('gemini-3.8-flash', 'medium'))
-    check('подпись: effort none → только модель',
-          bot.model_display_label('gemini-3.8-flash', 'none') == 'gemini-3.8-flash',
+    check('подпись: effort none → показывается явно',
+          bot.model_display_label('gemini-3.8-flash', 'none') == 'gemini-3.8-flash none',
           bot.model_display_label('gemini-3.8-flash', 'none'))
     check('подпись: effort пусто → только модель',
           bot.model_display_label('gemini-3.8-flash', '') == 'gemini-3.8-flash',
