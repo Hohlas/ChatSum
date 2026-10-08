@@ -1715,6 +1715,18 @@ def plural_messages(n):
     return "сообщений"
 
 
+def plural_stages(n):
+    """Правильная форма слова 'этап' для числа n: 1 этап, 2 этапа, 5 этапов."""
+    if 11 <= n % 100 <= 19:
+        return "этапов"
+    last_digit = n % 10
+    if last_digit == 1:
+        return "этап"
+    if 2 <= last_digit <= 4:
+        return "этапа"
+    return "этапов"
+
+
 def format_period_text(period_hours):
     """Форматирует длительность периода с правильными склонениями."""
     if period_hours is None:
@@ -2788,9 +2800,16 @@ def fix_html_nesting(html_content):
             elif open_tags and open_tags[-1] == tag_name:
                 open_tags.pop()
                 result_parts.append(match.group(0))  # Оставляем тег как есть
+            elif tag_name in open_tags:
+                # Несовпадение порядка (напр. <a>...<i></a>): закрываем
+                # висящие внутренние теги на месте, чтобы поломка осталась
+                # локальной и не глотала весь документ до конца.
+                while open_tags and open_tags[-1] != tag_name:
+                    result_parts.append(f'</{open_tags.pop()}>')
+                open_tags.pop()
+                result_parts.append(match.group(0))
             else:
-                # Неправильное закрытие - либо пропускаем, либо пытаемся исправить
-                # Простейший подход: пропускаем этот неправильный закрывающий тег
+                # Закрытие без открытия — выкидываем stray-тег
                 pass
         else:  # Открывающий тег
             result_parts.append(match.group(0))  # Оставляем тег как есть
@@ -2958,6 +2977,43 @@ def build_toc_html(titles):
     return ''.join(parts)
 
 
+# Плейсхолдеры ссылок: [текст](url) вырезаются ДО обработки **жирного** и
+# *курсива*, иначе * внутри текста ссылки (ник со звездой, пометка модели)
+# спаривается с * в другой строке абзаца — курсив рвёт скобки ссылки и
+# получается кривая вложенность <a>...<i></a>, глотающая весь документ
+# (инцидент 08.10: часть 2, блок Ketkes, ник «Head (Mr.D)*»).
+_LINK_PH_OPEN = '\ue000'
+_LINK_PH_CLOSE = '\ue001'
+
+
+def _protect_links(text):
+    """Вырезает Markdown-ссылки в плейсхолдеры. Возвращает (текст, ссылки)."""
+    links = []
+
+    def _repl(match):
+        links.append((match.group(1), match.group(2)))
+        return f'{_LINK_PH_OPEN}{len(links) - 1}{_LINK_PH_CLOSE}'
+
+    return MD_LINK_RE.sub(_repl, text), links
+
+
+def _restore_links(text, links):
+    """Возвращает ссылки из плейсхолдеров готовыми <a>-тегами."""
+    for idx, (link_text, link_url) in enumerate(links):
+        text = text.replace(
+            f'{_LINK_PH_OPEN}{idx}{_LINK_PH_CLOSE}',
+            f'<a href="{link_url}">{link_text}</a>')
+    return text
+
+
+def _apply_inline_md(text):
+    """Жирный/курсив поверх текста, ссылки при этом неприкосновенны."""
+    text, links = _protect_links(text)
+    text = MD_BOLD_RE.sub(r'<b>\1</b>', text)
+    text = MD_ITALIC_RE.sub(r'<i>\1</i>', text)
+    return _restore_links(text, links)
+
+
 def convert_markdown_to_html(content, for_telegram=False):
     """
     Конвертирует Markdown текст в HTML.
@@ -2992,9 +3048,7 @@ def convert_markdown_to_html(content, for_telegram=False):
             return
         separator = '\n' if for_telegram else '<br>'
         para_text = separator.join(current_paragraph)
-        para_text = MD_BOLD_RE.sub(r'<b>\1</b>', para_text)
-        para_text = MD_ITALIC_RE.sub(r'<i>\1</i>', para_text)
-        para_text = MD_LINK_RE.sub(r'<a href="\2">\1</a>', para_text)
+        para_text = _apply_inline_md(para_text)
         if for_telegram:
             html_paragraphs.append(para_text)
         else:
@@ -3071,9 +3125,7 @@ def convert_markdown_to_html(content, for_telegram=False):
         if line_stripped.startswith('- ') or line_stripped.startswith('* ') or line_stripped.startswith('• '):
             flush_paragraph()
             text = line_stripped.lstrip('- *•').strip()
-            text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-            text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
-            text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<a href="\2">\1</a>', text)
+            text = _apply_inline_md(text)
             if for_telegram:
                 html_paragraphs.append(f'\u2022 {text}\n')
             else:
@@ -3678,14 +3730,14 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                 minutes = wait_time_seconds // 60
                 seconds = wait_time_seconds % 60
                 if minutes > 0:
-                    wait_info = f"\n⏳ Примерное полное время обработки: **{minutes} мин {seconds} сек**"
+                    wait_info = f"\n⏳ Примерное время обработки: **{minutes} мин {seconds} сек**"
                 else:
-                    wait_info = f"\n⏳ Примерное полное время обработки: **{seconds} сек**"
+                    wait_info = f"\n⏳ Примерное время обработки: **{seconds} сек**"
 
             await telegram_client.send_message(
                 RESULTS_DESTINATION,
-                f"⚠️ **Внимание:** Большой объем сообщений ({len(optimized_messages)})\n"
-                f"Обработка будет выполняться в {num_chunks} этапов.{wait_info}\n",
+                f"⚠️ Большой объем сообщений ({len(optimized_messages)})\n"
+                f"Будет выполняться в {num_chunks} {plural_stages(num_chunks)}.{wait_info}\n",
                 reply_to=topic_id
             )
         

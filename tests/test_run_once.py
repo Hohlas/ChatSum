@@ -141,6 +141,7 @@ def main():
     test_heartbeat_loop()
     test_due_cap()
     test_telegraph_toc()
+    test_telegraph_link_stars()
     test_dedupe_topics()
     test_chunk_rebalance()
 
@@ -1673,6 +1674,60 @@ def test_telegraph_toc():
     dup = bot.build_toc_html(['Повтор', 'Повтор'])
     check('toc: дубли — одинаковый href (прыжок на первое вхождение)',
           dup.count('href="#💡-Повтор"') == 2, dup)
+
+
+def test_telegraph_link_stars():
+    # Инцидент 08.10: ник со звездой («Head (Mr.D)*») в цитатах одного
+    # абзаца спаривался через *курсив* и рвал скобки ссылок — незакрытый
+    # <a> глотал весь остаток второй части публикации.
+    md = (
+        '💡 **Токен Ketkes (Киткеш)**\n'
+        '*Идея.*\n'
+        '\n'
+        '[Head (Mr.D)*](https://t.me/c/123/1): раз\n'
+        '[Unknown](https://t.me/c/123/2): два\n'
+        '[Head (Mr.D)](https://t.me/c/123/3): три\n'
+        '[Unknown](https://t.me/c/123/4): четыре\n'
+        '[Head (Mr.D)*](https://t.me/c/123/5): пять\n'
+        '\n'
+        '---\n'
+        '\n'
+        '💡 **Второй топик**\n'
+        '*Идея два.*\n'
+        '\n'
+        '[User](https://t.me/c/123/6): шесть\n'
+    )
+    html = bot.convert_markdown_to_html(md)
+    # 6 цитат + 2 ссылки содержания.
+    check('звёзды: все 8 ссылок закрыты', html.count('</a>') == 8, html)
+    check('звёзды: ники со звездой целы',
+          html.count('Head (Mr.D)*</a>') == 2, html)
+    check('звёзды: без кривой вложенности',
+          '<i></a>' not in html and '</i></a>' not in html, html)
+    check('звёзды: второй топик не проглочен',
+          'шесть' in html
+          and html.index('<h3>💡 <b>Второй топик</b></h3>') > html.index('четыре'),
+          html[:120])
+    tg = bot.convert_markdown_to_html(md, for_telegram=True)
+    check('звёзды: Telegram-ветка — все ссылки закрыты',
+          tg.count('</a>') == 6, tg)
+
+    # Страховка вложенности: разрыв чинится на месте, а не глотает документ.
+    broken = '<p><a href="u1">x<i></a>y</p><p>tail</p>'
+    check('nesting: разрыв закрыт на месте',
+          bot.fix_html_nesting(broken) == '<p><a href="u1">x<i></i></a>y</p><p>tail</p>',
+          bot.fix_html_nesting(broken))
+    check('nesting: stray-закрытие выкинуто',
+          bot.fix_html_nesting('<p>a</i>b</p>') == '<p>ab</p>',
+          bot.fix_html_nesting('<p>a</i>b</p>'))
+
+    check('этапы: 1 этап', bot.plural_stages(1) == 'этап', bot.plural_stages(1))
+    check('этапы: 2 этапа', bot.plural_stages(2) == 'этапа', bot.plural_stages(2))
+    check('этапы: 4 этапа', bot.plural_stages(4) == 'этапа', bot.plural_stages(4))
+    check('этапы: 5 этапов', bot.plural_stages(5) == 'этапов', bot.plural_stages(5))
+    check('этапы: 11 этапов', bot.plural_stages(11) == 'этапов', bot.plural_stages(11))
+    check('этапы: 21 этап', bot.plural_stages(21) == 'этап', bot.plural_stages(21))
+    check('этапы: 22 этапа', bot.plural_stages(22) == 'этапа', bot.plural_stages(22))
 
 
 def test_dedupe_topics():
