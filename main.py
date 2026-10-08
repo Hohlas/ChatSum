@@ -289,7 +289,7 @@ except ValueError:
     print(f"⚠️ Неверное значение GEMINI_TEMPERATURE={GEMINI_TEMPERATURE_STR}, использую 0")
     GEMINI_TEMPERATURE = 0.0
 
-ALLOWED_REASONING_EFFORTS = {'low', 'medium', 'high'}
+ALLOWED_REASONING_EFFORTS = {'none', 'low', 'medium', 'high'}
 
 if not load_google_api_keys():
     print("⚠️  ВНИМАНИЕ: Не найден ни один GOOGLE_API_KEY / GOOGLE_API_KEYN в private.txt!")
@@ -365,16 +365,17 @@ def get_model_generation_config(model_name):
         })
         config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])
 
-    if GEMINI_REASONING_EFFORT == 'none':
-        pass  # явно отключено, оставляем None
-    elif GEMINI_REASONING_EFFORT in ALLOWED_REASONING_EFFORTS:
+    if GEMINI_REASONING_EFFORT in ALLOWED_REASONING_EFFORTS:
+        # 'none' тоже отправляем явно: если параметр не передать, Gemini
+        # берёт уровень по умолчанию (medium) — тогда 'none' = 'medium'.
         config['reasoning_effort'] = GEMINI_REASONING_EFFORT
-    else:
+    elif GEMINI_REASONING_EFFORT:
         print(
             f"⚠️  Неверное значение GEMINI_REASONING_EFFORT: {GEMINI_REASONING_EFFORT}. "
-            f"Допустимые значения: none, {', '.join(sorted(ALLOWED_REASONING_EFFORTS))}. "
+            f"Допустимые значения: {', '.join(sorted(ALLOWED_REASONING_EFFORTS))}. "
             f"Использую значение по умолчанию для модели."
         )
+    # Пусто (не задано) → оставляем None: параметр не шлём, у модели свой дефолт.
 
     if GEMINI_CHUNK_MAX_CHARS:
         try:
@@ -2295,6 +2296,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         total_usage = {
             'prompt_tokens': 0,
             'completion_tokens': 0,
+            'thinking_tokens': 0,
             'total_tokens': 0,
             'errors': []
         }
@@ -2348,9 +2350,9 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                 'max_completion_tokens': output_max_tokens
             }
 
-            if reasoning_effort and reasoning_effort != 'none':
+            if reasoning_effort is not None:
                 request_params['reasoning_effort'] = reasoning_effort
-            
+
             total_chars = len(system_content) + len(user_content)
             print(f"   📊 Размер запроса: {total_chars:,} символов")
             
@@ -2402,12 +2404,19 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                     prompt_tokens = usage.prompt_tokens if hasattr(usage, 'prompt_tokens') else 0
                     completion_tokens = usage.completion_tokens if hasattr(usage, 'completion_tokens') else 0
                     chunk_total = usage.total_tokens if hasattr(usage, 'total_tokens') else 0
-                    
+                    # total_tokens включает мышление, completion_tokens — нет.
+                    thinking_tokens = max(0, chunk_total - prompt_tokens - completion_tokens)
+
                     total_usage['prompt_tokens'] += prompt_tokens
                     total_usage['completion_tokens'] += completion_tokens
+                    total_usage['thinking_tokens'] += thinking_tokens
                     total_usage['total_tokens'] += chunk_total
-                    
-                    print(f"   📊 Токенов в чанке: {chunk_total:,}")
+
+                    print(
+                        f"   📊 Токены чанка {chunk_idx}: промпт {prompt_tokens:,} + "
+                        f"ответ {completion_tokens:,} + мышление {thinking_tokens:,} = "
+                        f"{chunk_total:,}"
+                    )
                 
                 chunk_summaries.append((start_idx, end_idx, chunk_summary, False))
                 
@@ -2466,7 +2475,13 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         # ═══════════════════════════════════════════════════════════════
         # Объединение саммари всех чанков
         # ═══════════════════════════════════════════════════════════════
-        print(f"\n✅ Обработано {num_chunks} чанков, всего токенов: {total_usage['total_tokens']:,}")
+        print(f"\n✅ Обработано {num_chunks} чанков")
+        print(
+            f"   📊 Токены (итог): промпт {total_usage['prompt_tokens']:,} + "
+            f"ответ {total_usage['completion_tokens']:,} + "
+            f"мышление {total_usage['thinking_tokens']:,} = "
+            f"{total_usage['total_tokens']:,}"
+        )
         if errors_count > 0:
             print(f"   ⚠️  Ошибок при обработке: {errors_count}")
         
@@ -2543,9 +2558,9 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
             'max_completion_tokens': output_max_tokens
         }
 
-        if reasoning_effort and reasoning_effort != 'none':
-                request_params['reasoning_effort'] = reasoning_effort
-        
+        if reasoning_effort is not None:
+            request_params['reasoning_effort'] = reasoning_effort
+
         total_chars = len(system_content) + len(user_content)
         print(f"   📊 Размер запроса: {total_chars:,} символов")
         
@@ -2571,14 +2586,20 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         usage_info = None
         if hasattr(response, 'usage'):
             usage = response.usage
+            prompt_tokens = usage.prompt_tokens if hasattr(usage, 'prompt_tokens') else 0
+            completion_tokens = usage.completion_tokens if hasattr(usage, 'completion_tokens') else 0
+            total_tokens = usage.total_tokens if hasattr(usage, 'total_tokens') else 0
             usage_info = {
-                'prompt_tokens': usage.prompt_tokens if hasattr(usage, 'prompt_tokens') else 0,
-                'completion_tokens': usage.completion_tokens if hasattr(usage, 'completion_tokens') else 0,
-                'total_tokens': usage.total_tokens if hasattr(usage, 'total_tokens') else 0
+                'prompt_tokens': prompt_tokens,
+                'completion_tokens': completion_tokens,
+                # total_tokens включает мышление, completion_tokens — нет.
+                'thinking_tokens': max(0, total_tokens - prompt_tokens - completion_tokens),
+                'total_tokens': total_tokens
             }
             print(f"   📊 Использовано токенов:")
             print(f"      Промпт: {usage_info['prompt_tokens']}")
             print(f"      Ответ: {usage_info['completion_tokens']}")
+            print(f"      Мышление: {usage_info['thinking_tokens']}")
             print(f"      Всего: {usage_info['total_tokens']}")
         
         return summary, usage_info

@@ -133,6 +133,7 @@ def main():
     test_server_overload_diag()
     test_api_error_diag()
     test_model_display_label()
+    test_reasoning_effort_config()
     test_flat_rotation()
     test_collect_order_and_parents()
     test_handoff()
@@ -1158,6 +1159,23 @@ def test_model_display_label():
     check('подпись: без модели — не падает',
           bot.model_display_label('', 'medium') == 'medium',
           repr(bot.model_display_label('', 'medium')))
+
+
+def test_reasoning_effort_config():
+    """'none' уходит в запрос явно; пусто — параметр не шлём (дефолт модели)."""
+    saved = bot.GEMINI_REASONING_EFFORT
+    try:
+        for effort in ('none', 'low', 'medium', 'high'):
+            bot.GEMINI_REASONING_EFFORT = effort
+            cfg = bot.get_model_generation_config('gemini-3.6-flash')
+            check(f'effort: {effort} передаётся как есть',
+                  cfg['reasoning_effort'] == effort, cfg['reasoning_effort'])
+        bot.GEMINI_REASONING_EFFORT = ''
+        cfg = bot.get_model_generation_config('gemini-3.6-flash')
+        check('effort: пусто → None (параметр не шлём)',
+              cfg['reasoning_effort'] is None, cfg['reasoning_effort'])
+    finally:
+        bot.GEMINI_REASONING_EFFORT = saved
 
 
 def test_api_error_diag():
