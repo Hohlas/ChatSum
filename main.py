@@ -3331,6 +3331,21 @@ async def send_summary_message(telegram_client, text, topic_id, post_to_source=F
             print(f"⚠️  Не удалось отправить результат в исходный чат: {e}")
 
 
+def model_display_label(model=None, effort=None):
+    """'model effort' для подписи в TG; effort добавляется только для reasoning.
+
+    effort='none'/пусто → показываем только модель. model=None → берём текущий
+    GEMINI_DEFAULT_MODEL, effort=None → текущий GEMINI_REASONING_EFFORT. Чистая.
+    """
+    name = (model if model is not None else GEMINI_DEFAULT_MODEL) or ''
+    name = str(name).strip()
+    eff = (effort if effort is not None else GEMINI_REASONING_EFFORT) or ''
+    eff = str(eff).strip().lower()
+    if eff and eff != 'none':
+        return f"{name} {eff}".strip()
+    return name
+
+
 def build_summary_stats_message(stats_message, header=""):
     """Добавляет заголовок, подпись бота и обрезает итоговое сообщение."""
     if not stats_message.endswith('\n'):
@@ -3567,10 +3582,11 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             stats_message += "\n"
             if period_text and period_start_time and period_end_time:
                 stats_message += f"• За {period_text} с {period_start_time} по {period_end_time}\n"
+            model_label = model_display_label()
             if usage_info and total_tokens:
-                stats_message += f"• {GEMINI_DEFAULT_MODEL} / {total_tokens:,} токенов\n"
+                stats_message += f"• {model_label} / {total_tokens:,} токенов\n"
             else:
-                stats_message += f"• Модель: {GEMINI_DEFAULT_MODEL}\n"
+                stats_message += f"• Модель: {model_label}\n"
             if usage_info and usage_info.get('errors'):
                 stats_message += "\n⚠️ Ошибки API:\n"
                 for error_text in usage_info['errors'][:3]:

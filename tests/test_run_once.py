@@ -132,6 +132,7 @@ def main():
     test_quota_diag()
     test_server_overload_diag()
     test_api_error_diag()
+    test_model_display_label()
     test_flat_rotation()
     test_collect_order_and_parents()
     test_handoff()
@@ -1136,6 +1137,25 @@ def test_server_overload_diag():
         bot._log_response_headers(SimpleNamespace(status_code=503))
     check('503-лог: нет заголовков — строка, без исключения',
           'недоступны' in buf.getvalue(), repr(buf.getvalue()))
+
+
+def test_model_display_label():
+    """Подпись модели: effort добавляется только для reasoning (не none/пусто)."""
+    check('подпись: модель + effort',
+          bot.model_display_label('gemini-3.8-flash', 'medium') == 'gemini-3.8-flash medium',
+          bot.model_display_label('gemini-3.8-flash', 'medium'))
+    check('подпись: effort none → только модель',
+          bot.model_display_label('gemini-3.8-flash', 'none') == 'gemini-3.8-flash',
+          bot.model_display_label('gemini-3.8-flash', 'none'))
+    check('подпись: effort пусто → только модель',
+          bot.model_display_label('gemini-3.8-flash', '') == 'gemini-3.8-flash',
+          bot.model_display_label('gemini-3.8-flash', ''))
+    check('подпись: effort регистр/пробелы нормализуются',
+          bot.model_display_label('gemini-3.8-flash', ' HIGH ') == 'gemini-3.8-flash high',
+          bot.model_display_label('gemini-3.8-flash', ' HIGH '))
+    check('подпись: без модели — не падает',
+          bot.model_display_label('', 'medium') == 'medium',
+          repr(bot.model_display_label('', 'medium')))
 
 
 def test_api_error_diag():
