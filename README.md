@@ -66,6 +66,43 @@ iLYA Boytsov: предположил, что платные тарифы сиг�
 Команды отправляются прямо в чат — бот работает с твоего аккаунта
 и отвечает там же.
 
+<details>
+<summary>Расширенный список команд</summary>
+
+```text
+/sum            — за последние 24 часа
+/sum 3h        — за последние 3 часа
+/sum 2d        — за последние 2 дня
+/sum 45        — последние 45 сообщений
+/sum 600-800   — сообщения с 600-го по 800-е от конца
+/sum 2d-3d     — сообщения от 3 до 2 дней назад
+/sum 1d+       — анализ + копия результата в исходный чат
+/sum 1d-       — вместо Telegraph прислать как сообщение Telegram
+/sum1d+-       — пробел не обязателен, + и - можно вместе
+
+/copy 3h | /copy 50 | /copy 600-800 | /copy 2d-3d
+               — то же, но выгрузка без анализа (бесплатно):
+                 JSON-файл + текст для ручного разбора
+/help          — справка
+```
+
+Настройка и расписание — только на своём сервере
+(в GitHub Actions расписание задаётся файлом `SCHEDULE.txt`):
+
+```text
+/config /show_model /show_excluded /show_priority /show_prompt
+/add_excluded НИК /remove_excluded НИК
+/add_priority НИК /remove_priority НИК
+/set_model НАЗВАНИЕ
+/reload_config
+/sch 09:00 1d    — дайджест каждый день в 09:00 МСК
+/sch 21:30 12h   — то же на 21:30 с охватом 12 часов
+/sch 09:00 1d+   — + копия в исходный чат, - как сообщение Telegram
+/sch_list /unsch
+```
+
+</details>
+
 ## Два способа запуска
 
 |  | Свой сервер (VPS) | GitHub Actions (бесплатно) |
@@ -80,12 +117,62 @@ iLYA Boytsov: предположил, что платные тарифы сиг�
 
 ### Что нужно заранее (для обоих способов)
 
-Два бесплатных ключа:
+<details>
+<summary>Telegram: api_id и api_hash (бот через BotFather НЕ нужен)</summary>
 
-1. **Ключи Telegram:** открой https://my.telegram.org/auth, войди по номеру
-   телефона, затем `API development tools` → создай приложение → скопируй
-   `api_id` и `api_hash`.
-2. **Ключ Gemini:** открой https://aistudio.google.com, создай API-ключ.
+Здесь нужен не отдельный бот, а приложение в системе Telegram:
+программа входит от твоего имени (такой запуск называется «userbot» —
+программа действует как твой аккаунт). Шаги по официальной справке
+(https://core.telegram.org/api/obtaining_api_id):
+
+1. Поставь официальный клиент Telegram и зарегистрируйся.
+2. Открой https://my.telegram.org/auth и войди по номеру телефона
+   (код придёт в Telegram).
+3. Раздел `API development tools` → заполни короткую форму
+   (название и платформа — любые) → получишь `api_id` (число)
+   и `api_hash` (строка).
+4. Впиши их в `private.txt` вместе с номером телефона в виде `+7999...`.
+
+Помни: один номер — одно приложение; важные письма разработчика
+приходят на этот номер. Ключи никому не показывай.
+
+</details>
+
+<details>
+<summary>Gemini: бесплатный ключ для gemini-3.6-flash</summary>
+
+1. Открой https://aistudio.google.com/apikey и войди Google-аккаунтом.
+2. Нажми `Create API key`, выбери или создай проект — ключ вида `AIza...`
+   появится на странице ключей (справка: https://ai.google.dev/gemini-api/docs/api-key).
+3. Вставь ключ в `private.txt` как `GOOGLE_API_KEY`. Для запаса лимита
+   добавь ещё: `GOOGLE_API_KEY1`, `GOOGLE_API_KEY2`… — бот крутит их по кругу.
+4. Модель уже выбрана в файле `MODEL_CONFIG.txt` (строка
+   `GEMINI_MODEL=gemini-3.6-flash`) — в `private.txt` её писать не надо.
+
+Старт бесплатный: щедрые лимиты, токены входа и выхода бесплатны
+(цены: https://aistudio.google.com/docs/pricing). Учти: на бесплатном
+уровне содержимое могут использовать для улучшения продуктов.
+
+</details>
+
+<details>
+<summary>Как заполнить private.txt</summary>
+
+```env
+TELEGRAM_API_ID=12345678
+TELEGRAM_API_HASH=0123456789abcdef0123456789abcdef
+TELEGRAM_PHONE=+79991234567
+TELEGRAM_GROUP_ID=-1002...
+GOOGLE_API_KEY=AIzaSyExampleKey
+# запас лимита:
+# GOOGLE_API_KEY1=AIzaSy...
+# GOOGLE_API_KEY2=AIzaSy...
+```
+
+`TELEGRAM_GROUP_ID` — чат для результатов, узнай через `@username_to_id_bot`.
+Модель задаётся в `MODEL_CONFIG.txt`, а не здесь.
+
+</details>
 
 ### Вариант 1. Свой сервер
 
@@ -96,7 +183,7 @@ git clone https://github.com/Hohlas/ChatSum.git && cd ChatSum
 cp private.txt.example private.txt
 ```
 
-Минимальное содержимое `private.txt`:
+Минимальное содержимое `private.txt` (модель — в `MODEL_CONFIG.txt`):
 
 ```env
 TELEGRAM_API_ID=12345678
@@ -104,7 +191,6 @@ TELEGRAM_API_HASH=0123456789abcdef0123456789abcdef
 TELEGRAM_PHONE=+79991234567
 
 GOOGLE_API_KEY=AIzaSyExampleKey
-GEMINI_MODEL=gemini-3.6-flash
 ```
 
 Запуск:
