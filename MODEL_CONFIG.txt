@@ -5,4 +5,4 @@
 GEMINI_MODEL=gemini-3.6-flash
 GEMINI_TEMPERATURE=0               # 0 = детерминированный (рекомендуется), 0.3 = вариативный
 GEMINI_REASONING_EFFORT=none     # none low medium high (none — детерминизм, medium — глубже анализ но нестабилен)
-GEMINI_CHUNK_MAX_CHARS=100000      # CHUNK/2 токенов  для русского чата
+GEMINI_CHUNK_MAX_CHARS=60000      # CHUNK/2 токенов  для русского чата
