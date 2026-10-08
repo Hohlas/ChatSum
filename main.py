@@ -1377,29 +1377,50 @@ def optimize_messages(messages_data, chat_id_str):
 
 def count_messages_with_urls(messages_data):
     """
-    Подсчитывает сообщения содержащие URL
-    
+    Counts unique external URLs in messages.
+
+    Excludes internal Telegram links (t.me, telegram.me) such as
+    message citations (https://t.me/c/...), and deduplicates repeats,
+    so the header stat reflects external addresses, not message links.
+
     Args:
         messages_data: Список сообщений
-    
+
     Returns:
-        Кортеж (количество сообщений с URL, список сообщений с URL)
+        Кортеж (количество уникальных внешних URL, список примеров)
     """
-    url_pattern = re.compile(r'https?://[^\s]+')
-    count = 0
-    urls = []
-    
+    url_pattern = re.compile(r'https?://[^\s<>\]\)"\']+')
+    host_pattern = re.compile(r'https?://([^/\s:?#]+)', re.IGNORECASE)
+    internal_hosts = ('t.me', 'telegram.me', 'telegram.dog')
+    seen = {}
+    examples = []
+
     for msg in messages_data:
-        text = msg.get('text', '')
-        if url_pattern.search(text):
-            count += 1
-            urls.append({
-                'sender': msg.get('sender'),
-                'message_id': msg.get('message_id'),
-                'text': text[:100]  # Первые 100 символов
-            })
-    
-    return count, urls
+        text = msg.get('text', '') or ''
+        for raw in url_pattern.findall(text):
+            # Strip trailing punctuation captured from prose/markdown
+            url = raw.rstrip('.,;:!?)]}"*_~>')
+            url = url.rstrip("'")
+            if not url:
+                continue
+            host_match = host_pattern.match(url)
+            host = host_match.group(1).lower() if host_match else ''
+            if host == '' or host in internal_hosts or host.endswith('.t.me'):
+                continue
+            # Normalize host case for dedup; path stays as-is
+            key = host_match.group(0).lower() + url[host_match.end(0):] if host_match else url
+            # Trailing slash does not make a new address
+            norm_key = key.rstrip('/')
+            if norm_key not in seen:
+                seen[norm_key] = url
+                examples.append({
+                    'sender': msg.get('sender'),
+                    'message_id': msg.get('message_id'),
+                    'url': url,
+                    'text': text[:100]  # Первые 100 символов
+                })
+
+    return len(seen), examples
 
 
 def _message_sort_key(msg):
@@ -3466,10 +3487,10 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
         # Оптимизируем сообщения (фильтруем шум)
         optimized_messages = optimize_messages(messages_data, chat_id_str)
         
-        # Подсчитываем сообщения с URL (без детального вывода в терминал)
+        # Подсчитываем уникальные внешние URL (без t.me)
         url_count, url_messages = count_messages_with_urls(optimized_messages)
         if url_count > 0:
-            print(f"\n📎 Найдено сообщений с URL: {url_count}")
+            print(f"\n📎 Найдено внешних URL: {url_count}")
         
         # Разбиваем сообщения на чанки заранее (используется и для предупреждения, и для анализа)
         # Используем разбиение по символам вместо количества сообщений
