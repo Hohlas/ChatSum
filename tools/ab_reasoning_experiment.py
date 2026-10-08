@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import main as bot  # noqa: E402
 
 DEFAULT_EXPORT = 'tests/export_PoN_Holders_🐋_20261008_071945.json'
-EFFORTS = ['none', 'low', 'medium']
+EFFORTS = os.environ.get('AB_EFFORTS', 'none,low,medium').split(',')
 MAX_ATTEMPTS = 4          # на один effort при временной перегрузке
 RETRY_PAUSE_SEC = 30      # пауза между попытками
 
