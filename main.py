@@ -2926,18 +2926,32 @@ def extract_topic_titles(markdown_text):
     Разметка снимается теми же выражениями и в том же порядке, что в ветке
     <h3> у convert_markdown_to_html, — иначе слаг разойдётся с якорем.
     """
-    titles = []
+    return [title for title, _ in extract_toc_entries(markdown_text)]
+
+
+# Строка-метка, которую enrich_summary_with_timestamps вставляет в каждый
+# топик перед первой цитатой: время первой цитаты топика.
+TOPIC_TIME_RE = re.compile(r'^-\s*\*(\d{2}\.\d{2})\s+(\d{2}:\d{2})\*\s*-$')
+
+
+def extract_toc_entries(markdown_text):
+    """Пары (заголовок, ЧЧ:ММ) для содержания: время — из строки-метки
+    топика (первая цитата), без метки — None (пункт без времени)."""
+    entries = []
     for line in (markdown_text or '').split('\n'):
         stripped = line.strip()
-        if not stripped.startswith('💡'):
+        if stripped.startswith('💡'):
+            title = stripped[1:].strip()
+            title = MD_BOLD_RE.sub(r'\1', title)
+            title = MD_ITALIC_RE.sub(r'\1', title)
+            title = title.strip()
+            if title:
+                entries.append([title, None])
             continue
-        title = stripped[1:].strip()
-        title = MD_BOLD_RE.sub(r'\1', title)
-        title = MD_ITALIC_RE.sub(r'\1', title)
-        title = title.strip()
-        if title:
-            titles.append(title)
-    return titles
+        m = TOPIC_TIME_RE.match(stripped)
+        if m and entries and entries[-1][1] is None:
+            entries[-1][1] = m.group(2)
+    return [(title, when) for title, when in entries]
 
 
 def telegraph_slug(title):
@@ -2958,21 +2972,33 @@ def _escape_attr(value):
             .replace('<', '&lt;').replace('>', '&gt;'))
 
 
-def build_toc_html(titles):
-    """Блок содержания из заголовков топиков. Только разрешённые API теги
-    (h4/ol/li/a). Меньше 2 топиков — пустая строка (содержание не нужно).
-    Дубли заголовков получают одинаковый href (якоря у фронтенда тоже
-    одинаковые) — обе ссылки ведут на первое вхождение.
+def build_toc_html(entries):
+    """Блок содержания из пар (заголовок, ЧЧ:ММ). Только разрешённые API
+    теги (h4/ul/li/a). Меньше 2 топиков — пустая строка (содержание не
+    нужно). Вместо номеров — время первой цитаты топика; без метки времени
+    пункт идёт голым заголовком. Дубли заголовков получают одинаковый
+    href (якоря у фронтенда тоже одинаковые) — обе ссылки ведут на первое
+    вхождение.
     """
-    titles = [t for t in (titles or []) if t]
-    if len(titles) < 2:
+    norm = []
+    for e in (entries or []):
+        if isinstance(e, (list, tuple)):
+            t = e[0] if len(e) > 0 else ''
+            when = e[1] if len(e) > 1 else None
+        else:
+            t, when = e, None
+        if t:
+            norm.append((t, when))
+    if len(norm) < 2:
         return ''
-    parts = ['<h4>Содержание</h4>', '<ol>']
-    for t in titles:
+    parts = ['<h4>Содержание</h4>', '<ul>']
+    for t, when in norm:
         href = _escape_attr('#' + telegraph_slug(t))
         text = t.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        if when:
+            text = f'{when} \'{text}\''
         parts.append(f'<li><a href="{href}">{text}</a></li>')
-    parts.append('</ol>')
+    parts.append('</ul>')
     parts.append('<hr>')
     return ''.join(parts)
 
@@ -3031,7 +3057,7 @@ def convert_markdown_to_html(content, for_telegram=False):
     # Содержание для Telegraph: заголовки читаем из сырого Markdown (до
     # экранирования ниже), вставляем перед первым топиком. Telegram-ветка —
     # без содержания (лимит длины сообщений).
-    toc_html = '' if for_telegram else build_toc_html(extract_topic_titles(content))
+    toc_html = '' if for_telegram else build_toc_html(extract_toc_entries(content))
     toc_pending = bool(toc_html)
     # Экранируем HTML-спецсимволы, чтобы предотвратить поломку вёрстки
     # из-за ников пользователей с символами < > & (например, sprintf(username, "id%04d", 1<<9))
