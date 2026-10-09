@@ -1858,6 +1858,20 @@ def test_chunk_rebalance():
     check('rebalance: один чанк не трогается',
           bot.rebalance_last_two_chunks([(msgs, 1, 10)], msgs, 1000, 100)[0][0] is msgs)
 
+    # Инвариант: в исходный чат — только полностью успешное саммари.
+    # Отчёты с ошибками API уходят только в группу (кейс 09.10: саммари
+    # с «⚠️ Ошибки API» попало в исходный чат).
+    check('source-post: чистый успех — можно',
+          bot.source_post_allowed(True, []) is True)
+    check('source-post: флаг выключен — нельзя',
+          bot.source_post_allowed(False, []) is False)
+    check('source-post: есть ошибки API — нельзя',
+          bot.source_post_allowed(True, ['❌ модель недоступна']) is False)
+    check('source-post: часть не опубликована — нельзя',
+          bot.source_post_allowed(True, [], 1) is False)
+    check('source-post: всё опубликовано, ошибок нет — можно',
+          bot.source_post_allowed(True, [], 0) is True)
+
 
 def _now_utc():
     from datetime import timezone

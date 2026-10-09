@@ -3558,6 +3558,21 @@ def create_html_report(title, content, author_name="Chat Filter Bot"):
         return None
 
 
+def source_post_allowed(post_to_source, api_errors, unpublished_parts=0):
+    """Инвариант: в исходный чат — только полностью успешное саммари.
+
+    Отчёты с ошибками API и частично/полностью неопубликованные части живут
+    только в группе (RESULTS_DESTINATION). Чистая.
+    """
+    if not post_to_source:
+        return False
+    if api_errors:  # непустой список ошибок или True
+        return False
+    if (unpublished_parts or 0) > 0:
+        return False
+    return True
+
+
 async def send_summary_message(telegram_client, text, topic_id, post_to_source=False, source_chat_id=None):
     """
     Отправляет итоговое сообщение в RESULTS_DESTINATION и (опционально) в исходный чат.
@@ -3849,6 +3864,13 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                     stats_message += f"• {trim_text_for_telegram(error_text, max_length=500)}\n"
                 if len(usage_info['errors']) > 3:
                     stats_message += f"• ... и ещё {len(usage_info['errors']) - 3}\n"
+
+            # Инвариант source_post_allowed: отчёт с ошибками API — только
+            # в группу, в исходный чат уходит лишь полностью успешное саммари.
+            has_api_errors = bool(usage_info and usage_info.get('errors'))
+            if post_to_source and not source_post_allowed(post_to_source, has_api_errors):
+                post_to_source = False
+                print("⚠️  Саммари содержит ошибки API — дублирование в исходный чат отключено")
             
             # Убираем разделители чанков Gemini из саммари
             clean_summary = re.sub(r'📊 Обработано \d+ сообщений в \d+ частях\n\n?', '', summary)
@@ -3994,6 +4016,12 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                         header += "\n"
                         stats_message = build_summary_stats_message(stats_message, header)
 
+                        # Не все части опубликованы — в исходный чат не дублируем.
+                        unpublished = sum(1 for _, url, _ in article_urls if not url)
+                        if post_to_source and not source_post_allowed(post_to_source, False, unpublished):
+                            post_to_source = False
+                            print(f"⚠️  {unpublished} из {len(article_urls)} частей не опубликованы — дублирование в исходный чат отключено")
+
                         # Отправляем сообщение с ссылками (в destination и при необходимости в исходный чат)
                         await send_summary_message(
                             telegram_client,
@@ -4038,11 +4066,12 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                         )
                         os.remove(filename)
                         
+                        # Все публикации провалились — отчёт о сбое только в группу.
                         await send_summary_message(
                             telegram_client,
                             build_summary_stats_message(stats_message),
                             topic_id,
-                            post_to_source=post_to_source,
+                            post_to_source=False,
                             source_chat_id=chat_id
                         )
                 
@@ -4135,12 +4164,12 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                         )
                         os.remove(filename)
                         
-                        # Отправляем статистику (в destination и при необходимости в исходный чат)
+                        # Публикация провалилась — отчёт о сбое только в группу.
                         await send_summary_message(
                             telegram_client,
                             build_summary_stats_message(stats_message),
                             topic_id,
-                            post_to_source=post_to_source,
+                            post_to_source=False,
                             source_chat_id=chat_id
                         )
             
