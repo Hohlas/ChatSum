@@ -1650,9 +1650,9 @@ def test_telegraph_toc():
     check('toc: пусто — без содержания', bot.build_toc_html([]) == '')
     toc = bot.build_toc_html(titles)
     check('toc: два пункта', toc.count('<li>') == 2, toc)
-    check('toc: без меток времени — голые заголовки без номеров',
+    check('toc: без меток времени — голые заголовки с нумерацией',
           '<li><a href="#💡-Вспышка-кори-в-США">Вспышка кори в США</a></li>' in toc
-          and '<ol>' not in toc, toc)
+          and '<ol>' in toc, toc)
     check('toc: href первого', 'href="#💡-Вспышка-кори-в-США"' in toc, toc)
     check('toc: & в href с двойным экранированием',
           'href="#💡-Токен-LayerZero-(ZRO)-&amp;amp;-рынок"' in toc, toc)
@@ -1663,7 +1663,7 @@ def test_telegraph_toc():
 
     html_two = bot.convert_markdown_to_html(md_two)
     check('toc: содержание в Telegraph-вёрстке',
-          '<h4>Содержание</h4>' in html_two and '<ul>' in html_two, html_two[:200])
+          '<h4>Содержание</h4>' in html_two and '<ol>' in html_two, html_two[:200])
     check('toc: href пережил санитарку',
           'href="#💡-Вспышка-кори-в-США"' in html_two, html_two[:400])
     check('toc: содержание до первого топика',
@@ -1673,7 +1673,7 @@ def test_telegraph_toc():
           'Содержание' not in bot.convert_markdown_to_html(md_one))
     tg_html = bot.convert_markdown_to_html(md_two, for_telegram=True)
     check('toc: Telegram-ветка — без содержания',
-          'Содержание' not in tg_html and '<ul>' not in tg_html, tg_html[:200])
+          'Содержание' not in tg_html and '<ol>' not in tg_html, tg_html[:200])
     dup = bot.build_toc_html(['Повтор', 'Повтор'])
     check('toc: дубли — одинаковый href (прыжок на первое вхождение)',
           dup.count('href="#💡-Повтор"') == 2, dup)
@@ -1698,19 +1698,19 @@ def test_telegraph_toc():
           entries == [('Вспышка кори в США', '10:24'),
                       ('Токен LayerZero (ZRO) & рынок', '11:05')], entries)
     toc_timed = bot.build_toc_html(entries)
-    check('toc: пункт со временем',
-          '<li><a href="#💡-Вспышка-кори-в-США">10:24 \'Вспышка кори в США\'</a></li>'
+    check('toc: пункт — заголовок, время в конце без кавычек',
+          '<li><a href="#💡-Вспышка-кори-в-США">Вспышка кори в США - 10:24</a></li>'
           in toc_timed, toc_timed)
     check('toc: время со спецсимволом в заголовке',
-          '11:05 \'Токен LayerZero (ZRO) &amp; рынок\'' in toc_timed, toc_timed)
-    check('toc: номеров-цифр больше нет', '<ol>' not in toc_timed, toc_timed)
+          'Токен LayerZero (ZRO) &amp; рынок - 11:05' in toc_timed, toc_timed)
+    check('toc: нумерация списка на месте', '<ol>' in toc_timed, toc_timed)
     mixed = bot.build_toc_html([('A', '09:01'), ('B', None)])
     check('toc: без метки — голый заголовок',
           '<li><a href="#💡-B">B</a></li>' in mixed
-          and '09:01 \'A\'' in mixed, mixed)
+          and 'A - 09:01' in mixed, mixed)
     html_timed = bot.convert_markdown_to_html(md_timed)
     check('toc: время дожило до вёрстки',
-          '10:24 \'Вспышка кори в США\'' in html_timed, html_timed[:300])
+          'Вспышка кори в США - 10:24' in html_timed, html_timed[:300])
 
 
 def test_telegraph_link_stars():
