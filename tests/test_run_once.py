@@ -144,6 +144,7 @@ def main():
     test_telegraph_link_stars()
     test_dedupe_topics()
     test_chunk_rebalance()
+    test_chunk_redrive()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")
@@ -1899,6 +1900,94 @@ def test_chunk_rebalance():
           bot.source_post_allowed(True, [], 1) is False)
     check('source-post: всё опубликовано, ошибок нет — можно',
           bot.source_post_allowed(True, [], 0) is True)
+
+
+def test_chunk_redrive():
+    # Добой битых чанков (вариант C, 09.10): точечный всплеск перегрузки —
+    # дырка досчитывается одной попыткой после паузы; счётчики чистятся.
+    # Квота/затяжной шторм — добоя нет (паузой не лечатся, 503 жжёт лимит).
+    from types import SimpleNamespace
+
+    def fake_msg(mid, sender):
+        return {'message_id': mid, 'sender': sender,
+                'date': '2026-10-09 10:00:00', 'text': f'текст {mid}'}
+
+    chunks = [
+        ([fake_msg(1, 'U1')], 1, 1),
+        ([fake_msg(2, 'U2')], 2, 2),
+    ]
+    good1 = '💡 **Тема один**\n*Идея один.*\n\n[U1](https://t.me/c/1/1): суть один\n'
+    good2 = '💡 **Тема два**\n*Идея два.*\n\n[U2](https://t.me/c/1/2): суть два\n'
+
+    class FakeResp:
+        def __init__(self, text):
+            self.choices = [SimpleNamespace(message=SimpleNamespace(content=text))]
+
+    real_exec = bot.execute_gemini_request
+    real_redrive_pause = bot.CHUNK_REDRIVE_PAUSE_SEC
+    real_chunk_pause = bot.CHUNK_DELAY_SECONDS
+    bot.CHUNK_REDRIVE_PAUSE_SEC = 0
+    bot.CHUNK_DELAY_SECONDS = 0
+    try:
+        calls = []
+
+        async def flaky(params):
+            calls.append(1)
+            if len(calls) == 1:
+                raise Exception('boom-spike')
+            return FakeResp(good2 if len(calls) == 2 else good1)
+
+        bot.execute_gemini_request = flaky
+        loop = asyncio.get_event_loop()
+        combined, usage = loop.run_until_complete(
+            bot.create_summary(chunks, '1', model='test-model'))
+        check('redrive: дырка досчитана',
+              'Тема один' in combined and 'Тема два' in combined, combined[:200])
+        check('redrive: тел ошибок не осталось',
+              '❌' not in combined and usage['errors'] == [], usage['errors'])
+        check('redrive: три запроса (2 чанка + 1 добой)', len(calls) == 3, len(calls))
+
+        # Добой не помог — ошибка остаётся, попыток больше нет (4 запроса).
+        calls2 = []
+
+        async def always_fail(params):
+            calls2.append(1)
+            raise Exception('still-down')
+
+        bot.execute_gemini_request = always_fail
+        combined2, usage2 = loop.run_until_complete(
+            bot.create_summary(chunks, '1', model='test-model'))
+        check('redrive: неубиваемая ошибка остаётся',
+              combined2.count('❌') == 2 and len(usage2['errors']) == 2,
+              (combined2.count('❌'), usage2['errors']))
+        check('redrive: ровно одна попытка добоя на чанк', len(calls2) == 4, len(calls2))
+
+        # Стоп-флаг перегрузки — добоя нет вообще (1 запрос, второй чанк пропущен).
+        calls3 = []
+
+        def no_json():
+            raise Exception('no json')
+
+        fake_http = SimpleNamespace(
+            status_code=503, request=object(), headers={},
+            text='UNAVAILABLE: backend overloaded', json=no_json)
+
+        async def overloaded(params):
+            calls3.append(1)
+            raise bot.APIStatusError('overloaded', response=fake_http, body=None)
+
+        bot.execute_gemini_request = overloaded
+        combined3, usage3 = loop.run_until_complete(
+            bot.create_summary(chunks, '1', model='test-model'))
+        check('redrive: шторм 503 — добоя нет',
+              len(calls3) == 1 and 'Чанк пропущен' in combined3,
+              (len(calls3), combined3[:200]))
+        check('redrive: шторм 503 — ошибки учтены', len(usage3['errors']) == 1,
+              usage3['errors'])
+    finally:
+        bot.execute_gemini_request = real_exec
+        bot.CHUNK_REDRIVE_PAUSE_SEC = real_redrive_pause
+        bot.CHUNK_DELAY_SECONDS = real_chunk_pause
 
 
 def _now_utc():

@@ -323,6 +323,8 @@ def chunk_overlap_for(max_chars):
 
 CHUNK_OVERLAP_CHARS = chunk_overlap_for(DEFAULT_CHUNK_MAX_CHARS)
 CHUNK_DELAY_SECONDS = 10   # Задержка между запросами к API (для соблюдения RPM лимита)
+CHUNK_REDRIVE_PAUSE_SEC = 15   # Пауза перед добоем битых чанков (вариант C): всплеск
+# перегрузки обычно секундный; одна попытка, только genuine-ошибки, без стоп-флагов.
 
 # Хук маркера прогресса (сессия 12): run_once ставит сюда колбэк, create_summary
 # дёргает его между чанками. Без run_once остаётся None — поведение не меняется.
@@ -2493,6 +2495,57 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
             if chunk_idx < num_chunks:
                 print(f"   ⏳ Пауза {CHUNK_DELAY_SECONDS} секунд перед следующим чанком...")
                 await asyncio.sleep(CHUNK_DELAY_SECONDS)
+
+        # Добой битых чанков (вариант C): секундный всплеск перегрузки к этому
+        # моменту обычно проходит — по одной попытке после короткой паузы.
+        # Каждый чанк добивается отдельно однопроходным режимом (рекурсия
+        # всегда в 1 чанк, повтора внутри повтора нет). Добиваем только
+        # genuine-ошибки API (текст с ❌; пропуски после стоп-флагов не трогаем)
+        # и только без стоп-флагов: квоту и затяжной шторм паузой не лечат,
+        # а каждый 503 жжёт дневной лимит.
+        failed_for_redrive = [
+            i for i, (_, _, text, is_err) in enumerate(chunk_summaries)
+            if is_err and isinstance(text, str) and text.startswith('❌')
+        ]
+        if failed_for_redrive and not stop_due_to_quota and not stop_due_to_overload:
+            print(f"\n🔁 Добой {len(failed_for_redrive)} битых чанков "
+                  f"(пауза {CHUNK_REDRIVE_PAUSE_SEC}с, по одному)...")
+            if PROGRESS_HOOK is not None:
+                try:
+                    PROGRESS_HOOK()
+                except Exception:
+                    pass
+            await asyncio.sleep(CHUNK_REDRIVE_PAUSE_SEC)
+            for n, list_idx in enumerate(failed_for_redrive):
+                start_idx, end_idx, old_error, _ = chunk_summaries[list_idx]
+                chunk_messages = next(
+                    (c[0] for c in chunks if c[1] == start_idx and c[2] == end_idx), None)
+                if chunk_messages is None:
+                    print(f"   ⚠️ Добой пропущен: чанк {start_idx}-{end_idx} не найден")
+                    continue
+                if n > 0:
+                    await asyncio.sleep(CHUNK_DELAY_SECONDS)
+                print(f"\n📦 Добой чанка (сообщения {start_idx}-{end_idx})")
+                healed, healed_usage = await create_summary(
+                    [(chunk_messages, start_idx, end_idx)],
+                    chat_id_str, model=model, use_reasoning=use_reasoning,
+                    period_start_date=period_start_date,
+                )
+                if healed and not healed.startswith('❌'):
+                    chunk_summaries[list_idx] = (start_idx, end_idx, healed, False)
+                    errors_count -= 1
+                    try:
+                        total_usage['errors'].remove(old_error)
+                    except ValueError:
+                        pass
+                    if healed_usage:
+                        total_usage['prompt_tokens'] += healed_usage.get('prompt_tokens', 0)
+                        total_usage['completion_tokens'] += healed_usage.get('completion_tokens', 0)
+                        total_usage['thinking_tokens'] += healed_usage.get('thinking_tokens', 0)
+                        total_usage['total_tokens'] += healed_usage.get('total_tokens', 0)
+                    print(f"   ✅ Добой удался: чанк {start_idx}-{end_idx} досчитан")
+                else:
+                    print(f"   ⚠️ Добой не помог, оставляем ошибку чанка {start_idx}-{end_idx}")
         
         # ═══════════════════════════════════════════════════════════════
         # Объединение саммари всех чанков
