@@ -124,6 +124,7 @@ def main():
     test_openrouter_nemotron_profile()
     test_gemini_38_flash_profile()
     test_empty_model_response_is_error()
+    test_none_choices_is_error()
     test_rotate_advances_cursor()
     test_duty_gap()
     test_work_wedge()
@@ -909,6 +910,69 @@ def test_empty_model_response_is_error():
         out = bot.dedupe_topics_across_chunks(
             [(1, 1, None, False), (2, 2, '💡 **T**\n[X](https://t.me/c/1/2)', False)])
         check('dedupe: None-текст не роняет', len(out) == 2, out)
+    finally:
+        bot.LLM_PROVIDER = saved_provider
+        bot.execute_gemini_request = saved_exec
+        bot.CHUNK_REDRIVE_PAUSE_SEC = saved_redrive
+        bot.CHUNK_DELAY_SECONDS = saved_delay
+
+
+def test_none_choices_is_error():
+    """choices=None/[] (провайдер вернул пустой ответ вместо текста) —
+    ошибка чанка/запроса, а не TypeError. Регрессия живого случая
+    Nemotron через OpenRouter."""
+    from types import SimpleNamespace
+    saved_provider = bot.LLM_PROVIDER
+    saved_exec = bot.execute_gemini_request
+    saved_redrive = bot.CHUNK_REDRIVE_PAUSE_SEC
+    saved_delay = bot.CHUNK_DELAY_SECONDS
+    loop = asyncio.get_event_loop()
+    try:
+        bot.LLM_PROVIDER = 'google'
+        bot.CHUNK_REDRIVE_PAUSE_SEC = 0
+        bot.CHUNK_DELAY_SECONDS = 0
+        check('helper: choices=None → None',
+              bot._first_choice_text(SimpleNamespace(choices=None)) is None, '')
+        check('helper: choices=[] → None',
+              bot._first_choice_text(SimpleNamespace(choices=[])) is None, '')
+        check('helper: content=None → None',
+              bot._first_choice_text(SimpleNamespace(
+                  choices=[SimpleNamespace(
+                      message=SimpleNamespace(content=None))])) is None, '')
+        check('helper: обычный ответ достаётся',
+              bot._first_choice_text(SimpleNamespace(
+                  choices=[SimpleNamespace(
+                      message=SimpleNamespace(content=' txt '))])) == ' txt ', '')
+
+        def fake_msg(mid, sender):
+            return {'message_id': mid, 'sender': sender,
+                    'date': '2026-10-09 10:00:00', 'text': f'текст {mid}'}
+
+        class NoChoicesResp:
+            choices = None
+            usage = SimpleNamespace(prompt_tokens=10,
+                                    completion_tokens=5,
+                                    total_tokens=15)
+
+        async def no_choices(params):
+            return NoChoicesResp()
+        bot.execute_gemini_request = no_choices
+        chunks = [([fake_msg(1, 'U1')], 1, 1),
+                  ([fake_msg(2, 'U2')], 2, 2)]
+        with _quiet():
+            combined, usage = loop.run_until_complete(
+                bot.create_summary(chunks, '1', model='gemini-3.8-flash'))
+        check('choices=None: анализ не падает, оба чанка — ошибки',
+              combined.count('Пустой ответ модели') == 2
+              and len(usage['errors']) == 2,
+              (combined[:200], usage['errors']))
+
+        with _quiet():
+            single, _ = loop.run_until_complete(
+                bot.create_summary([chunks[0]], '1', model='gemini-3.8-flash'))
+        check('choices=None: одиночный путь — ошибка строкой, не падение',
+              isinstance(single, str) and single.startswith('❌'),
+              (single or '')[:120])
     finally:
         bot.LLM_PROVIDER = saved_provider
         bot.execute_gemini_request = saved_exec

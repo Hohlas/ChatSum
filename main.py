@@ -2407,6 +2407,19 @@ def estimate_total_ai_processing_seconds(chunks, use_ai=True, use_html_export=Tr
     return ai_seconds + chunk_pause_seconds + publish_pause_seconds + publish_overhead_seconds
 
 
+def _first_choice_text(response):
+    """Безопасно достаёт текст первого choice: choices=None/[] или
+    message/content=None (так отвечают некоторые провайдеры вместо
+    текста) → None. Исключений не бросает."""
+    try:
+        choices = getattr(response, 'choices', None)
+        if not choices:
+            return None
+        return getattr(choices[0].message, 'content', None)
+    except Exception:
+        return None
+
+
 def is_valid_summary(text):
     """
     Проверяет, что ответ содержит саммари, а не сырой JSON.
@@ -2759,8 +2772,8 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
             # Отправляем запрос
             try:
                 response = await execute_gemini_request(request_params)
-                
-                chunk_summary = response.choices[0].message.content
+
+                chunk_summary = _first_choice_text(response)
                 
                 # Проверяем, что ответ содержит саммари, а не JSON
                 if not is_valid_summary(chunk_summary):
@@ -2779,7 +2792,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                     while retry_valid_count <= max_valid_retries:
                         try:
                             response = await execute_gemini_request(request_params)
-                            chunk_summary = response.choices[0].message.content
+                            chunk_summary = _first_choice_text(response)
                             if is_valid_summary(chunk_summary):
                                 print(f"   ✅ Валидация пройдена после retry {retry_valid_count}")
                                 validation_passed = True
@@ -3039,7 +3052,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         # Отправляем запрос
         response = await execute_gemini_request(request_params)
         
-        summary = response.choices[0].message.content
+        summary = _first_choice_text(response)
         
         # Проверяем, что ответ содержит саммари, а не JSON
         if not is_valid_summary(summary):
