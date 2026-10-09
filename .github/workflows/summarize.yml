@@ -69,10 +69,21 @@ jobs:
           GOOGLE_API_KEY2:   ${{ secrets.GOOGLE_API_KEY2 }}
           GOOGLE_API_KEY3:   ${{ secrets.GOOGLE_API_KEY3 }}
           GOOGLE_API_KEYS:   ${{ secrets.GOOGLE_API_KEYS }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          NVIDIA_API_KEY:   ${{ secrets.NVIDIA_API_KEY }}
+          LLM_PROVIDER:     ${{ vars.LLM_PROVIDER }}
           GEMINI_MODEL:      ${{ vars.GEMINI_MODEL }}
           GEMINI_TEMPERATURE:      ${{ vars.GEMINI_TEMPERATURE }}
           GEMINI_REASONING_EFFORT: ${{ vars.GEMINI_REASONING_EFFORT }}
           GEMINI_CHUNK_MAX_CHARS:  ${{ vars.GEMINI_CHUNK_MAX_CHARS }}
+          OPENROUTER_MODEL:      ${{ vars.OPENROUTER_MODEL }}
+          OPENROUTER_TEMPERATURE:      ${{ vars.OPENROUTER_TEMPERATURE }}
+          OPENROUTER_REASONING_EFFORT: ${{ vars.OPENROUTER_REASONING_EFFORT }}
+          OPENROUTER_CHUNK_MAX_CHARS:  ${{ vars.OPENROUTER_CHUNK_MAX_CHARS }}
+          NVIDIA_MODEL:      ${{ vars.NVIDIA_MODEL }}
+          NVIDIA_TEMPERATURE:      ${{ vars.NVIDIA_TEMPERATURE }}
+          NVIDIA_REASONING_EFFORT: ${{ vars.NVIDIA_REASONING_EFFORT }}
+          NVIDIA_CHUNK_MAX_CHARS:  ${{ vars.NVIDIA_CHUNK_MAX_CHARS }}
           # inputs передаём через env, НЕ через интерполяцию ${{ }} в shell
           # (защита от quoting/инъекций; пустой period → дефолт 1d)
           CHAT_ID: ${{ github.event.inputs.chat_id }}

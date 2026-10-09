@@ -964,8 +964,11 @@ def preflight_actions_env():
         if not os.getenv(var, '').strip():
             print(f"❌ Не задан {label}. Проверьте Secrets в настройках репозитория.")
             ok = False
-    if not os.getenv('GOOGLE_API_KEY', '').strip() and not os.getenv('GOOGLE_API_KEYS', '').strip():
-        print("❌ Не задан GOOGLE_API_KEY (или сводный GOOGLE_API_KEYS). Проверьте Secrets в настройках репозитория.")
+    if (not os.getenv('GOOGLE_API_KEY', '').strip()
+            and not os.getenv('GOOGLE_API_KEYS', '').strip()
+            and not os.getenv('OPENROUTER_API_KEY', '').strip()
+            and not os.getenv('NVIDIA_API_KEY', '').strip()):
+        print("❌ Не задан ни один LLM-ключ (GOOGLE_API_KEY/GOOGLE_API_KEYS, OPENROUTER_API_KEY или NVIDIA_API_KEY). Проверьте Secrets в настройках репозитория.")
         ok = False
     return ok
 

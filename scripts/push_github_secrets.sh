@@ -177,15 +177,37 @@ case "$GROUP_ID" in
   *) echo "⏭️  TELEGRAM_GROUP_ID пропущен (не задан — будет «Избранное»)" ;;
 esac
 
+echo "--- Secrets (LLM-провайдеры; private.txt хранит только ключи) ---"
+gh_set_secret OPENROUTER_API_KEY "$(get_var OPENROUTER_API_KEY)" 0
+gh_set_secret NVIDIA_API_KEY "$(get_var NVIDIA_API_KEY)" 0
+
 echo "--- Variables (публичные; секретные значения кладите в Secrets) ---"
+PROVIDER="$(get_var LLM_PROVIDER)";       [ -n "$PROVIDER" ] || PROVIDER="google"
 MODEL="$(get_var GEMINI_MODEL)";            [ -n "$MODEL" ] || MODEL="gemini-3.6-flash"
 TEMP="$(get_var GEMINI_TEMPERATURE)";       [ -n "$TEMP" ] || TEMP="0"
 EFFORT="$(get_var GEMINI_REASONING_EFFORT)"; [ -n "$EFFORT" ] || EFFORT="none"
 CHUNK="$(get_var GEMINI_CHUNK_MAX_CHARS)";  [ -n "$CHUNK" ] || CHUNK="60000"
+gh_set_var LLM_PROVIDER "$PROVIDER"
 gh_set_var GEMINI_MODEL "$MODEL"
 gh_set_var GEMINI_TEMPERATURE "$TEMP"
 gh_set_var GEMINI_REASONING_EFFORT "$EFFORT"
 gh_set_var GEMINI_CHUNK_MAX_CHARS "$CHUNK"
+OR_MODEL="$(get_var OPENROUTER_MODEL)";            [ -n "$OR_MODEL" ] || OR_MODEL="nvidia/nemotron-3-ultra-550b-a55b:free"
+OR_TEMP="$(get_var OPENROUTER_TEMPERATURE)";       [ -n "$OR_TEMP" ] || OR_TEMP="0"
+OR_EFFORT="$(get_var OPENROUTER_REASONING_EFFORT)"; [ -n "$OR_EFFORT" ] || OR_EFFORT="none"
+OR_CHUNK="$(get_var OPENROUTER_CHUNK_MAX_CHARS)";  [ -n "$OR_CHUNK" ] || OR_CHUNK="60000"
+gh_set_var OPENROUTER_MODEL "$OR_MODEL"
+gh_set_var OPENROUTER_TEMPERATURE "$OR_TEMP"
+gh_set_var OPENROUTER_REASONING_EFFORT "$OR_EFFORT"
+gh_set_var OPENROUTER_CHUNK_MAX_CHARS "$OR_CHUNK"
+NV_MODEL="$(get_var NVIDIA_MODEL)";            [ -n "$NV_MODEL" ] || NV_MODEL="deepseek-ai/deepseek-v4.1-flash"
+NV_TEMP="$(get_var NVIDIA_TEMPERATURE)";       [ -n "$NV_TEMP" ] || NV_TEMP="0"
+NV_EFFORT="$(get_var NVIDIA_REASONING_EFFORT)"; [ -n "$NV_EFFORT" ] || NV_EFFORT="none"
+NV_CHUNK="$(get_var NVIDIA_CHUNK_MAX_CHARS)";  [ -n "$NV_CHUNK" ] || NV_CHUNK="60000"
+gh_set_var NVIDIA_MODEL "$NV_MODEL"
+gh_set_var NVIDIA_TEMPERATURE "$NV_TEMP"
+gh_set_var NVIDIA_REASONING_EFFORT "$NV_EFFORT"
+gh_set_var NVIDIA_CHUNK_MAX_CHARS "$NV_CHUNK"
 
 echo ""
 if [ "$DRY_RUN" = 1 ]; then

@@ -1,8 +1,23 @@
 # Model settings, tracked in git. One push to main updates VPS and Actions, no Secrets/Variables change.
 # File wins over env; env is fallback only.
+# private.txt holds ONLY keys (TELEGRAM_*, GOOGLE_API_KEY*, OPENROUTER_API_KEY, NVIDIA_API_KEY).
+# All MODEL / TEMPERATURE / REASONING_EFFORT / CHUNK_MAX_CHARS live here, per provider.
 # REASONING_EFFORT: none low medium high.
+# LLM_PROVIDER: google | openrouter | nvidia (default google).
+
+LLM_PROVIDER=openrouter  # google | openrouter | nvidia
 
 GEMINI_MODEL=gemini-3.8-flash
 GEMINI_TEMPERATURE=0               # 0 = детерминированный (рекомендуется), 0.3 = вариативный
 GEMINI_REASONING_EFFORT=low     # none low medium high (none — детерминизм, medium — глубже анализ но нестабилен)
 GEMINI_CHUNK_MAX_CHARS=40000      # CHUNK/2 токенов  для русского чата
+
+OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free
+OPENROUTER_TEMPERATURE=0
+OPENROUTER_REASONING_EFFORT=low
+OPENROUTER_CHUNK_MAX_CHARS=100000   # ~42K токенов входа, ~30K токенов выхода: запас 2x до лимита 65536
+
+NVIDIA_MODEL=deepseek-ai/deepseek-v4.1-flash
+NVIDIA_TEMPERATURE=0
+NVIDIA_REASONING_EFFORT=low
+NVIDIA_CHUNK_MAX_CHARS=40000

@@ -121,6 +121,9 @@ def main():
     test_sched_flows()
     test_key_cursor()
     test_503_holds_key()
+    test_openrouter_nemotron_profile()
+    test_gemini_38_flash_profile()
+    test_empty_model_response_is_error()
     test_rotate_advances_cursor()
     test_duty_gap()
     test_work_wedge()
@@ -714,7 +717,8 @@ def test_503_holds_key():
     """503: один запрос, пауза 3 мин, выход наружу (внутреннего повтора нет,
     поэтому успех в тесте недостижим). Ключ не меняется. 429 — старый путь."""
     saved = (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
-             bot.google_analysis_counter, bot.google_client, bot.asyncio.sleep)
+             bot.google_analysis_counter, bot.google_client, bot.asyncio.sleep,
+             bot.LLM_PROVIDER)
     saved_set_index = bot.set_google_api_key_index
     sleeps = []
     calls = {'n': 0}
@@ -736,6 +740,7 @@ def test_503_holds_key():
 
     loop = asyncio.get_event_loop()
     try:
+        bot.LLM_PROVIDER = 'google'
         bot.GOOGLE_API_KEYS = ['k1', 'k2', 'k3']
         bot.current_google_key_index = 0
         bot.google_analysis_counter = 0
@@ -757,8 +762,158 @@ def test_503_holds_key():
     finally:
         (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
          bot.google_analysis_counter, bot.google_client,
-         bot.asyncio.sleep) = saved
+         bot.asyncio.sleep, bot.LLM_PROVIDER) = saved
         bot.set_google_api_key_index = saved_set_index
+
+
+def test_openrouter_nemotron_profile():
+    """Nemotron-3-Ultra (:free): окно 1M, выход 65536, чанк 100K;
+    503 на одиночном ключе — пауза 3 мин и выход, без ротации Google."""
+    saved_provider = bot.LLM_PROVIDER
+    saved_or_effort = bot.OPENROUTER_REASONING_EFFORT
+    saved = (bot.openrouter_client, bot.asyncio.sleep)
+    sleeps = []
+    calls = {'n': 0}
+
+    async def fake_sleep(sec):
+        sleeps.append(sec)
+
+    class FakeCompletions:
+        async def create(self, **kw):
+            calls['n'] += 1
+            raise Exception("Error code: 503 - high demand, status UNAVAILABLE")
+
+    class FakeClient:
+        chat = type('C', (), {'completions': FakeCompletions()})()
+
+        def with_options(self, **kw):
+            return self
+
+    loop = asyncio.get_event_loop()
+    try:
+        bot.LLM_PROVIDER = 'openrouter'
+        bot.OPENROUTER_REASONING_EFFORT = 'low'
+        cfg = bot.get_model_generation_config(
+            'nvidia/nemotron-3-ultra-550b-a55b:free', provider='openrouter')
+        check('nemotron: окно 1M', cfg['context_limit_tokens'] == 1000000,
+              cfg['context_limit_tokens'])
+        check('nemotron: выход 65536', cfg['output_max_tokens'] == 65536,
+              cfg['output_max_tokens'])
+        check('nemotron: чанк 100K', cfg['chunk_max_chars'] == 100000,
+              cfg['chunk_max_chars'])
+        check('nemotron: effort low', cfg['reasoning_effort'] == 'low',
+              cfg['reasoning_effort'])
+        cfg_paid = bot.get_model_generation_config(
+            'nvidia/nemotron-3-ultra-550b-a55b', provider='openrouter')
+        check('nemotron платный: окно 512K',
+              cfg_paid['context_limit_tokens'] == 512000,
+              cfg_paid['context_limit_tokens'])
+        check('nemotron платный: выход 16384',
+              cfg_paid['output_max_tokens'] == 16384,
+              cfg_paid['output_max_tokens'])
+        bot.openrouter_client = FakeClient()
+        bot.asyncio.sleep = fake_sleep
+        try:
+            with _quiet():
+                loop.run_until_complete(bot.execute_gemini_request({}))
+            check('nemotron 503: должен был raise', False)
+        except Exception as e:
+            check('nemotron 503: raise после 1 запроса',
+                  '503' in str(e) and calls['n'] == 1,
+                  (str(e)[:40], calls))
+        check('nemotron 503: пауза 3 мин', sleeps == [180], sleeps)
+    finally:
+        bot.LLM_PROVIDER = saved_provider
+        bot.OPENROUTER_REASONING_EFFORT = saved_or_effort
+        (bot.openrouter_client, bot.asyncio.sleep) = saved
+
+
+def test_gemini_38_flash_profile():
+    """gemini-3.8-flash: окно 1M, выход 65536 (официальные доки)."""
+    saved_provider = bot.LLM_PROVIDER
+    saved_chunk = bot.GEMINI_CHUNK_MAX_CHARS
+    try:
+        bot.LLM_PROVIDER = 'google'
+        cfg = bot.get_model_generation_config('gemini-3.8-flash')
+        check('3.8: окно 1M', cfg['context_limit_tokens'] == 1048576,
+              cfg['context_limit_tokens'])
+        check('3.8: выход 65536', cfg['output_max_tokens'] == 65536,
+              cfg['output_max_tokens'])
+        # Профиль даёт 100K, но значение из MODEL_CONFIG.txt важнее.
+        bot.GEMINI_CHUNK_MAX_CHARS = ''
+        cfg2 = bot.get_model_generation_config('gemini-3.8-flash')
+        check('3.8: чанк профиля 100K', cfg2['chunk_max_chars'] == 100000,
+              cfg2['chunk_max_chars'])
+    finally:
+        bot.LLM_PROVIDER = saved_provider
+        bot.GEMINI_CHUNK_MAX_CHARS = saved_chunk
+
+
+def test_empty_model_response_is_error():
+    """Пустой content (None) чанка — ошибка чанка (добой), а не успех;
+    dedupe с None-текстом не падает."""
+    from types import SimpleNamespace
+    saved_provider = bot.LLM_PROVIDER
+    saved_exec = bot.execute_gemini_request
+    saved_redrive = bot.CHUNK_REDRIVE_PAUSE_SEC
+    saved_delay = bot.CHUNK_DELAY_SECONDS
+    loop = asyncio.get_event_loop()
+    try:
+        bot.LLM_PROVIDER = 'google'
+        bot.CHUNK_REDRIVE_PAUSE_SEC = 0
+        bot.CHUNK_DELAY_SECONDS = 0
+
+        class FakeResp:
+            def __init__(self, text):
+                self.choices = [SimpleNamespace(
+                    message=SimpleNamespace(content=text))]
+                self.usage = SimpleNamespace(prompt_tokens=10,
+                                             completion_tokens=5,
+                                             total_tokens=15)
+
+        async def empty_then_ok(params):
+            # Чанк 1: запрос + до 3 retry валидации — пусто (n=1..4),
+            # чанк 2 — нормальный текст (n=5), добой чанка 1 (n=6) — текст.
+            empty_then_ok.n += 1
+            if empty_then_ok.n <= 4:
+                return FakeResp(None)
+            if empty_then_ok.n == 5:
+                return FakeResp('💡 **Два**\nтекст\n\n[U2](https://t.me/c/1/2): суть\n')
+            return FakeResp('💡 **T**\nтекст\n\n[U](https://t.me/c/1/1): суть\n')
+        empty_then_ok.n = 0
+        bot.execute_gemini_request = empty_then_ok
+        chunks = [([{'message_id': 1, 'sender': 'U',
+                     'date': '2026-10-09 10:00:00', 'text': 'hi'}], 1, 1),
+                  ([{'message_id': 2, 'sender': 'U2',
+                     'date': '2026-10-09 10:01:00', 'text': 'hi2'}], 2, 2)]
+        with _quiet():
+            combined, usage = loop.run_until_complete(
+                bot.create_summary(chunks, '1', model='gemini-3.8-flash'))
+        check('пустой ответ: добой досчитал чанк',
+              '💡 **T**' in combined and '💡 **Два**' in combined
+              and '❌' not in combined,
+              combined[:200])
+
+        async def always_empty(params):
+            return FakeResp(None)
+        bot.execute_gemini_request = always_empty
+        with _quiet():
+            combined2, usage2 = loop.run_until_complete(
+                bot.create_summary(chunks, '1', model='gemini-3.8-flash'))
+        check('пустой ответ: неубиваемая пустота — ошибки чанков, не падение',
+              combined2.count('Пустой ответ модели') == 2
+              and len(usage2['errors']) == 2,
+              (combined2[:200], usage2['errors']))
+
+        # dedupe напрямую с None-текстом не падает.
+        out = bot.dedupe_topics_across_chunks(
+            [(1, 1, None, False), (2, 2, '💡 **T**\n[X](https://t.me/c/1/2)', False)])
+        check('dedupe: None-текст не роняет', len(out) == 2, out)
+    finally:
+        bot.LLM_PROVIDER = saved_provider
+        bot.execute_gemini_request = saved_exec
+        bot.CHUNK_REDRIVE_PAUSE_SEC = saved_redrive
+        bot.CHUNK_DELAY_SECONDS = saved_delay
 
 
 def test_rotate_advances_cursor():
@@ -1166,7 +1321,9 @@ def test_model_display_label():
 def test_reasoning_effort_config():
     """'none' уходит в запрос явно; пусто — параметр не шлём (дефолт модели)."""
     saved = bot.GEMINI_REASONING_EFFORT
+    saved_provider = bot.LLM_PROVIDER
     try:
+        bot.LLM_PROVIDER = 'google'
         for effort in ('none', 'low', 'medium', 'high'):
             bot.GEMINI_REASONING_EFFORT = effort
             cfg = bot.get_model_generation_config('gemini-3.6-flash')
@@ -1178,6 +1335,7 @@ def test_reasoning_effort_config():
               cfg['reasoning_effort'] is None, cfg['reasoning_effort'])
     finally:
         bot.GEMINI_REASONING_EFFORT = saved
+        bot.LLM_PROVIDER = saved_provider
 
 
 def test_api_error_diag():
