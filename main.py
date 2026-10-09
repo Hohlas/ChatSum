@@ -1206,6 +1206,11 @@ def load_model_config(filename):
         use_html_export = default_html_export
         file_provider = None
         vals = {}
+        # Пустая строка (KEY=) — осознанный сброс в '' (параметр не шлём),
+        # а не «не трогать»: иначе medium из прошлого чтения пережил бы
+        # очистку и в долгоживущем процессе, и в кроне через env. Отслеживаем
+        # присутствие ключа отдельно от непустого значения (только effort).
+        seen_keys = set()
         file_effort_generic = None
         file_chunk_generic = None
         file_temp_generic = None
@@ -1218,6 +1223,7 @@ def load_model_config(filename):
             if '=' in line:
                 key, value = line.split('=', 1)
                 key = key.strip().upper()
+                seen_keys.add(key)
                 # Strip trailing " # comment" (dotenv-style, same as push script).
                 value = value.split('#', 1)[0].strip()
 
@@ -1283,20 +1289,22 @@ def load_model_config(filename):
         if vals.get('NVIDIA_MODEL'):
             NVIDIA_DEFAULT_MODEL = vals['NVIDIA_MODEL']
         # Параметры по провайдерам.
-        if vals.get('GEMINI_REASONING_EFFORT'):
-            GEMINI_REASONING_EFFORT = vals['GEMINI_REASONING_EFFORT']
+        # Effort — по присутствию ключа: пустое значение сбрасывает в ''
+        # (дефолт модели, параметр не отправляем). Остальные — по значению.
+        if 'GEMINI_REASONING_EFFORT' in seen_keys:
+            GEMINI_REASONING_EFFORT = vals.get('GEMINI_REASONING_EFFORT', '')
         if vals.get('GEMINI_CHUNK_MAX_CHARS'):
             GEMINI_CHUNK_MAX_CHARS = vals['GEMINI_CHUNK_MAX_CHARS']
         if vals.get('GEMINI_TEMPERATURE'):
             _apply_temp(vals['GEMINI_TEMPERATURE'], 'GEMINI')
-        if vals.get('OPENROUTER_REASONING_EFFORT'):
-            OPENROUTER_REASONING_EFFORT = vals['OPENROUTER_REASONING_EFFORT']
+        if 'OPENROUTER_REASONING_EFFORT' in seen_keys:
+            OPENROUTER_REASONING_EFFORT = vals.get('OPENROUTER_REASONING_EFFORT', '')
         if vals.get('OPENROUTER_CHUNK_MAX_CHARS'):
             OPENROUTER_CHUNK_MAX_CHARS = vals['OPENROUTER_CHUNK_MAX_CHARS']
         if vals.get('OPENROUTER_TEMPERATURE'):
             _apply_temp(vals['OPENROUTER_TEMPERATURE'], 'OPENROUTER')
-        if vals.get('NVIDIA_REASONING_EFFORT'):
-            NVIDIA_REASONING_EFFORT = vals['NVIDIA_REASONING_EFFORT']
+        if 'NVIDIA_REASONING_EFFORT' in seen_keys:
+            NVIDIA_REASONING_EFFORT = vals.get('NVIDIA_REASONING_EFFORT', '')
         if vals.get('NVIDIA_CHUNK_MAX_CHARS'):
             NVIDIA_CHUNK_MAX_CHARS = vals['NVIDIA_CHUNK_MAX_CHARS']
         if vals.get('NVIDIA_TEMPERATURE'):

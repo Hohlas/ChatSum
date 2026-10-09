@@ -123,6 +123,7 @@ def main():
     test_503_holds_key()
     test_openrouter_nemotron_profile()
     test_openrouter_free_profiles()
+    test_empty_effort_key_resets_global()
     test_gemini_38_flash_profile()
     test_empty_model_response_is_error()
     test_none_choices_is_error()
@@ -877,6 +878,46 @@ def test_openrouter_free_profiles():
         bot.LLM_PROVIDER = saved_provider
         bot.OPENROUTER_REASONING_EFFORT = saved_effort
         bot.OPENROUTER_CHUNK_MAX_CHARS = saved_chunk
+
+
+def test_empty_effort_key_resets_global():
+    """Пустой KEY= в файле сбрасывает effort в '' (не хранит прошлое чтение)."""
+    path = '/tmp/opencode/test_empty_effort_cfg.txt'
+    keys = ('LLM_PROVIDER', 'CURRENT_MODEL', 'USE_REASONING', 'USE_HTML_EXPORT',
+            'GEMINI_DEFAULT_MODEL', 'GEMINI_REASONING_EFFORT',
+            'OPENROUTER_DEFAULT_MODEL', 'OPENROUTER_REASONING_EFFORT',
+            'NVIDIA_DEFAULT_MODEL', 'NVIDIA_REASONING_EFFORT')
+    snap = {k: getattr(bot, k) for k in keys}
+    try:
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write('LLM_PROVIDER=openrouter\n'
+                     'OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free\n'
+                     'OPENROUTER_REASONING_EFFORT=medium\n')
+        with _quiet():
+            bot.load_model_config(path)
+        check('effort: medium читается',
+              bot.OPENROUTER_REASONING_EFFORT == 'medium',
+              bot.OPENROUTER_REASONING_EFFORT)
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write('LLM_PROVIDER=openrouter\n'
+                     'OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free\n'
+                     'OPENROUTER_REASONING_EFFORT=\n')
+        with _quiet():
+            bot.load_model_config(path)
+        check('effort: пустой KEY= сбрасывает в пусто',
+              bot.OPENROUTER_REASONING_EFFORT == '',
+              repr(bot.OPENROUTER_REASONING_EFFORT))
+        cfg = bot.get_model_generation_config(
+            'nvidia/nemotron-3-super-120b-a12b:free', provider='openrouter')
+        check('effort: пусто → параметр не шлём (None)',
+              cfg['reasoning_effort'] is None, cfg['reasoning_effort'])
+    finally:
+        for k, v in snap.items():
+            setattr(bot, k, v)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def test_gemini_38_flash_profile():
