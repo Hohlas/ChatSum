@@ -125,6 +125,7 @@ def main():
     test_gemini_38_flash_profile()
     test_empty_model_response_is_error()
     test_none_choices_is_error()
+    test_raw_answer_dump_on_json()
     test_rotate_advances_cursor()
     test_duty_gap()
     test_work_wedge()
@@ -973,6 +974,88 @@ def test_none_choices_is_error():
         check('choices=None: одиночный путь — ошибка строкой, не падение',
               isinstance(single, str) and single.startswith('❌'),
               (single or '')[:120])
+    finally:
+        bot.LLM_PROVIDER = saved_provider
+        bot.execute_gemini_request = saved_exec
+        bot.CHUNK_REDRIVE_PAUSE_SEC = saved_redrive
+        bot.CHUNK_DELAY_SECONDS = saved_delay
+
+
+def test_raw_answer_dump_on_json():
+    """JSON-ответ чанка сохраняется в html_reports/debug_raw_* для
+    диагностики (шаг 1 лечения), анализ при этом не падает."""
+    import glob
+    saved_provider = bot.LLM_PROVIDER
+    saved_exec = bot.execute_gemini_request
+    saved_redrive = bot.CHUNK_REDRIVE_PAUSE_SEC
+    saved_delay = bot.CHUNK_DELAY_SECONDS
+    loop = asyncio.get_event_loop()
+    try:
+        bot.LLM_PROVIDER = 'google'
+        bot.CHUNK_REDRIVE_PAUSE_SEC = 0
+        bot.CHUNK_DELAY_SECONDS = 0
+        from types import SimpleNamespace
+
+        class FakeResp:
+            def __init__(self, text):
+                self.choices = [SimpleNamespace(
+                    message=SimpleNamespace(content=text))]
+                self.usage = SimpleNamespace(prompt_tokens=10,
+                                             completion_tokens=5,
+                                             total_tokens=15)
+
+        raw_json = ('{"topic": "T", "summary": "S", '
+                    '"messages": [{"author": "U", "text": "hi"}]}')
+
+        async def json_then_ok(params):
+            # Первый запрос чанка — JSON (валидация не проходит),
+            # retry с усиленным промптом — нормальный текст.
+            json_then_ok.n += 1
+            if json_then_ok.n == 1:
+                return FakeResp(raw_json)
+            return FakeResp('💡 **T**\nтекст\n\n[U](https://t.me/c/1/1): суть\n')
+        json_then_ok.n = 0
+        bot.execute_gemini_request = json_then_ok
+        chunks = [([{'message_id': 1, 'sender': 'U',
+                     'date': '2026-10-09 10:00:00', 'text': 'hi'}], 1, 1),
+                  ([{'message_id': 2, 'sender': 'U2',
+                     'date': '2026-10-09 10:01:00', 'text': 'hi2'}], 2, 2)]
+        before = set(glob.glob(os.path.join('html_reports', 'debug_raw_*.txt')))
+        with _quiet():
+            combined, usage = loop.run_until_complete(
+                bot.create_summary(chunks, '1', model='gemini-3.8-flash'))
+        dumps = sorted(set(glob.glob(
+            os.path.join('html_reports', 'debug_raw_*.txt'))) - before)
+        try:
+            check('JSON-ответ: сырой текст сохранён в debug_raw_*',
+                  len(dumps) == 1 and raw_json in open(
+                      dumps[0], encoding='utf-8').read(),
+                  dumps)
+            check('JSON-ответ: анализ не падает, retry даёт текст',
+                  '💡 **T**' in combined and '❌' not in combined
+                  and usage['errors'] == [],
+                  (combined[:200], usage['errors']))
+
+            # Пустота — не JSON: дамп не пишется, сразу ошибка чанка.
+            async def always_none(params):
+                return FakeResp(None)
+            bot.execute_gemini_request = always_none
+            before2 = set(glob.glob(
+                os.path.join('html_reports', 'debug_raw_*.txt')))
+            with _quiet():
+                combined2, _ = loop.run_until_complete(
+                    bot.create_summary(chunks, '1', model='gemini-3.8-flash'))
+            dumps2 = sorted(set(glob.glob(
+                os.path.join('html_reports', 'debug_raw_*.txt'))) - before2)
+            check('Пустой ответ: дамп не пишется, ошибки чанков без падения',
+                  dumps2 == [] and combined2.count('Пустой ответ модели') == 2,
+                  (dumps2, combined2[:200]))
+        finally:
+            for p in dumps:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
     finally:
         bot.LLM_PROVIDER = saved_provider
         bot.execute_gemini_request = saved_exec

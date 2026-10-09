@@ -2778,6 +2778,27 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                 # Проверяем, что ответ содержит саммари, а не JSON
                 if not is_valid_summary(chunk_summary):
                     print(f"   ⚠️  Ответ содержит JSON вместо текста, повторяем с усиленным промптом...")
+                    # Диагностика (шаг 1 лечения JSON-ответов): сохраняем сырой
+                    # первый ответ, чтобы видеть реальную форму ответа модели.
+                    # Только непустой текст: для пустоты есть своя ветка ниже,
+                    # файл со строкой 'None' диагностической ценности не имеет.
+                    # Папка html_reports/ в .gitignore — наружу не утечёт.
+                    if chunk_summary and str(chunk_summary).strip():
+                        try:
+                            dbg_dir = 'html_reports'
+                            if not os.path.exists(dbg_dir):
+                                os.makedirs(dbg_dir)
+                            dbg_name = (f"debug_raw_{chat_id_str}_chunk{chunk_idx}_"
+                                        f"{start_idx}-{end_idx}_"
+                                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+                            dbg_path = os.path.join(dbg_dir, dbg_name)
+                            with open(dbg_path, 'w', encoding='utf-8') as dbg_f:
+                                dbg_f.write(f"model={actual_model} chunk={chunk_idx} "
+                                            f"messages={start_idx}-{end_idx}\n\n")
+                                dbg_f.write(str(chunk_summary))
+                            print(f"   🔍 Сырой ответ сохранён: {dbg_path}")
+                        except Exception as dbg_err:
+                            print(f"   ⚠️  Не удалось сохранить сырой ответ: {dbg_err}")
                     # Добавляем усиленную инструкцию в промпт
                     enhanced_system = system_content + "\n\nВАЖНО: Верни ТОЛЬКО текстовое саммари в виде обычного текста. НЕ возвращай JSON, НЕ используй кодовые блоки ```json. Пиши непосредственно текст."
                     request_params['messages'] = [
