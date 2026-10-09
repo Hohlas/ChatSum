@@ -9,7 +9,7 @@ LLM_PROVIDER=google  # google | openrouter | nvidia
 
 GEMINI_MODEL=gemini-3.8-flash
 GEMINI_TEMPERATURE=0               # 0 = детерминированный (рекомендуется), 0.3 = вариативный
-GEMINI_REASONING_EFFORT=low     # none low medium high (none — детерминизм, medium — глубже анализ но нестабилен)
+GEMINI_REASONING_EFFORT=medium     # none low medium high (none — детерминизм, medium — глубже анализ но нестабилен)
 GEMINI_CHUNK_MAX_CHARS=40000      # CHUNK/2 токенов  для русского чата
 
 # Кандидаты на переключение (активна только строка без '#'; остальные держать в комментарии):
