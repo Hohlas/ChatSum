@@ -1298,7 +1298,8 @@ def test_collect_order_and_parents():
     kept_ids = sorted(m['message_id'] for m in kept)
     check('родитель по r не вылетает как шум', 10 in kept_ids, kept_ids)
     check('несвязанный шум вылетает', 12 not in kept_ids, kept_ids)
-    # Родитель из списка исключённых тоже сохраняется как контекст
+    # Родитель из списка исключённых вылетает вместе со своим текстом —
+    # иначе его цитаты просачиваются в саммари как «контекст» (кейс CALISTA).
     saved = bot.EXCLUDED_USERS
     bot.EXCLUDED_USERS = ['Spammer']
     try:
@@ -1310,9 +1311,22 @@ def test_collect_order_and_parents():
         ]
         with _quiet():
             kept2 = bot.optimize_messages([dict(m) for m in excl], '193')
-        check('родитель-исключённый не вылетает',
-              any(m['message_id'] == 20 for m in kept2),
-              [m['message_id'] for m in kept2])
+        kept2_ids = sorted(m['message_id'] for m in kept2)
+        check('родитель-исключённый вылетает', 20 not in kept2_ids, kept2_ids)
+        check('ответ на исключённого остаётся', 21 in kept2_ids, kept2_ids)
+        child = next(m for m in kept2 if m['message_id'] == 21)
+        check('r на выброшенного родителя сохраняется (сигнал связи, PROMPT:11)',
+              child.get('reply_to') == 20, child.get('reply_to'))
+        # Регистр не важен: в файле CAPS, в чате — как отдаст Telegram
+        bot.EXCLUDED_USERS = ['CALISTA']
+        with _quiet():
+            kept3 = bot.optimize_messages(
+                [{'sender': 'Calista', 'text': 'развёрнутый пост по существу темы',
+                  'date': '2026-10-06 10:00:00', 'message_id': 30, 'reply_to': None}],
+                '193')
+        check('исключение регистронезависимо',
+              all(m['sender'] != 'Calista' for m in kept3),
+              [m['sender'] for m in kept3])
     finally:
         bot.EXCLUDED_USERS = saved
 
@@ -1651,7 +1665,7 @@ def test_telegraph_toc():
     toc = bot.build_toc_html(titles)
     check('toc: два пункта', toc.count('<li>') == 2, toc)
     check('toc: без меток времени — голые заголовки с нумерацией',
-          '<li><a href="#💡-Вспышка-кори-в-США">Вспышка кори в США</a></li>' in toc
+          '<li><a href="#💡-Вспышка-кори-в-США"><b>Вспышка кори в США</b></a></li>' in toc
           and '<ol>' in toc, toc)
     check('toc: href первого', 'href="#💡-Вспышка-кори-в-США"' in toc, toc)
     check('toc: & в href с двойным экранированием',
@@ -1698,19 +1712,19 @@ def test_telegraph_toc():
           entries == [('Вспышка кори в США', '10:24'),
                       ('Токен LayerZero (ZRO) & рынок', '11:05')], entries)
     toc_timed = bot.build_toc_html(entries)
-    check('toc: пункт — заголовок, время в конце без кавычек',
-          '<li><a href="#💡-Вспышка-кори-в-США">Вспышка кори в США - 10:24</a></li>'
+    check('toc: пункт — жирный заголовок, время в конце обычным',
+          '<li><a href="#💡-Вспышка-кори-в-США"><b>Вспышка кори в США</b> - 10:24</a></li>'
           in toc_timed, toc_timed)
     check('toc: время со спецсимволом в заголовке',
-          'Токен LayerZero (ZRO) &amp; рынок - 11:05' in toc_timed, toc_timed)
+          '<b>Токен LayerZero (ZRO) &amp; рынок</b> - 11:05' in toc_timed, toc_timed)
     check('toc: нумерация списка на месте', '<ol>' in toc_timed, toc_timed)
     mixed = bot.build_toc_html([('A', '09:01'), ('B', None)])
-    check('toc: без метки — голый заголовок',
-          '<li><a href="#💡-B">B</a></li>' in mixed
-          and 'A - 09:01' in mixed, mixed)
+    check('toc: без метки — голый жирный заголовок',
+          '<li><a href="#💡-B"><b>B</b></a></li>' in mixed
+          and '<b>A</b> - 09:01' in mixed, mixed)
     html_timed = bot.convert_markdown_to_html(md_timed)
     check('toc: время дожило до вёрстки',
-          'Вспышка кори в США - 10:24' in html_timed, html_timed[:300])
+          '<b>Вспышка кори в США</b> - 10:24' in html_timed, html_timed[:300])
 
 
 def test_telegraph_link_stars():

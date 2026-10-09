@@ -1339,19 +1339,29 @@ def optimize_messages(messages_data, chat_id_str):
         if parent_id is not None:
             referenced_ids.add(parent_id)
 
+    # Исключённые — по нижнему регистру: Telegram может отдать имя
+    # в другом регистре, чем записано в файле.
+    excluded_lc = {u.casefold() for u in EXCLUDED_USERS}
+
     for msg in messages_data:
         sender = msg.get('sender')
         unique_senders.add(sender)
 
+        # Исключённые вылетают всегда — даже если на них отвечают.
+        # Иначе их тексты попадали в анализ как «контекст» и цитировались
+        # в саммари. Bypass ниже — только для шумовых родителей.
+        # Поле r у ответов НЕ трогаем: PROMPT.txt велит модели считать
+        # отсутствующего родителя только сигналом связи и никогда его
+        # не цитировать — ответы с общим r образуют тему без утечки автора.
+        if sender and sender.casefold() in excluded_lc:
+            excluded_count += 1
+            continue
+
         # Родитель чужой цепочки — только контекст, фильтры не применяем
+        # (кроме исключённых выше)
         if msg.get('message_id') in referenced_ids:
             msg['chat_id'] = chat_id_str
             optimized.append(msg)
-            continue
-
-        # Фильтруем исключенных пользователей
-        if sender and sender in EXCLUDED_USERS:
-            excluded_count += 1
             continue
 
         # Фильтруем бессодержательные сообщения
@@ -2995,9 +3005,10 @@ def build_toc_html(entries):
     for t, when in norm:
         href = _escape_attr('#' + telegraph_slug(t))
         text = t.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        item = f'<b>{text}</b>'
         if when:
-            text = f'{text} - {when}'
-        parts.append(f'<li><a href="{href}">{text}</a></li>')
+            item = f'{item} - {when}'
+        parts.append(f'<li><a href="{href}">{item}</a></li>')
     parts.append('</ol>')
     parts.append('<hr>')
     return ''.join(parts)
