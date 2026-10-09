@@ -494,12 +494,14 @@ def get_model_generation_config(model_name, provider=None):
             'chunk_max_chars': 100000,
         })
         config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])
-    elif model_name == 'qwen/qwen3.8-27b:free':
-        # Qwen3.8 27B (:free): контекст 262144, выход до 262144 — страница
-        # модели OpenRouter + HuggingFace Qwen/Qwen3.8-27B (натив 262144).
+    elif model_name in ('nvidia/nemotron-3-super-120b-a12b:free', 'nvidia/nemotron-3-super-120b-a12b'):
+        # Nemotron 3 Super (:free; платный twin — тот же профиль): контекст
+        # 262144, выход до 235929 — каталог OpenRouter (top_provider).
+        # Живая проба 2026-10-09: точное 'PROBE_OK' и без effort, и с
+        # reasoning_effort=medium; reasoning_effort в supported_parameters.
         config.update({
             'context_limit_tokens': 262144,
-            'output_max_tokens': 262144,
+            'output_max_tokens': 235929,
             'chunk_max_chars': 100000,
         })
         config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])

@@ -834,7 +834,7 @@ def test_openrouter_nemotron_profile():
 
 
 def test_openrouter_free_profiles():
-    """Qwen3.8-27B (:free): окно 262144, выход 262144, чанк 100K;
+    """Nemotron 3 Super (:free): окно 262144, выход 235929, чанк 100K;
     Gemma 4 31B (:free): окно 262144, выход 32768, чанк 60K (выход tight).
     Значение OPENROUTER_CHUNK_MAX_CHARS из MODEL_CONFIG.txt важнее профиля."""
     saved_provider = bot.LLM_PROVIDER
@@ -844,18 +844,18 @@ def test_openrouter_free_profiles():
         bot.LLM_PROVIDER = 'openrouter'
         bot.OPENROUTER_REASONING_EFFORT = 'low'
         bot.OPENROUTER_CHUNK_MAX_CHARS = ''
-        qwen = bot.get_model_generation_config(
-            'qwen/qwen3.8-27b:free', provider='openrouter')
-        check('qwen free: окно 262144',
-              qwen['context_limit_tokens'] == 262144,
-              qwen['context_limit_tokens'])
-        check('qwen free: выход 262144',
-              qwen['output_max_tokens'] == 262144,
-              qwen['output_max_tokens'])
-        check('qwen free: чанк 100K', qwen['chunk_max_chars'] == 100000,
-              qwen['chunk_max_chars'])
-        check('qwen free: effort low', qwen['reasoning_effort'] == 'low',
-              qwen['reasoning_effort'])
+        super120 = bot.get_model_generation_config(
+            'nvidia/nemotron-3-super-120b-a12b:free', provider='openrouter')
+        check('super free: окно 262144',
+              super120['context_limit_tokens'] == 262144,
+              super120['context_limit_tokens'])
+        check('super free: выход 235929',
+              super120['output_max_tokens'] == 235929,
+              super120['output_max_tokens'])
+        check('super free: чанк 100K', super120['chunk_max_chars'] == 100000,
+              super120['chunk_max_chars'])
+        check('super free: effort low', super120['reasoning_effort'] == 'low',
+              super120['reasoning_effort'])
         gemma = bot.get_model_generation_config(
             'google/gemma-4-31b-it:free', provider='openrouter')
         check('gemma free: окно 262144',
@@ -868,11 +868,11 @@ def test_openrouter_free_profiles():
               gemma['chunk_max_chars'])
         # Файл важнее профиля.
         bot.OPENROUTER_CHUNK_MAX_CHARS = '100000'
-        qwen2 = bot.get_model_generation_config(
-            'qwen/qwen3.8-27b:free', provider='openrouter')
-        check('qwen free: файл 100K бьёт профиль',
-              qwen2['chunk_max_chars'] == 100000,
-              qwen2['chunk_max_chars'])
+        gemma2 = bot.get_model_generation_config(
+            'google/gemma-4-31b-it:free', provider='openrouter')
+        check('gemma free: файл 100K бьёт профиль 60K',
+              gemma2['chunk_max_chars'] == 100000,
+              gemma2['chunk_max_chars'])
     finally:
         bot.LLM_PROVIDER = saved_provider
         bot.OPENROUTER_REASONING_EFFORT = saved_effort
