@@ -494,6 +494,25 @@ def get_model_generation_config(model_name, provider=None):
             'chunk_max_chars': 100000,
         })
         config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])
+    elif model_name == 'qwen/qwen3.8-27b:free':
+        # Qwen3.8 27B (:free): контекст 262144, выход до 262144 — страница
+        # модели OpenRouter + HuggingFace Qwen/Qwen3.8-27B (натив 262144).
+        config.update({
+            'context_limit_tokens': 262144,
+            'output_max_tokens': 262144,
+            'chunk_max_chars': 100000,
+        })
+        config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])
+    elif model_name == 'google/gemma-4-31b-it:free':
+        # Gemma 4 31B (:free): контекст 262144, выход до 32768 — страница
+        # модели OpenRouter (slug строго с '-it', без него 404). Выход tight:
+        # наши чанки давали до 25K токенов ответа, поэтому чанк-профиль 60K.
+        config.update({
+            'context_limit_tokens': 262144,
+            'output_max_tokens': 32768,
+            'chunk_max_chars': 60000,
+        })
+        config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])
     elif model_name in ('deepseek-ai/deepseek-v4.1-flash', 'deepseek-v4.1-flash'):
         config.update({
             'context_limit_tokens': 128000,
@@ -4969,6 +4988,7 @@ async def process_chat_command(event, use_ai=True):
             status_msg = f"🔄 Начинаю {action} последних {limit} сообщений из чата '{chat_name}'..."
         else:
             status_msg = f"🔄 Начинаю {action} чата '{chat_name}' за последние {days or 0} дней и {hours or 0} часов..."
+        status_msg += f"\nМодель {model_display_label()}"
         
         await telegram_client.send_message(
             RESULTS_DESTINATION, 

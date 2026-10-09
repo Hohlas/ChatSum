@@ -12,9 +12,12 @@ GEMINI_TEMPERATURE=0               # 0 = детерминированный (р�
 GEMINI_REASONING_EFFORT=low     # none low medium high (none — детерминизм, medium — глубже анализ но нестабилен)
 GEMINI_CHUNK_MAX_CHARS=40000      # CHUNK/2 токенов  для русского чата
 
-OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free
+# Кандидаты на переключение (активна только строка без '#'; остальные держать в комментарии):
+# OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free   # контекст 1M, выход 65K, чанк-профиль 100K
+OPENROUTER_MODEL=qwen/qwen3.8-27b:free            # контекст 262K, выход 262K, чанк-профиль 100K
+# OPENROUTER_MODEL=google/gemma-4-31b-it:free      # контекст 262K, выход 32K (tight), чанк-профиль 60K; slug строго с '-it'
 OPENROUTER_TEMPERATURE=0
-OPENROUTER_REASONING_EFFORT=low
+OPENROUTER_REASONING_EFFORT=medium
 OPENROUTER_CHUNK_MAX_CHARS=100000   # ~42K токенов входа, ~30K токенов выхода: запас 2x до лимита 65536
 
 NVIDIA_MODEL=deepseek-ai/deepseek-v4.1-flash

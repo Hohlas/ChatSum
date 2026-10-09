@@ -122,10 +122,13 @@ def main():
     test_key_cursor()
     test_503_holds_key()
     test_openrouter_nemotron_profile()
+    test_openrouter_free_profiles()
     test_gemini_38_flash_profile()
     test_empty_model_response_is_error()
     test_none_choices_is_error()
     test_raw_answer_dump_on_json()
+    test_refresh_runtime_files()
+    test_inbox_start_notice_shows_model()
     test_rotate_advances_cursor()
     test_duty_gap()
     test_work_wedge()
@@ -830,6 +833,52 @@ def test_openrouter_nemotron_profile():
         (bot.openrouter_client, bot.asyncio.sleep) = saved
 
 
+def test_openrouter_free_profiles():
+    """Qwen3.8-27B (:free): окно 262144, выход 262144, чанк 100K;
+    Gemma 4 31B (:free): окно 262144, выход 32768, чанк 60K (выход tight).
+    Значение OPENROUTER_CHUNK_MAX_CHARS из MODEL_CONFIG.txt важнее профиля."""
+    saved_provider = bot.LLM_PROVIDER
+    saved_effort = bot.OPENROUTER_REASONING_EFFORT
+    saved_chunk = bot.OPENROUTER_CHUNK_MAX_CHARS
+    try:
+        bot.LLM_PROVIDER = 'openrouter'
+        bot.OPENROUTER_REASONING_EFFORT = 'low'
+        bot.OPENROUTER_CHUNK_MAX_CHARS = ''
+        qwen = bot.get_model_generation_config(
+            'qwen/qwen3.8-27b:free', provider='openrouter')
+        check('qwen free: окно 262144',
+              qwen['context_limit_tokens'] == 262144,
+              qwen['context_limit_tokens'])
+        check('qwen free: выход 262144',
+              qwen['output_max_tokens'] == 262144,
+              qwen['output_max_tokens'])
+        check('qwen free: чанк 100K', qwen['chunk_max_chars'] == 100000,
+              qwen['chunk_max_chars'])
+        check('qwen free: effort low', qwen['reasoning_effort'] == 'low',
+              qwen['reasoning_effort'])
+        gemma = bot.get_model_generation_config(
+            'google/gemma-4-31b-it:free', provider='openrouter')
+        check('gemma free: окно 262144',
+              gemma['context_limit_tokens'] == 262144,
+              gemma['context_limit_tokens'])
+        check('gemma free: выход 32768',
+              gemma['output_max_tokens'] == 32768,
+              gemma['output_max_tokens'])
+        check('gemma free: чанк 60K', gemma['chunk_max_chars'] == 60000,
+              gemma['chunk_max_chars'])
+        # Файл важнее профиля.
+        bot.OPENROUTER_CHUNK_MAX_CHARS = '100000'
+        qwen2 = bot.get_model_generation_config(
+            'qwen/qwen3.8-27b:free', provider='openrouter')
+        check('qwen free: файл 100K бьёт профиль',
+              qwen2['chunk_max_chars'] == 100000,
+              qwen2['chunk_max_chars'])
+    finally:
+        bot.LLM_PROVIDER = saved_provider
+        bot.OPENROUTER_REASONING_EFFORT = saved_effort
+        bot.OPENROUTER_CHUNK_MAX_CHARS = saved_chunk
+
+
 def test_gemini_38_flash_profile():
     """gemini-3.8-flash: окно 1M, выход 65536 (официальные доки)."""
     saved_provider = bot.LLM_PROVIDER
@@ -1061,6 +1110,218 @@ def test_raw_answer_dump_on_json():
         bot.execute_gemini_request = saved_exec
         bot.CHUNK_REDRIVE_PAUSE_SEC = saved_redrive
         bot.CHUNK_DELAY_SECONDS = saved_delay
+
+
+def test_refresh_runtime_files():
+    """Обновление настроек перед командой: один fetch, запись только при
+    изменении, переключение провайдера применяется, сбой — тихо и на старом."""
+    import unittest.mock as mock
+    from types import SimpleNamespace
+
+    tmp_sched = '/tmp/opencode/test_sched_refresh.txt'
+    tmp_model = '/tmp/opencode/test_model_refresh.txt'
+    for p in (tmp_sched, tmp_model):
+        if os.path.exists(p):
+            os.remove(p)
+    with open(tmp_sched, 'w', encoding='utf-8') as fh:
+        fh.write('old-schedule\n')
+    with open(tmp_model, 'w', encoding='utf-8') as fh:
+        fh.write('LLM_PROVIDER=google\nGEMINI_MODEL=gemini-3.8-flash\n')
+
+    fake = SimpleNamespace(SCHEDULE_FILE=tmp_sched,
+                           MODEL_CONFIG_FILE=tmp_model,
+                           LLM_PROVIDER='google',
+                           CURRENT_MODEL='gemini-3.8-flash',
+                           USE_REASONING=False, USE_HTML_EXPORT=True)
+    applied = {}
+
+    def fake_reload():
+        applied['reloaded'] = True
+        fake.CURRENT_MODEL = 'nvidia/nemotron-3-ultra-550b-a55b:free'
+        fake.LLM_PROVIDER = 'openrouter'
+        return fake.CURRENT_MODEL, False, True
+    fake.refresh_model_config = fake_reload
+
+    real_open = open
+    writes = []
+
+    def counting_open(path, mode='r', *a, **k):
+        if 'w' in str(mode) and str(path) in (tmp_sched, tmp_model):
+            writes.append(str(path))
+        return real_open(path, mode, *a, **k)
+
+    new_sched = 'new-schedule\n'
+    new_model = ('LLM_PROVIDER=openrouter\n'
+                 'OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free\n')
+    fresh = {'SCHEDULE.txt': new_sched, 'MODEL_CONFIG.txt': new_model}
+    with mock.patch('builtins.open', counting_open):
+        with _quiet():
+            ok = run_once.refresh_runtime_files_best_effort(fake, fresh)
+    check('refresh: изменения применились',
+          ok is True and applied.get('reloaded') is True
+          and open(tmp_sched, encoding='utf-8').read() == new_sched
+          and open(tmp_model, encoding='utf-8').read() == new_model
+          and fake.LLM_PROVIDER == 'openrouter',
+          (ok, applied))
+    check('refresh: оба файла записаны за один проход',
+          sorted(writes) == sorted([tmp_sched, tmp_model]), writes)
+
+    # Повтор с тем же текстом — тихо, без перезаписи и перечитывания.
+    applied.clear()
+    writes.clear()
+    with mock.patch('builtins.open', counting_open):
+        with _quiet():
+            ok2 = run_once.refresh_runtime_files_best_effort(fake, fresh)
+    check('refresh: без изменений — тихо, файл не трогаем',
+          ok2 is True and writes == [] and applied == {},
+          (ok2, writes))
+
+    # Fetch упал (None) — False, файлы целы.
+    with _quiet():
+        ok3 = run_once.refresh_runtime_files_best_effort(
+            fake, {'SCHEDULE.txt': None, 'MODEL_CONFIG.txt': None})
+    check('refresh: сбой fetch — False, файлы целы',
+          ok3 is False
+          and open(tmp_sched, encoding='utf-8').read() == new_sched,
+          ok3)
+
+    # Хук перед командой: зовёт общий refresh, исключение — False без падения.
+    calls = []
+    saved = run_once.refresh_runtime_files_best_effort
+    try:
+        run_once.refresh_runtime_files_best_effort = lambda m, fresh=None: (
+            calls.append(1) or True)
+        check('hook: зовёт refresh и возвращает True',
+              run_once.refresh_before_command(fake, 'Test') is True
+              and calls == [1], calls)
+
+        def boom(main, fresh=None):
+            raise RuntimeError('net down')
+        run_once.refresh_runtime_files_best_effort = boom
+        with _quiet():
+            res = run_once.refresh_before_command(fake, 'Test')
+        check('hook: исключение — False, не падает', res is False, res)
+    finally:
+        run_once.refresh_runtime_files_best_effort = saved
+
+    # Сквозной тест на реальном main: смена провайдера применяется целиком.
+    real_file = bot.MODEL_CONFIG_FILE
+    real_sched = bot.SCHEDULE_FILE
+    snap = {k: getattr(bot, k) for k in (
+        'LLM_PROVIDER', 'CURRENT_MODEL', 'USE_REASONING', 'USE_HTML_EXPORT',
+        'GEMINI_DEFAULT_MODEL', 'GEMINI_TEMPERATURE', 'GEMINI_REASONING_EFFORT',
+        'GEMINI_CHUNK_MAX_CHARS', 'OPENROUTER_DEFAULT_MODEL',
+        'OPENROUTER_TEMPERATURE', 'OPENROUTER_REASONING_EFFORT',
+        'OPENROUTER_CHUNK_MAX_CHARS', 'NVIDIA_DEFAULT_MODEL',
+        'NVIDIA_TEMPERATURE', 'NVIDIA_REASONING_EFFORT',
+        'NVIDIA_CHUNK_MAX_CHARS')}
+    bot.MODEL_CONFIG_FILE = tmp_model
+    bot.SCHEDULE_FILE = tmp_sched
+    try:
+        with open(tmp_model, 'w', encoding='utf-8') as fh:
+            fh.write('LLM_PROVIDER=google\nGEMINI_MODEL=gemini-3.8-flash\n')
+        with _quiet():
+            bot.refresh_model_config()
+        # В файле — старый google-текст, во fresh — новый: refresh должен
+        # увидеть различие, записать и перечитать.
+        with _quiet():
+            ok4 = run_once.refresh_runtime_files_best_effort(
+                bot, {'SCHEDULE.txt': 'x\n', 'MODEL_CONFIG.txt': new_model})
+        check('refresh: реальный main переключает провайдера целиком',
+              ok4 is True and bot.LLM_PROVIDER == 'openrouter'
+              and bot.CURRENT_MODEL == 'nvidia/nemotron-3-ultra-550b-a55b:free',
+              (ok4, bot.LLM_PROVIDER, bot.CURRENT_MODEL))
+    finally:
+        bot.MODEL_CONFIG_FILE = real_file
+        bot.SCHEDULE_FILE = real_sched
+        for k, v in snap.items():
+            setattr(bot, k, v)
+        with _quiet():
+            bot.refresh_model_config()
+    for p in (tmp_sched, tmp_model):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def test_inbox_start_notice_shows_model():
+    """Стартовое TG-уведомление inbox-команды содержит строку 'Модель ...'
+    (диагностика активного провайдера при переключении LLM_PROVIDER)."""
+    class FakeMsg:
+        def __init__(self, id, text):
+            self.id = id
+            self.text = text
+            self.reply_to = None
+
+    class FakeEntity:
+        title = 'SrcChat'
+
+    class FakeClient:
+        def __init__(self, msgs):
+            self.msgs = msgs
+            self.sent = []
+            self.deleted = []
+
+        async def iter_messages(self, dest, limit=None, min_id=None, offset_id=0):
+            msgs = self.msgs
+            if min_id is not None:
+                msgs = [m for m in msgs if m.id > min_id]
+            for m in msgs:
+                yield m
+
+        async def get_messages(self, dest, ids=None):
+            want = ids if isinstance(ids, (list, tuple)) else [ids]
+            found = [m for m in self.msgs if m.id in want]
+            if isinstance(ids, (list, tuple)):
+                return found
+            return found[0] if found else None
+
+        async def get_entity(self, peer_id):
+            return FakeEntity()
+
+        async def send_message(self, dest, text, reply_to=None):
+            self.sent.append(text)
+            return None
+
+        async def delete_messages(self, dest, ids):
+            self.deleted.extend(ids)
+
+    class FakeMain:
+        RESULTS_DESTINATION = 'test-inbox'
+        parse_chat_command_args = staticmethod(bot.parse_chat_command_args)
+        model_display_label = staticmethod(bot.model_display_label)
+
+        def __init__(self, client):
+            self.telegram_client = client
+
+        async def get_or_create_topic(self, name):
+            return 1
+
+        async def run_analysis(self, **kw):
+            return True
+
+    client = FakeClient([FakeMsg(7, 'sum10 t.me/c/1892263845/50')])
+    fake = FakeMain(client)
+    asyncio.get_event_loop().run_until_complete(
+        run_once.poll_inbox_once(fake, None, run_once.new_inbox_mem()))
+    starts = [t for t in client.sent if t.startswith('🔄 Начинаю')]
+    check('inbox notice: стартовое сообщение отправлено', len(starts) == 1, client.sent)
+    check('inbox notice: есть строка модели',
+          bool(starts) and 'Модель ' in starts[0]
+          and bot.model_display_label() in starts[0],
+          starts)
+
+    # Без хелпера подпись не роняет команду: уведомление с '?', задача выполнена.
+    class BareMain(FakeMain):
+        model_display_label = None
+    client2 = FakeClient([FakeMsg(8, 'sum10 t.me/c/1892263845/50')])
+    bare = BareMain(client2)
+    res = asyncio.get_event_loop().run_until_complete(
+        run_once.poll_inbox_once(bare, None, run_once.new_inbox_mem()))
+    check('inbox notice: без хелпера команда выполняется', res == (8, 0), res)
+    check('inbox notice: без хелпера подпись-пустышка',
+          any('Модель ?' in t for t in client2.sent), client2.sent)
 
 
 def test_rotate_advances_cursor():
@@ -1884,7 +2145,10 @@ def test_due_cap():
     calls = []
 
     class FakeMain:
-        SCHEDULE_FILE = 'x'
+        # Путь-заглушка в /tmp: run_due_once теперь обновляет SCHEDULE.txt
+        # перед задачами (refresh_before_command), dummy обязан быть
+        # записываемым и не мусорить в корне репо.
+        SCHEDULE_FILE = '/tmp/opencode/test_due_cap_sched.txt'
 
         @staticmethod
         def load_schedule(path):

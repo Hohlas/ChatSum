@@ -770,22 +770,94 @@ def _verify_push(path, local):
     return False
 
 
-def _fetch_file_from_main(path):
-    """Fetch single tracked file text from origin/main (best-effort)."""
+def fetch_main_files_once(paths=('SCHEDULE.txt', 'MODEL_CONFIG.txt')):
+    """Один git fetch + git show на каждый файл. Возвращает {path: text|None}.
+
+    Рабочее дерево не трогается (только чтение origin/main) — безопасно
+    посреди дежурства. Ошибка сети → None по всем файлам, ран не падает.
+    """
     import subprocess
+    texts = {p: None for p in paths}
     try:
         f = subprocess.run(['git', 'fetch', '--quiet', '--depth=1', 'origin', 'main'],
                            capture_output=True, text=True, timeout=60)
         if f.returncode != 0:
-            return None
-        s = subprocess.run(['git', 'show', f'origin/main:{path}'],
-                           capture_output=True, text=True, timeout=30)
-        if s.returncode != 0 or not s.stdout.strip():
-            return None
-        text = s.stdout if s.stdout.endswith('\n') else s.stdout + '\n'
-        return text
+            return texts
+        for p in paths:
+            s = subprocess.run(['git', 'show', f'origin/main:{p}'],
+                               capture_output=True, text=True, timeout=30)
+            if s.returncode == 0 and s.stdout.strip():
+                texts[p] = s.stdout if s.stdout.endswith('\n') else s.stdout + '\n'
+    except Exception:
+        pass
+    return texts
+
+
+def _read_local_text(path):
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            return fh.read()
     except Exception:
         return None
+
+
+def _apply_schedule_text(main, fresh):
+    """Записать SCHEDULE.txt, если отличается от локального.
+
+    Тихо при отсутствии изменений (частый случай при опросе перед
+    каждой командой). Возвращает True/False.
+    """
+    if fresh is None:
+        return False
+    try:
+        if _read_local_text(main.SCHEDULE_FILE) == fresh:
+            return True
+        with open(main.SCHEDULE_FILE, 'w', encoding='utf-8') as fh:
+            fh.write(fresh)
+        print("🔄 SCHEDULE.txt обновлён из origin/main")
+        return True
+    except Exception as e:
+        print(f"⚠️ Не удалось обновить SCHEDULE.txt: {e}")
+        return False
+
+
+def _apply_model_text(main, fresh):
+    """Записать MODEL_CONFIG.txt (если отличается) + перечитать в рантайм.
+
+    Перечитывание через main.refresh_model_config() обновляет всё, включая
+    LLM_PROVIDER, температуры, чанки и клиентов. Тихо без изменений.
+    Возвращает True/False.
+    """
+    if fresh is None:
+        return False
+    try:
+        if _read_local_text(main.MODEL_CONFIG_FILE) == fresh:
+            return True
+        old_provider = getattr(main, 'LLM_PROVIDER', '?')
+        old_model = getattr(main, 'CURRENT_MODEL', '?')
+        with open(main.MODEL_CONFIG_FILE, 'w', encoding='utf-8') as fh:
+            fh.write(fresh)
+    except Exception as e:
+        print(f"⚠️ Не удалось обновить MODEL_CONFIG.txt: {e}")
+        return False
+    try:
+        refresh = getattr(main, 'refresh_model_config', None)
+        if callable(refresh):
+            refresh()
+        else:
+            main.CURRENT_MODEL, main.USE_REASONING, main.USE_HTML_EXPORT = \
+                main.load_model_config(main.MODEL_CONFIG_FILE)
+        new_provider = getattr(main, 'LLM_PROVIDER', '?')
+        new_model = getattr(main, 'CURRENT_MODEL', '?')
+        if new_provider != old_provider or new_model != old_model:
+            print(f"🔄 MODEL_CONFIG обновлён: "
+                  f"провайдер {old_provider}→{new_provider}, модель {old_model}→{new_model}")
+        else:
+            print(f"🔄 MODEL_CONFIG обновлён (провайдер {new_provider}, модель {new_model})")
+        return True
+    except Exception as e:
+        print(f"⚠️ Не удалось перечитать MODEL_CONFIG.txt: {e}")
+        return False
 
 
 def refresh_schedule_best_effort(main):
@@ -796,50 +868,46 @@ def refresh_schedule_best_effort(main):
     (_sched_add/_sched_unsch пушат сразу либо откатывают), так что
     перезапись безопасна. Возвращает True/False.
     """
-    text = _fetch_file_from_main('SCHEDULE.txt')
-    if text is None:
-        return False
-    try:
-        with open(main.SCHEDULE_FILE, 'w', encoding='utf-8') as fh:
-            fh.write(text)
-        return True
-    except Exception:
-        return False
+    texts = fetch_main_files_once(('SCHEDULE.txt',))
+    return _apply_schedule_text(main, texts.get('SCHEDULE.txt'))
 
 
 def refresh_model_config_best_effort(main):
     """Обновить локальный MODEL_CONFIG.txt из origin/main + перечитать.
 
     Один push в main меняет настройки модели без смены Secrets/Variables
-    и без перезапуска дежурства: следующий цикл лидера уже работает
+    и без перезапуска дежурства: следующая команда уже работает
     с новыми значениями. Возвращает True/False.
     """
-    text = _fetch_file_from_main('MODEL_CONFIG.txt')
-    if text is None:
-        return False
+    texts = fetch_main_files_once(('MODEL_CONFIG.txt',))
+    return _apply_model_text(main, texts.get('MODEL_CONFIG.txt'))
+
+
+def refresh_runtime_files_best_effort(main, fresh=None):
+    """Refresh SCHEDULE.txt + MODEL_CONFIG.txt: один fetch на оба файла.
+
+    fresh — предзагруженный dict fetch_main_files_once() (точка перед
+    командой и тесты); None — дотянуть самому. Тихо без изменений.
+    """
+    texts = fresh if fresh is not None else fetch_main_files_once()
+    ok_sched = _apply_schedule_text(main, texts.get('SCHEDULE.txt'))
+    ok_model = _apply_model_text(main, texts.get('MODEL_CONFIG.txt'))
+    return ok_sched and ok_model
+
+
+def refresh_before_command(main, why):
+    """Обновить настройки перед исполнением команды (best-effort).
+
+    Коммит владельца в main применяется без перезапуска дежурства;
+    конфиг дальше заморожен на время задачи (переключения посреди
+    чанков нет). Не сработало — команда идёт на текущем конфиге, тихо:
+    fetch-падения и так молчаливые, спам в лог не нужен.
+    Возвращает True/False.
+    """
     try:
-        with open(main.MODEL_CONFIG_FILE, 'w', encoding='utf-8') as fh:
-            fh.write(text)
+        return bool(refresh_runtime_files_best_effort(main))
     except Exception:
         return False
-    try:
-        refresh = getattr(main, 'refresh_model_config', None)
-        if callable(refresh):
-            refresh()
-        else:
-            main.CURRENT_MODEL, main.USE_REASONING, main.USE_HTML_EXPORT = \
-                main.load_model_config(main.MODEL_CONFIG_FILE)
-        return True
-    except Exception as e:
-        print(f"⚠️ Не удалось перечитать MODEL_CONFIG.txt: {e}")
-        return False
-
-
-def refresh_runtime_files_best_effort(main):
-    """Refresh SCHEDULE.txt + MODEL_CONFIG.txt together (one fetch each)."""
-    ok_sched = refresh_schedule_best_effort(main)
-    ok_model = refresh_model_config_best_effort(main)
-    return ok_sched and ok_model
 
 
 def git_push_schedule(message):
@@ -1080,6 +1148,10 @@ async def run_due_once(main, args, state, path, max_tasks=None):
         print(f"⏳ Due-кап: беру {max_tasks} из {len(pending)}, "
               f"остальные — следующими итерациями (inbox вперёд).")
         pending = pending[:max_tasks]
+
+    # Свежий конфиг к старту задач (коммит без перезапуска); при сбое молча
+    # едем на текущем. Только когда есть работа — в простое fetch не нужен.
+    refresh_before_command(main, 'Due')
 
     failed = 0
     for entry, occurrence, key, date_key in pending:
@@ -1598,6 +1670,20 @@ async def _sched_add(main, mem, dest, msg, m):
     return 'ok'
 
 
+def _model_diag_label(main):
+    """Подпись 'модель effort' для стартовых TG-уведомлений.
+
+    Чисто диагностика: хелпера нет или упал — '?' вместо падения команды.
+    """
+    fn = getattr(main, 'model_display_label', None)
+    if callable(fn):
+        try:
+            return fn()
+        except Exception:
+            pass
+    return '?'
+
+
 async def process_inbox_message(main, mem, dest, msg):
     """Обработка одного inbox-сообщения. Возвращает 'ok' | 'fail' | 'skip' | 'retry'.
 
@@ -1737,6 +1823,11 @@ async def process_inbox_message(main, mem, dest, msg):
     except Exception as e:
         print(f"⚠️ Inbox {msg.id}: не удалось перепроверить команду ({e}) — продолжаю")
 
+    # Свежий конфиг к моменту исполнения (MODEL_CONFIG/SCHEDULE из origin/main):
+    # коммит владельца применяется без перезапуска дежурства; дальше конфиг
+    # заморожен на время задачи. Не сработало — едем на текущем, тихо.
+    refresh_before_command(main, f"Inbox {msg.id}")
+
     notify_topic = home
     attempt_no = _attempt_number(mem, msg.id)
     retry_note = f" 🔁 Попытка {attempt_no}/{INBOX_MAX_ATTEMPTS}." if attempt_no > 1 else ""
@@ -1745,7 +1836,8 @@ async def process_inbox_message(main, mem, dest, msg):
         notify_topic = topic_out
         action = "анализ" if use_ai else "экспорт"
         await main.telegram_client.send_message(
-            dest, f"🔄 Начинаю {action} по команде из inbox, чат '{chat_name}'...{retry_note}",
+            dest, f"🔄 Начинаю {action} по команде из inbox, чат '{chat_name}'...{retry_note}"
+                  f"\nМодель {_model_diag_label(main)}",
             reply_to=topic_out)
         ok = await main.run_analysis(
             chat_id=source_id,
@@ -2021,8 +2113,10 @@ async def _run_leader_loop(main, args, state, path, me, poll, use_handoff,
                     # как разруливатель сплит-брейна: старший молча выходит.
                     print(f"👑 Обнаружен более новый лидер {remote.get('run_id')} — выхожу.")
                     break
-                if iteration % sched_every == 0:
-                    refresh_runtime_files_best_effort(main)
+            # Страховочная сетка поверх обновления перед каждой командой:
+            # тик общий для handoff и сольного режима, тихо без изменений.
+            if iteration % sched_every == 0:
+                refresh_runtime_files_best_effort(main)
             # Inbox всегда первый: команды не ждут догона расписания.
             try:
                 last_seen, inbox_failed = await poll_inbox_once(main, last_seen, inbox_mem)
