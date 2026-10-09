@@ -1681,7 +1681,7 @@ def test_telegraph_toc():
     check('toc: href пережил санитарку',
           'href="#💡-Вспышка-кори-в-США"' in html_two, html_two[:400])
     check('toc: содержание до первого топика',
-          html_two.index('Содержание') < html_two.index('<h3>'))
+          html_two.index('Содержание') < html_two.index('<h3'))
     md_one = '💡 **Один топик**\n*Идея.*\n'
     check('toc: один топик — без содержания',
           'Содержание' not in bot.convert_markdown_to_html(md_one))
@@ -1725,6 +1725,20 @@ def test_telegraph_toc():
     html_timed = bot.convert_markdown_to_html(md_timed)
     check('toc: время дожило до вёрстки',
           '<b>Вспышка кори в США</b> - 10:24' in html_timed, html_timed[:300])
+    check('якоря: h3 несёт id тем же слагом, что ссылка содержания',
+          '<h3 id="💡-Вспышка-кори-в-США">' in html_timed, html_timed[:300])
+    check('якоря: id со спецсимволом экранирован как href',
+          '<h3 id="💡-Токен-LayerZero-(ZRO)-&amp;amp;-рынок">' in html_timed,
+          html_timed[:600])
+    hrefs = re.findall(r'<li><a href="(#[^"]+)">', html_timed)
+    check('якоря: каждой ссылке содержания есть парный h3',
+          len(hrefs) == 2
+          and all(f'<h3 id="{h[1:]}">' in html_timed for h in hrefs), hrefs)
+    check('якоря: Telegram-ветка — без h3 и id',
+          '<h3' not in tg_html and 'id=' not in tg_html, tg_html[:200])
+    dup_html = bot.convert_markdown_to_html('💡 **Повтор**\n*Идея.*\n\n---\n\n💡 **Повтор**\n*Идея.*\n')
+    check('якоря: дубли — одинаковый id (прыжок на первое, как href)',
+          dup_html.count('<h3 id="💡-Повтор">') == 2, dup_html[:200])
 
 
 def test_telegraph_link_stars():
@@ -1757,7 +1771,7 @@ def test_telegraph_link_stars():
           '<i></a>' not in html and '</i></a>' not in html, html)
     check('звёзды: второй топик не проглочен',
           'шесть' in html
-          and html.index('<h3>💡 <b>Второй топик</b></h3>') > html.index('четыре'),
+          and html.index('<h3 id="💡-Второй-топик">💡 <b>Второй топик</b></h3>') > html.index('четыре'),
           html[:120])
     tg = bot.convert_markdown_to_html(md, for_telegram=True)
     check('звёзды: Telegram-ветка — все ссылки закрыты',

@@ -2933,8 +2933,8 @@ def _preprocess_for_telegram(content):
 def extract_topic_titles(markdown_text):
     """Заголовки топиков из Markdown-саммари (строки на 💡) чистым текстом.
 
-    Разметка снимается теми же выражениями и в том же порядке, что в ветке
-    <h3> у convert_markdown_to_html, — иначе слаг разойдётся с якорем.
+    Чистка — через _strip_topic_title, общую с веткой <h3>, иначе слаг
+    разойдётся с якорем.
     """
     return [title for title, _ in extract_toc_entries(markdown_text)]
 
@@ -2944,6 +2944,19 @@ def extract_topic_titles(markdown_text):
 TOPIC_TIME_RE = re.compile(r'^-\s*\*(\d{2}\.\d{2})\s+(\d{2}:\d{2})\*\s*-$')
 
 
+def _strip_topic_title(line_stripped):
+    """Чистый текст заголовка топика из строки на 💡.
+
+    Разметка снимается теми же выражениями и в том же порядке, что в ветке
+    <h3> у convert_markdown_to_html, — иначе слаг разойдётся с якорем.
+    Единая точка для extract_toc_entries и id у <h3>.
+    """
+    title = line_stripped[1:].strip()
+    title = MD_BOLD_RE.sub(r'\1', title)
+    title = MD_ITALIC_RE.sub(r'\1', title)
+    return title.strip()
+
+
 def extract_toc_entries(markdown_text):
     """Пары (заголовок, ЧЧ:ММ) для содержания: время — из строки-метки
     топика (первая цитата), без метки — None (пункт без времени)."""
@@ -2951,10 +2964,7 @@ def extract_toc_entries(markdown_text):
     for line in (markdown_text or '').split('\n'):
         stripped = line.strip()
         if stripped.startswith('💡'):
-            title = stripped[1:].strip()
-            title = MD_BOLD_RE.sub(r'\1', title)
-            title = MD_ITALIC_RE.sub(r'\1', title)
-            title = title.strip()
+            title = _strip_topic_title(stripped)
             if title:
                 entries.append([title, None])
             continue
@@ -3135,7 +3145,17 @@ def convert_markdown_to_html(content, for_telegram=False):
             if for_telegram:
                 html_paragraphs.append(f'\n<b>{text}</b>\n')
             else:
-                html_paragraphs.append(f'<h3>{text}</h3>')
+                # id-якорь тем же слагом, что ссылки содержания: локальный
+                # .html статичен (фронтенда telegra.ph там нет), а API хранит
+                # только href/src — на telegra.ph якорь соберётся из текста.
+                # Строка уже экранирована выше (до разметки), а содержание
+                # читает сырой Markdown — снимаем один слой, иначе слаг
+                # получит лишнее экранирование и разойдётся с href.
+                anchor = _strip_topic_title(line_stripped)
+                anchor = (anchor.replace('&amp;', '&')
+                          .replace('&lt;', '<').replace('&gt;', '>'))
+                aid = f' id="{_escape_attr(telegraph_slug(anchor))}"' if anchor else ''
+                html_paragraphs.append(f'<h3{aid}>{text}</h3>')
             continue
         ts_match = re.match(r'^-\s*\*(\d{2}\.\d{2}\s+\d{2}:\d{2})\*\s*-$', line_stripped)
         if ts_match:
