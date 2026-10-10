@@ -794,6 +794,18 @@ def should_rotate_key_for_error(error_message):
     )
 
 
+def _is_timeout_text(error_str):
+    """Превышение ожидания: ловит и 'timeout', и 'timed out'.
+
+    Библиотека приходит с текстом 'Request timed out.' (через пробел) —
+    слитная проверка 'timeout' его не видит, и повтор не срабатывает.
+    """
+    if not error_str:
+        return False
+    lowered = error_str.lower()
+    return 'timeout' in lowered or 'timed out' in lowered
+
+
 def is_transient_server_error(error_str):
     """Транзиентный сбой сервера (перегрузка/таймаут), а не квота/доступ.
 
@@ -804,7 +816,7 @@ def is_transient_server_error(error_str):
     """
     if not error_str:
         return False
-    if 'unavailable' in error_str.lower() or 'timeout' in error_str.lower():
+    if 'unavailable' in error_str.lower() or _is_timeout_text(error_str):
         return True
     return re.search(r'\b(500|502|503|504)\b', error_str) is not None
 
@@ -890,10 +902,14 @@ async def execute_gemini_request(request_params):
     for attempt_idx in range(attempts):
         for retry in range(max_retries_per_key):
             try:
+                t0 = time.monotonic()
                 return await google_client.chat.completions.create(**request_params)
             except Exception as e:
                 last_error = e
                 error_str = str(e)
+                elapsed = time.monotonic() - t0
+                print(f"   ⏱️ Попытка: ключ {current_google_key_index + 1}/{max(1, len(GOOGLE_API_KEYS))}, "
+                      f"повтор {retry + 1}/{max_retries_per_key}, {type(e).__name__}, {elapsed:.0f}с: {error_str}")
 
                 # Квота/доступ (429): плоская ротация — один удар в ключ,
                 # сразу следующий, без повторов и сна. Сухой ключ от повторов
@@ -917,7 +933,7 @@ async def execute_gemini_request(request_params):
                 # Временные сбои сервера — retry с задержкой на том же ключе
                 is_retryable = any(
                     code in error_str for code in ('503', '429', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED')
-                ) or 'timeout' in error_str.lower()
+                ) or _is_timeout_text(error_str)
                 if is_retryable and retry < max_retries_per_key - 1:
                     delay = (retry + 1) * 10
                     print(f"   ⚠️  Временный сбой, повтор через {delay}с (попытка {retry + 2}/{max_retries_per_key})...")
@@ -990,7 +1006,7 @@ async def _execute_single_key_request(request_params):
                 raise
             is_retryable = any(
                 code in error_str for code in ('503', '429', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED')
-            ) or 'timeout' in error_str.lower()
+            ) or _is_timeout_text(error_str)
             if is_retryable and retry < max_retries - 1:
                 delay = (retry + 1) * 10
                 print(f"   ⚠️  Временный сбой, повтор через {delay}с (попытка {retry + 2}/{max_retries})...")
@@ -1457,8 +1473,10 @@ current_google_key_index = 0
 google_analysis_counter = 0
 
 # Создаём асинхронный HTTP-клиент с настройками таймаута и лимитов соединений
+# 600с: модели с обдумыванием отвечают минутами (непоточный запрос ждёт
+# полный ответ); 180с рвало такие запросы на полуслове (сессия 27).
 http_client = httpx.AsyncClient(
-    timeout=180.0,
+    timeout=600.0,
     limits=httpx.Limits(
         max_keepalive_connections=5,
         max_connections=10
@@ -1471,12 +1489,18 @@ def create_google_client(api_key):
 
 def create_llm_client(provider, api_key):
     """OpenAI-совместимый клиент под провайдер. api_key может быть пустым
-    (клиент создастся, запрос упадёт честной 401 — валидация ловит раньше)."""
+    (клиент создастся, запрос упадёт честной 401 — валидация ловит раньше).
+
+    max_retries=0: повторы библиотеки отключены осознанно (сессия 27) —
+    повторяет только наш код (паузы 10/20с, смена ключа) и внешний цикл
+    (inbox «Попытка N/5» / due «провал N»). Иначе слои умножались: до 12
+    наших вызовов × 3 попытки библиотеки.
+    """
     return AsyncOpenAI(
         api_key=api_key or 'missing-key',
         base_url=PROVIDER_BASE_URL.get(provider, PROVIDER_BASE_URL['google']),
         http_client=http_client,
-        max_retries=2
+        max_retries=0
     )
 
 
@@ -3175,17 +3199,18 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False):
         
         return error_msg, None
     except Exception as e:
-        error_msg = f"❌ Ошибка при создании выжимки: {e}"
+        error_msg = f"❌ Ошибка при создании выжимки ({type(e).__name__}): {e}"
         print(error_msg)
         print(f"   Модель: {actual_model}")
         print(f"   Размер данных: {len(messages_json)} символов")
         print(f"   Тип ошибки: {type(e).__name__}")
-        
-        # Подробный traceback для отладки
+
+        # Подробный traceback для отладки (в stdout: в журнале Actions
+        # виден целиком, в отличие от stderr-варианта print_exc).
         import traceback
         print("   Подробная трассировка:")
-        traceback.print_exc()
-        
+        print(traceback.format_exc())
+
         return error_msg, None
 def enrich_summary_with_timestamps(summary_text, messages_data, period_start_date=None):
     msg_date_map = {}
@@ -4333,9 +4358,15 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             # Проверяем, что summary не является сообщением об ошибке
             if summary.startswith('❌'):
                 # Если получили ошибку, отправляем её пользователю и выходим
+                if _is_timeout_text(summary):
+                    hint = ("⚠️ Модель думала дольше предела ожидания (600 с). "
+                            "Повтор идёт сам по внешнему циклу.")
+                else:
+                    hint = ("⚠️ Анализ прерван. Попробуйте позже "
+                            "или уменьшите количество сообщений.")
                 await telegram_client.send_message(
                     RESULTS_DESTINATION,
-                    f"{summary}\n\n⚠️ Анализ прерван. Попробуйте позже или уменьшите количество сообщений.",
+                    f"{summary}\n\n{hint}",
                     reply_to=topic_id
                 )
                 return False
