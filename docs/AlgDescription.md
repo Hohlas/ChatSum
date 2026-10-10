@@ -4,7 +4,9 @@ Telegram summarizer bot, one codebase, **two runtime modes — use exactly one
 at a time** (two live processes on one Telegram session desync updates and can
 kill the authorization; README §"Выбор площадки"). Repo: `Hohlas/ChatSum`. Read this file
 first; it replaces reading the whole code. Numbers below are load-bearing —
-do not "tune" them without the owner.
+do not "tune" them without the owner. Locations are symbol names, never line
+numbers (`grep -n "def merge_states" run_once.py`) — line numbers rot on
+every edit.
 
 ## Components
 
@@ -35,8 +37,22 @@ do not "tune" them without the owner.
    retries the command ×5, so one command could burn ~15 requests. Sustained
    503 also stops remaining chunks (`stop_due_to_overload`, mirror of the
    quota stop), so a multi-chunk summary doesn't sleep 3 min per chunk.
-   500/502/504 and timeouts deliberately stay on the old short-retry
-   path (second-long blips; timeouts are ambiguous client/network-side).
+    500/502/504 stay on the old short-retry path (second-long blips).
+    Timeouts and connection breaks ride the same short path (retries with
+    10/20s pauses on the same key, then rotation) but with a long fuse:
+    HTTP budget 600s — `gemini-3.8-flash` + thinking high answers non-streamed,
+    one request waits for the full thought (session 27: 180s cut healthy
+    answers). SDK retries are OFF (`max_retries=0`) — retries are ours +
+    rotation only, never layered (library × ours multiplies). Detection:
+    `_is_timeout_text` catches both `timeout` and `timed out` (the latter is
+    what the library actually emits); `_is_connection_error` matches by TYPE
+    (`APIConnectionError`, wraps `httpx.ReadError`/`ConnectError` — the text
+    is a bare `Connection error.` and must not be trusted). A break before
+    the answer almost surely spends no quota, so retry+rotate is cheap.
+    Observability per attempt: `⏱️ Попытка:` log line (key, retry, error type,
+    seconds), error type in the TG text, full traceback to stdout; TG hints
+    for timeout ("model thought past the 600s budget, outer loop repeats")
+    and for connection break.
    TG 429 line carries quotaId + retry (`format_quota_diagnostic`; retry also
    parsed from message text 'Please retry in 17h1m40s'). TG 503 line is the
    **verbatim** Google error text (`format_server_overload_diagnostic`, `❌`
@@ -44,17 +60,26 @@ do not "tune" them without the owner.
    (`_log_response_headers`) to look for an overload-end signal.
 - `run_once.py` — scheduler + duty wrapper. Imports `main.py`. Entry points:
   `--due` (manual drain), `--watch` (duty loop). All times in slots are
-  **MSK = UTC+3** (`MSK`, `run_once.py:39`).
+  **MSK = UTC+3** (`MSK` in `run_once.py`).
 - `SCHEDULE.txt` (on `main`) — slots `chat_id|HH:MM|limit`, one per line.
   Leading `+` is stripped. Limit `10` = cheap probe, `1d` = full summary.
-- `.github/workflows/summarize.yml` — cron `*/31 * * * *` UTC (31 is coprime
-  with 60, ticks drift away from the :00 load peak; sparser than the old */11 —
-  GitHub silently thins out frequent crons), `timeout-minutes: 355`
+- `.github/workflows/summarize.yml` — cron `7,19,33,46,58 * * * *` UTC:
+  explicit minute list, no drift (cron is wall-clock-anchored; the old "31 is
+  coprime with 60, ticks drift" note was wrong — `*/31` sat fixed at :00+:31,
+  hitting the load peak every hour). Minutes avoid the :00–:05 peak (docs:
+  delays/drops) and round minutes (:15/:30/:45 herd choice — hypothesis,
+  unmeasured); gaps 12–14 min + 9-min seam at the hour edge. ~5 ticks/h risks
+  GitHub thinning (tick_probe on */11: one run per 2.5–9.7h, session 17) —
+  gaps are bridged by the 5.5h watch + promotion, monitored by gap warnings.
+  `timeout-minutes: 355`
   (platform max 360; the kill is identical to GitHub's — ours only lands
   earlier and predictably), **no `concurrency`** (overlap is the design,
   not an accident). Budget: watch 330 + tail 15 + setup 1 = 346 ≤ 355.
-  Inputs `watch_seconds` (default 19800 = 5.5h), `poll_interval` (default 30).
-- `state` branch (GitHub Contents API, `STATE_DEFAULT`, `run_once.py:40`):
+  Inputs `watch_seconds` (workflow default 19800 = 5.5h; code default 18000),
+  `poll_interval` (default 30). Stdout is unbuffered (`PYTHONUNBUFFERED=1`)
+  so web logs stream in real time instead of arriving in 8KB chunks minutes
+  late (session 27: log lagged reality by ~5 min on silent pauses).
+- `state` branch (GitHub Contents API, `STATE_DEFAULT` in `run_once.py`):
   `state.json` {`completed`, `last_run_utc`, `google_key_cursor`,
   `inbox_attempts`, `due_fails`}, `leader.json`, `standby.json`,
   `work.json` {`run_id`, `last_work_utc`} (progress marker, §Duty protocol).
@@ -68,22 +93,21 @@ do not "tune" them without the owner.
 
 ## VPS mode (long-lived userbot, the original mode)
 
-Entry: `python3 main.py` → `main()` (`main.py:4771`) → Telethon client
+Entry: `python3 main.py` → `main()` in `main.py` → Telethon client
 `run_until_disconnected()`. One process holds one Telegram session
 (`session_name.session` file; `telegram_session.txt` holds the StringSession
 copy). Config is local `private.txt` (+ `PROMPT.txt`, `EXCLUDED_USERS.txt`,
 `PRIORITY_USERS.txt`, `SCHEDULE.txt` from the working tree).
 
 - Commands are **outgoing slash-commands from the owner's own account**
-  (`@telegram_client.on(events.NewMessage(outgoing=True, ...))`,
-  `main.py:4120+`): `/sum` (`3h` / `45` / `600-800` / `2d-3d` / `1d+` — the
+  (handler on `events.NewMessage(outgoing=True, ...)` in `main.py`): `/sum` (`3h` / `45` / `600-800` / `2d-3d` / `1d+` — the
   `+` also posts the result back into the source chat), `/copy` (same ranges,
   no AI = no API cost), `/config` family (`/show_model`, `/set_model`,
   `/add_excluded`, `/reload_config`, …), `/sch HH:MM period` + `/sch_list` +
   `/unsch`, `/help`. Send `/sum …` in any chat, the userbot answers there.
-- Schedule: APScheduler `AsyncIOScheduler` (`main.py:4067`); `reload_schedule()`
-  (`main.py:4105`) registers one `CronTrigger` per slot in MSK
-  (`scheduled_analysis_job`, `main.py:4070` → `run_analysis(…, scheduled=True)`).
+- Schedule: APScheduler `AsyncIOScheduler` in `main.py`; `reload_schedule()`
+  registers one `CronTrigger` per slot in MSK
+  (`scheduled_analysis_job` → `run_analysis(…, scheduled=True)`).
 - No dedup layer: a trigger fires once by the clock. If the process is down
   at fire time, **that slot is silently missed** — no catch-up (this exact
   weakness is why the Actions mode uses per-key `completed` marks instead).
@@ -93,55 +117,55 @@ copy). Config is local `private.txt` (+ `PROMPT.txt`, `EXCLUDED_USERS.txt`,
 
 ## GitHub Actions mode (duty on cron, current production mode)
 
-No long-lived process: short-lived workflow runs form a relay — cron tick
-`*/31` UTC starts a run, the run works as leader or standby for up to 5.5h,
-then the next tick takes over.
+No long-lived process: short-lived workflow runs form a relay — each cron tick
+(`7,19,33,46,58 * * * *` UTC) starts a run, the run works as leader or standby
+for up to 5.5h, then the next tick takes over.
 
-## Leader iteration (the hot loop, `_run_leader_loop`, `run_once.py:1940`)
+## Leader iteration (the hot loop, `_run_leader_loop` in `run_once.py`)
 
 Each iteration, strictly in this order:
 
-1. **Inbox first** — `poll_inbox_first` (`run_once.py:1771`): deep first pass
+1. **Inbox first** — `poll_inbox_first` in `run_once.py`: deep first pass
 with `offset_id` pagination (10×100) so commands buried under summaries
 during a gap are not skipped. Processing via `_process_batch` /
-`process_inbox_message` (`run_once.py:1744`/`1552`). Before starting an
+`process_inbox_message`. Before starting an
    analysis the message is re-read (claim-check vs double-take by a rival).
    Failure does NOT delete the command: `inbox_attempts` counter up to
    `INBOX_MAX_ATTEMPTS=5` with "🔁 Попытка N/5" progress; `last_seen` rolls
    back to (oldest retry − 1) so retry comes in ~30s, not after restart.
    Only success or exhaustion deletes the command.
 2. **At most one due task** — `run_due_once(..., max_tasks=1)`
-    (`MAX_DUE_PER_ITERATION`, `run_once.py:186`; manual `--due` passes
+    (`MAX_DUE_PER_ITERATION`; manual `--due` passes
     None = drain all). Per-key dedup: `compute_due(entries, now, completed)`
-    (`run_once.py:847`) — a slot fires once per key `chat|HH:MM|limit` per
+    — a slot fires once per key `chat|HH:MM|limit` per
     occurrence date. After 3 consecutive failures a slot is skipped for 1h
-    (`due_skip_info`, `run_once.py:968`; quota protection). Success clears.
+    (`due_skip_info`; quota protection). Success clears.
     Worst inbox delay ≈ one summary duration.
-3. Background: `_heartbeat_loop` (`run_once.py:1913`, own asyncio task)
+3. Background: `_heartbeat_loop` (own asyncio task)
     re-claims + pushes every `LEADER_HEARTBEAT_SEC` (interleaves on Gemini/
     Telegram awaits — a long summary must NOT look like a dead leader).
     State + work-marker push ride the same 120s rhythm,
     `SCHEDULE.txt` refresh from `origin/main` every
     `SCHEDULE_REFRESH_SEC` (a 5.5h run would otherwise go stale).
 
-Cleanup (`_watch_cleanup`, `run_once.py:1824`) ALWAYS pull-merges first,
+Cleanup (`_watch_cleanup`) ALWAYS pull-merges first,
 then saves/pushes. The workflow's trailing `Persist state` step does the
 same. Rationale: a silent standby or a yielding leader must only ever write
 a **superset** — never wipe чужой прогресс.
 
 ## Duty protocol (leader ↔ standby, all via Contents API files)
 
-- Claim: `leader_claim` (`run_once.py:625`) — check-then-PUT, last-writer-wins
+- Claim: `leader_claim` — check-then-PUT, last-writer-wins
   + one retry on sha race. New run claims `ready:false`, then `ready:true`
   only after Telegram connect succeeds (a run that can't reach Telegram
   must never look like a leader).
-- Newcomer vs live leader → `_run_standby_loop` (`run_once.py:2009`): no
+- Newcomer vs live leader → `_run_standby_loop`: no
   Telegram, only GETs the flag every 30s; single shared `standby.json`.
   Older standby yields to a newer one ("newer wins" — the promoter is
-  normally ≤31 min old, so inherited reigns stay long).
-- `leader_should_yield` (`run_once.py:254`): yield only to a live + ready +
+  normally ≤14 min old, so inherited reigns stay long).
+- `leader_should_yield`: yield only to a live + ready +
   strictly newer leader; equal start time → bigger `run_id` wins.
-- `standby_should_promote` (`run_once.py:519`): missing flag, stale heartbeat,
+- `standby_should_promote`: missing flag, stale heartbeat,
   or `retiring` leader — confirmed over `PROMOTE_CONFIRM_READS` consecutive
   reads (no flapping on one slow GET). A leader near its deadline writes
   `retiring` + pushes → handoff is instant.
@@ -160,15 +184,15 @@ a **superset** — never wipe чужой прогресс.
 
 ## State merge — the one invariant that matters
 
-`merge_states(local, remote)` (`run_once.py:675`) is a **union**, never an
+`merge_states(local, remote)` is a **union**, never an
 intersection: `completed` keeps the fresher date per key, counters take
 `max()` (incl. `google_key_cursor` — a local value must never roll the
-rotation back), `last_run_utc` takes max. `prune_state` (`run_once.py:93`)
+rotation back), `last_run_utc` takes max. `prune_state`
 drops counters older than 3 days. Consequence: under a single writer,
 pushed content is monotonically non-decreasing in keys.
 
-`push_state_best_effort` (`run_once.py:723`): GET → merge → PUT → on sha
-conflict one re-GET/merge/PUT. Then `_verify_push` (`run_once.py:748`):
+`push_state_best_effort`: GET → merge → PUT → on sha
+conflict one re-GET/merge/PUT. Then `_verify_push`:
 re-read the branch, confirm all local `completed` keys are present;
 on mismatch one more PUT + loud `🚨` log (tripwire, see Incidents §4).
 A run never exits nonzero over state trouble — worst case the trailing
@@ -202,8 +226,8 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
 
 | Symbol | Value | Meaning |
 |---|---|---|
-| cron / timeout | `*/31`, 355 min | schedule drift; 330 watch + 15 tail + 1 setup (platform max 360) |
-| watch / poll defaults | 19800s / 30s | duty length / inbox latency while leader lives |
+| cron / timeout | `7,19,33,46,58`, 355 min | off-peak un-round ticks (gaps 12–14 min + 9-min seam); 330 watch + 15 tail + 1 setup (platform max 360) |
+| watch / poll defaults | workflow 19800s / code 18000s / poll 30s | duty length (workflow input wins) / inbox latency while leader lives |
 | `LEADER_HEARTBEAT_SEC` / `LEADER_STALE_SEC` | 120 / 300 | liveness bound ≈ 2 missed beats |
 | `WORK_STALE_SEC` (`work.json`) | 900 | wedge bound: fresh heartbeat + no progress 15 min → takeover |
 | `SCHEDULE_REFRESH_SEC` | 600 | schedule staleness inside a 5.5h run |
@@ -253,12 +277,14 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
   live in GitHub Secrets + locally only. Never commit, never print.
 - `docs/CONTEXT_HANDOFF.md` = the *now* (live run ids, today's observations);
   stable knowledge lives HERE, not there. One source of truth each.
-- Tests: `./venv/bin/python tests/test_run_once.py` must stay green (241 PASS as of
-  2026-10-06; incl. `test_duty`, `test_heartbeat_loop`, `test_due_cap`,
-  `test_inbox_retry_flow`, `test_duty_gap`, `test_work_wedge`,
+- Tests: `./venv/bin/python tests/test_run_once.py` must stay green (390 PASS
+  as of 2026-10-10, plus 1 KNOWN fail: `nemotron: чанк 100K` — fails on the
+  clean tree too, do not chase it; incl. `test_duty`, `test_heartbeat_loop`,
+  `test_due_cap`, `test_inbox_retry_flow`, `test_duty_gap`, `test_work_wedge`,
   `test_leader_watch_inherit`, `test_timeout_budget`, `test_liveness`,
   `test_due_fail_renew`, `test_quota_diag`, `test_flat_rotation`,
-  `test_503_holds_key`). The last one parses
+  `test_503_holds_key`, `test_server_overload_diag`,
+  `test_connection_error_retries`). `test_timeout_budget` parses
   `summarize.yml` with plain regex (no new deps) and asserts
   watch + tail + setup ≤ timeout — the exact inequality that killed three
   leaders on 2026-10-05.
