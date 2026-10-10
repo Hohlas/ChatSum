@@ -92,6 +92,9 @@ jobs:
           WATCH_SECONDS:  ${{ github.event.inputs.watch_seconds }}
           # run_once.py читает/пишет state по этому пути (вне рабочего дерева)
           STATE_PATH: ${{ runner.temp }}/state.json
+          # Без буфера stdout: иначе print копится по 8КБ и веб-лог
+          # отстаёт от реальности на минуты (паузы 30с/3мин молчат).
+          PYTHONUNBUFFERED: '1'
           # handoff лидерства через Contents API ветки state
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
