@@ -5,7 +5,7 @@
 # REASONING_EFFORT: none low medium high.
 # LLM_PROVIDER: google | openrouter | nvidia (default google).
 
-LLM_PROVIDER=google  # google | openrouter | nvidia
+LLM_PROVIDER=goopenrouterogle  # google | openrouter | nvidia
 
 GEMINI_MODEL=gemini-3.8-flash
 GEMINI_TEMPERATURE=0               # 0 = детерминированный (рекомендуется), 0.3 = вариативный
@@ -18,7 +18,7 @@ OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free   # контекст 1M,
 # OPENROUTER_MODEL=google/gemma-4-31b-it:free      # контекст 262K, выход 32K (tight), чанк-профиль 60K; slug строго с '-it'
 OPENROUTER_TEMPERATURE=0
 OPENROUTER_REASONING_EFFORT=medium  # 
-OPENROUTER_CHUNK_MAX_CHARS=100000   # ~42K токенов входа, ~30K токенов выхода: запас большой до лимита 235929
+OPENROUTER_CHUNK_MAX_CHARS=80000   # ~42K токенов входа, ~30K токенов выхода: запас большой до лимита 235929
 
 NVIDIA_MODEL=deepseek-ai/deepseek-v4.1-flash
 NVIDIA_TEMPERATURE=0
