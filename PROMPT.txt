@@ -41,12 +41,12 @@ Step 3: Formulate key idea.
 For each topic, write 1-2 sentence summary reflecting dominant opinion, consensus, or main conclusion (note disagreements if no consensus).
 
 Step 4: Select quotes and key arguments.
-- LIMIT: Include quotes from maximum 5 participants per topic, maximum 2 quotes per participant. These limits apply only to a topic's quotes; they never limit or merge the number of topics.
 - Prioritize messages that:
   1) are from {PRIORITY_USERS} (key contributors, match by field "s")
   2) contain external URLs (keep the URL in the gist)
   3) most accurately reflect the discussion essence.
-- Format: link, then a one-sentence gist; quote verbatim in "..." only a term or a figure.
+- After prioritizing, keep quotes from at most 5 participants per topic, at most 2 quotes per participant. These limits are per-topic; they never limit or merge the number of topics.  
+- Format: link, then a one-sentence gist; quote verbatim in "..." only a term or a number.
 - Messages longer than 200 characters: compress to one sentence and keep any external URL.
 - Preserve original terminology and key phrases.
 
@@ -65,7 +65,7 @@ Use this template:
 *<key idea of the topic (1-2 sentences)>*
 
 [{s}](https://t.me/c/{chat_id}/{id}): one-sentence gist
-... (up to 5 participants, up to 2 lines per participant)
+... (up to 5 participants, up to 2 quotes per participant)
 
 ---
 
