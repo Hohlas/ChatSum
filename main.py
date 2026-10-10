@@ -7,7 +7,7 @@ import time
 from collections import Counter
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from openai import AsyncOpenAI, AuthenticationError, APIStatusError
+from openai import AsyncOpenAI, AuthenticationError, APIConnectionError, APIStatusError
 from dotenv import load_dotenv
 import json
 from datetime import datetime, timedelta, timezone
@@ -806,6 +806,21 @@ def _is_timeout_text(error_str):
     return 'timeout' in lowered or 'timed out' in lowered
 
 
+def _is_connection_error(error):
+    """Обрыв соединения: ловля по типу, а не по тексту.
+
+    Текст беден и нестабилен ('Connection error.'), а тип точен:
+    библиотека заворачивает httpx.ReadError/ConnectError в
+    APIConnectionError (см. прод-след 10.10: обрыв на чтении заголовков).
+    Обрыв до ответа лимит почти surely не тратит — повтор и смена ключа
+    здесь дешевле, чем при 503.
+    """
+    try:
+        return isinstance(error, APIConnectionError)
+    except Exception:
+        return False
+
+
 def is_transient_server_error(error_str):
     """Транзиентный сбой сервера (перегрузка/таймаут), а не квота/доступ.
 
@@ -913,7 +928,7 @@ async def execute_gemini_request(request_params):
 
                 # Квота/доступ (429): плоская ротация — один удар в ключ,
                 # сразу следующий, без повторов и сна. Сухой ключ от повторов
-                # не мокреет; 503/таймауты идут ниже старым путём с повторами.
+                # не мокреет; 503/таймауты/обрывы идут ниже старым путём с повторами.
                 if is_quota_rate_limit(e):
                     if attempt_idx < attempts - 1:
                         rotate_google_api_key("квота исчерпана, сразу следующий ключ")
@@ -933,7 +948,7 @@ async def execute_gemini_request(request_params):
                 # Временные сбои сервера — retry с задержкой на том же ключе
                 is_retryable = any(
                     code in error_str for code in ('503', '429', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED')
-                ) or _is_timeout_text(error_str)
+                ) or _is_timeout_text(error_str) or _is_connection_error(e)
                 if is_retryable and retry < max_retries_per_key - 1:
                     delay = (retry + 1) * 10
                     print(f"   ⚠️  Временный сбой, повтор через {delay}с (попытка {retry + 2}/{max_retries_per_key})...")
@@ -941,12 +956,12 @@ async def execute_gemini_request(request_params):
                     continue
 
                 # Ретраи на том же ключе исчерпаны, а сбой транзиентный
-                # (503/таймаут, НЕ квота) — пробуем следующий ключ.
-                if (is_transient_server_error(error_str)
+                # (503/таймаут/обрыв, НЕ квота) — пробуем следующий ключ.
+                if ((is_transient_server_error(error_str) or _is_connection_error(e))
                         and attempt_idx < attempts - 1
                         and server_rotations < MAX_SERVER_ROTATIONS):
                     server_rotations += 1
-                    rotate_google_api_key("сервер перегружен/таймаут, пробуем следующий ключ")
+                    rotate_google_api_key("сервер перегружен/таймаут/обрыв, пробуем следующий ключ")
                     break  # выходим из retry-цикла, пробуем следующий ключ
 
                 # Ошибки аутентификации — ротация ключа
@@ -1006,7 +1021,7 @@ async def _execute_single_key_request(request_params):
                 raise
             is_retryable = any(
                 code in error_str for code in ('503', '429', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED')
-            ) or _is_timeout_text(error_str)
+            ) or _is_timeout_text(error_str) or _is_connection_error(e)
             if is_retryable and retry < max_retries - 1:
                 delay = (retry + 1) * 10
                 print(f"   ⚠️  Временный сбой, повтор через {delay}с (попытка {retry + 2}/{max_retries})...")
@@ -4360,6 +4375,10 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                 # Если получили ошибку, отправляем её пользователю и выходим
                 if _is_timeout_text(summary):
                     hint = ("⚠️ Модель думала дольше предела ожидания (600 с). "
+                            "Повтор идёт сам по внешнему циклу.")
+                elif ('connection error' in summary.lower()
+                        or 'APIConnectionError' in summary):
+                    hint = ("⚠️ Соединение с моделью оборвалось. "
                             "Повтор идёт сам по внешнему циклу.")
                 else:
                     hint = ("⚠️ Анализ прерван. Попробуйте позже "

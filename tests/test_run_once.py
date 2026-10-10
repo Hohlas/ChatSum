@@ -121,6 +121,7 @@ def main():
     test_sched_flows()
     test_key_cursor()
     test_503_holds_key()
+    test_connection_error_retries()
     test_openrouter_nemotron_profile()
     test_openrouter_free_profiles()
     test_empty_effort_key_resets_global()
@@ -765,6 +766,77 @@ def test_503_holds_key():
                   and calls['n'] == 1,
                   (str(e)[:40], bot.current_google_key_index, calls))
         check('503: пауза 3 мин, повтора нет', sleeps == [180], sleeps)
+    finally:
+        (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
+         bot.google_analysis_counter, bot.google_client,
+         bot.asyncio.sleep, bot.LLM_PROVIDER) = saved
+        bot.set_google_api_key_index = saved_set_index
+
+
+def test_connection_error_retries():
+    """Обрыв соединения: повторы 10/20с на том же ключе, затем смена ключа;
+    разовый обрыв лечится повтором. Ловля по типу — текст беден."""
+    saved = (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
+             bot.google_analysis_counter, bot.google_client, bot.asyncio.sleep,
+             bot.LLM_PROVIDER)
+    saved_set_index = bot.set_google_api_key_index
+    sleeps = []
+    calls = {'n': 0}
+    mode = {'failures_left': 1}
+
+    async def fake_sleep(sec):
+        sleeps.append(sec)
+
+    class FakeCompletions:
+        async def create(self, **kw):
+            calls['n'] += 1
+            if mode['failures_left'] > 0:
+                mode['failures_left'] -= 1
+                raise bot.APIConnectionError(message="Connection error.",
+                                             request=None)
+            return "OK"
+
+    class FakeClient:
+        chat = type('C', (), {'completions': FakeCompletions()})()
+
+    def fake_set_index(idx):
+        bot.current_google_key_index = idx % len(bot.GOOGLE_API_KEYS)
+
+    loop = asyncio.get_event_loop()
+    try:
+        bot.LLM_PROVIDER = 'google'
+        bot.GOOGLE_API_KEYS = ['k1', 'k2', 'k3']
+        bot.current_google_key_index = 0
+        bot.google_analysis_counter = 0
+        bot.asyncio.sleep = fake_sleep
+        bot.google_client = FakeClient()
+        bot.set_google_api_key_index = fake_set_index
+
+        # Разовый обрыв: повтор через 10с лечит, ключ тот же
+        with _quiet():
+            res = loop.run_until_complete(bot.execute_gemini_request({}))
+        check('обрыв: разовый лечится повтором',
+              res == "OK" and calls['n'] == 2, (res, calls))
+        check('обрыв: пауза 10с, ключ тот же',
+              sleeps == [10] and bot.current_google_key_index == 0,
+              (sleeps, bot.current_google_key_index))
+
+        # Глухой обрыв: 3 попытки на ключ, смена ключа, в конце raise
+        mode['failures_left'] = 10 ** 9
+        calls['n'] = 0
+        del sleeps[:]
+        try:
+            with _quiet():
+                loop.run_until_complete(bot.execute_gemini_request({}))
+            check('обрыв: должен был raise', False)
+        except Exception as e:
+            check('обрыв: raise после круга',
+                  isinstance(e, bot.APIConnectionError) and calls['n'] == 9,
+                  (type(e).__name__, calls))
+        check('обрыв: паузы 10/20 на ключ + смена ×2',
+              sleeps == [10, 20, 10, 20, 10, 20]
+              and bot.current_google_key_index == 2,
+              (sleeps, bot.current_google_key_index))
     finally:
         (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
          bot.google_analysis_counter, bot.google_client,
