@@ -2178,7 +2178,7 @@ def build_processed_label(count, range_start=None, range_end=None, time_range_st
     return f"{count} {plural_messages(count)}"
 
 
-def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, total_messages=None, filtered_messages=None, period_start_date=None):
+def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, total_messages=None, filtered_messages=None):
     """
     Формирует оптимизированную JSON структуру для экспорта/анализа
     
@@ -2190,17 +2190,10 @@ def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, t
         chat_name: Название чата (опционально, для экспорта)
         total_messages: Общее количество сообщений (опционально, для экспорта)
         filtered_messages: Количество отфильтрованных сообщений (опционально, для экспорта)
-        period_start_date: Дата первого сообщения исходного периода (до догрузки родительских)
-    
+
     Returns:
         Словарь с оптимизированной структурой: {'metadata': {...}, 'messages': [...]}
     """
-    # Используем переданную дату начала периода, или берем из первого сообщения (запасной вариант)
-    if period_start_date:
-        period_start = period_start_date
-    else:
-        period_start = messages_data[0].get('date', '') if messages_data else ''
-    
     # Преобразуем плоский список сообщений с переименованием полей
     # sender → s, text → t, message_id → id, reply_to → r
     # Поле date исключаем из финального JSON
@@ -2218,8 +2211,7 @@ def build_optimized_json_structure(messages_data, chat_id_str, chat_name=None, t
     
     # Формируем metadata
     metadata = {
-        'chat_id': safe_str(chat_id_str),
-        'period_start': safe_str(period_start)
+        'chat_id': safe_str(chat_id_str)
     }
     
     # Дополнительные поля для экспорта (/copy)
@@ -2647,7 +2639,7 @@ def dedupe_topics_across_chunks(chunk_summaries):
     return result
 
 
-async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, period_start_date=None):
+async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False):
     """
     Создает выжимку из сообщений с помощью LLM активного провайдера.
     Использует предварительно разбитые на чанки сообщения.
@@ -2657,7 +2649,6 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         chat_id_str: ID чата для ссылок
         model: Название модели (например, значение из MODEL_CONFIG.txt). Если None, используется CURRENT_MODEL
         use_reasoning: Использовать ли reasoning режим (для моделей с поддержкой)
-        period_start_date: Дата начала периода для метаданных
 
     Returns:
         Кортеж (текст выжимки, информация об использовании токенов)
@@ -2724,9 +2715,6 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
             print(f"   👥 Приоритетные пользователи: не заданы")
     system_content = safe_str(prompt_with_priority)
     
-    # Добавляем критические инструкции для предотвращения JSON-ответов
-    system_content += "\n\n⚠️ CRITICAL: Return ONLY plain text summary. NEVER return JSON. NEVER use code blocks (```). NEVER echo input JSON structure."
-    
     # Проверяем, нужно ли разбивать на чанки
     if num_chunks > 1:
         # ═══════════════════════════════════════════════════════════════
@@ -2766,10 +2754,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
             print(f"\n📦 Обработка чанка {chunk_idx} из {num_chunks} ({chunk_size} сообщений: {start_idx}-{end_idx})")
             
             # Формируем JSON для текущего чанка
-            chunk_period_start = chunk_messages[0].get('date', '') if chunk_messages else period_start_date
-            optimized_structure = build_optimized_json_structure(
-                chunk_messages, chat_id_str, period_start_date=chunk_period_start
-            )
+            optimized_structure = build_optimized_json_structure(chunk_messages, chat_id_str)
             messages_json = json.dumps(optimized_structure, ensure_ascii=False)
             
             # Примечание: Размер чанка уже проверен в split_messages_by_chars()
@@ -2984,7 +2969,6 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
                 healed, healed_usage = await create_summary(
                     [(chunk_messages, start_idx, end_idx)],
                     chat_id_str, model=model, use_reasoning=use_reasoning,
-                    period_start_date=period_start_date,
                 )
                 if healed and not healed.startswith('❌'):
                     chunk_summaries[list_idx] = (start_idx, end_idx, healed, False)
@@ -3047,7 +3031,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
     chunk_messages, start_idx, end_idx = chunks[0]
     
     # Формируем JSON
-    optimized_structure = build_optimized_json_structure(chunk_messages, chat_id_str, period_start_date=period_start_date)
+    optimized_structure = build_optimized_json_structure(chunk_messages, chat_id_str)
     messages_json = json.dumps(optimized_structure, ensure_ascii=False)
     
     # Проверяем размер и при необходимости ограничиваем
@@ -3068,8 +3052,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False, p
         print(f"   💡 Рекомендация: уменьшите период анализа (например /analyze 12h вместо 24h)")
         
         chunk_messages_limited = chunk_messages[-limit:]
-        period_start_limited = chunk_messages_limited[0].get('date', '') if chunk_messages_limited else period_start_date
-        optimized_structure = build_optimized_json_structure(chunk_messages_limited, chat_id_str, period_start_date=period_start_limited)
+        optimized_structure = build_optimized_json_structure(chunk_messages_limited, chat_id_str)
         messages_json = json.dumps(optimized_structure, ensure_ascii=False)
     
     try:
@@ -4345,7 +4328,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
         # Ветвление: с AI или без
         if use_ai:
             # Режим /sum - анализ с AI
-            summary, usage_info = await create_summary(chunks, chat_id_str, model=CURRENT_MODEL, use_reasoning=USE_REASONING, period_start_date=period_start_date)
+            summary, usage_info = await create_summary(chunks, chat_id_str, model=CURRENT_MODEL, use_reasoning=USE_REASONING)
             
             # Проверяем, что summary не является сообщением об ошибке
             if summary.startswith('❌'):
@@ -4740,8 +4723,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                 chat_id_str,
                 chat_name=chat_name,
                 total_messages=len(messages_data),
-                filtered_messages=len(optimized_messages),
-                period_start_date=period_start_date
+                filtered_messages=len(optimized_messages)
             )
             
             # Вычисляем информацию о периоде

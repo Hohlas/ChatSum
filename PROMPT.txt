@@ -38,13 +38,13 @@ Step 2: Remove noise.
 Delete topics that consist ONLY of spam, bot messages, or non-substantive one-liners. If a topic contains at least one substantive message, keep the topic and drop only its noise replies. Never let noise break or cancel a reply chain.
 
 Step 3: Formulate key idea.
-For each topic, write 1-2 sentence summary reflecting dominant opinion, consensus, or main conclusion (note disagreements if no consensus).
+For each topic, write 1-2 sentence summary reflecting dominant opinion, consensus, or main conclusion (note disagreements if no consensus; note significant dissent even under consensus).
 
 Step 4: Select quotes and key arguments.
 - Prioritize messages that:
-  1) are from {PRIORITY_USERS} (key contributors, match by field "s")
+  1) are from {PRIORITY_USERS} if any (key contributors, match by field "s")
   2) contain external URLs (keep the URL in the gist)
-  3) most accurately reflect the discussion essence.
+  3) most accurately reflect the discussion essence, including dissent.
 - After prioritizing, keep quotes from at most 5 participants per topic, at most 2 quotes per participant. These limits are per-topic; they never limit or merge the number of topics.  
 - Format: link, then a one-sentence gist; quote verbatim in "..." only a term or a number.
 - Messages longer than 200 characters: compress to one sentence and keep any external URL.

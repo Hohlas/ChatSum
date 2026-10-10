@@ -74,7 +74,6 @@ def run_effort(loop, effort, model, raw, meta, out_dir):
             meta.get('chat_id', ''),
             model=model,
             use_reasoning=(effort != 'none'),
-            period_start_date=meta.get('period_start'),
         ))
         usage = usage or {}
         if not usage.get('errors'):
