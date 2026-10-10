@@ -5,7 +5,7 @@
 # REASONING_EFFORT: none low medium high.
 # LLM_PROVIDER: google | openrouter | nvidia (default google).
 
-LLM_PROVIDER=goopenrouterogle  # google | openrouter | nvidia
+LLM_PROVIDER=openrouter  # google | openrouter | nvidia
 
 GEMINI_MODEL=gemini-3.8-flash
 GEMINI_TEMPERATURE=0               # 0 = детерминированный (рекомендуется), 0.3 = вариативный
