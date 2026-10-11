@@ -138,7 +138,7 @@ during a gap are not skipped. Processing via `_process_batch` /
     (`MAX_DUE_PER_ITERATION`; manual `--due` passes
     None = drain all). Per-key dedup: `compute_due(entries, now, completed)`
     — a slot fires once per key `chat|HH:MM|limit` per
-    occurrence date. After 3 consecutive failures a slot is skipped for 1h
+    occurrence date. After 3 consecutive failures a slot is skipped for 10 min
     (`due_skip_info`; quota protection). Success clears.
     Worst inbox delay ≈ one summary duration.
 3. Background: `_heartbeat_loop` (own asyncio task)
@@ -233,7 +233,7 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
 | `SCHEDULE_REFRESH_SEC` | 600 | schedule staleness inside a 5.5h run |
 | `PROMOTE_CONFIRM_READS` | 2 | anti-flap on promotion |
 | `INBOX_MAX_ATTEMPTS` | 5 | command retries before deletion |
-| `DUE_FAIL_THRESHOLD` / `DUE_FAIL_SKIP_SEC` | 3 / 3600 | скип падающего слота 1ч, возобновляемый: окно меряется от `last_utc`, по истечении — новый эпизод 3 попытки + 1ч тишины (`due_fail_record`, сессии 22/25) |
+| `DUE_FAIL_THRESHOLD` / `DUE_FAIL_SKIP_SEC` | 3 / 600 | скип падающего слота 10 мин, возобновляемый: окно меряется от `last_utc`, по истечении — новый эпизод 3 попытки + 10 мин тишины (`due_fail_record`, сессии 22/25; 10 мин — решение владельца 2026-10-11) |
 | `MAX_DUE_PER_ITERATION` | 1 | inbox-first latency bound |
 | `LIVENESS_EVERY` / `LIVENESS_SCAN_LIMIT` | 5 / 50 | маяк в General: правка каждый 5-й тик (120с × 5 = 10 мин) / глубина подхвата |
 
@@ -265,8 +265,9 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
    исчерпанная free-tier квота Gemini (429) дали 46 провалов одного слота
    за ночь тремя лидерами. Тогда `due_fails.first_utc` не обновлялся — скип 3ч
    срабатывал один раз, дальше повторы каждые ~8 мин до успеха. С тех пор
-   скип возобновляемый (окно от `last_utc`, сессии 22/25) и укорочен до 1ч:
-   ритм сухого слота теперь «3 попытки → 1ч тишины → …». Урок:
+   скип возобновляемый (окно от `last_utc`, сессии 22/25) и укорочен до 1ч,
+   2026-10-11 — до 10 мин по решению владельца:
+   ритм сухого слота теперь «3 попытки → 10 мин тишины → …». Урок:
    смену периода/суффикса уже отработанного слота делать осознанно
    (это плановый перезапуск, не баг); тишину при исчерпанной квоте держит
    возобновляемый скип, успех не обязателен.

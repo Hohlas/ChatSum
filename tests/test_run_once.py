@@ -1715,22 +1715,22 @@ def test_due_fail_renew():
     check('скип: первый провал — n=1, метки свежие',
           r == {'n': 1, 'first_utc': iso(now), 'last_utc': iso(now)}, r)
 
-    r2 = run_once.due_fail_record({'k': r}, 'k', now + timedelta(minutes=20))
+    r2 = run_once.due_fail_record({'k': r}, 'k', now + timedelta(minutes=3))
     check('скип: повтор в окне — n=2, first kept, last движется',
           r2['n'] == 2 and r2['first_utc'] == iso(now)
-          and r2['last_utc'] == iso(now + timedelta(minutes=20)), r2)
+          and r2['last_utc'] == iso(now + timedelta(minutes=3)), r2)
     check('скип: 2 провала — работаем',
-          run_once.due_skip_info({'k': r2}, 'k', now + timedelta(minutes=20)) is False)
-    r3 = run_once.due_fail_record({'k': r2}, 'k', now + timedelta(minutes=40))
+          run_once.due_skip_info({'k': r2}, 'k', now + timedelta(minutes=3)) is False)
+    r3 = run_once.due_fail_record({'k': r2}, 'k', now + timedelta(minutes=6))
     check('скип: 3 свежих провала — пропуск',
-          run_once.due_skip_info({'k': r3}, 'k', now + timedelta(minutes=40)) is True)
+          run_once.due_skip_info({'k': r3}, 'k', now + timedelta(minutes=6)) is True)
 
-    r4 = run_once.due_fail_record({'k': r3}, 'k', now + timedelta(hours=2))
+    r4 = run_once.due_fail_record({'k': r3}, 'k', now + timedelta(minutes=20))
     check('скип: окно истекло — новый эпизод n=1',
-          r4 == {'n': 1, 'first_utc': iso(now + timedelta(hours=2)),
-                 'last_utc': iso(now + timedelta(hours=2))}, r4)
+          r4 == {'n': 1, 'first_utc': iso(now + timedelta(minutes=20)),
+                 'last_utc': iso(now + timedelta(minutes=20))}, r4)
     check('скип: новый эпизод — работаем',
-          run_once.due_skip_info({'k': r4}, 'k', now + timedelta(hours=2)) is False)
+          run_once.due_skip_info({'k': r4}, 'k', now + timedelta(minutes=20)) is False)
 
     stale = {'k': {'n': 46, 'first_utc': '2026-10-05T17:12:34Z'}}
     check('скип: stale без last_utc — не скипаем (fallback first_utc)',
@@ -2123,15 +2123,15 @@ def test_duty():
     check('duty: 2-е протухшее чтение — promote',
           run_once.standby_should_promote(stale, 2, now) is True)
 
-    # Due-backoff: <3 провалов — работаем; 3 свежих — пропуск 1ч; старые (>1ч) — снова работаем
-    fresh_ts = (now - timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    # Due-backoff: <3 провалов — работаем; 3 свежих — пропуск 10 мин; старые (>10 мин) — снова работаем
+    fresh_ts = (now - timedelta(minutes=2)).strftime('%Y-%m-%dT%H:%M:%SZ')
     hour2_ts = (now - timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%SZ')
     old_ts = (now - timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M:%SZ')
     check('duty: 2 провала — работаем',
           run_once.due_skip_info({'k': {'n': 2, 'first_utc': fresh_ts}}, 'k', now) is False)
     check('duty: 3 свежих провала — пропуск',
           run_once.due_skip_info({'k': {'n': 3, 'first_utc': fresh_ts}}, 'k', now) is True)
-    check('duty: 3 провала 2ч назад — снова работаем (скип 1ч, не 3ч)',
+    check('duty: 3 провала 2ч назад — снова работаем (скип 10 мин)',
           run_once.due_skip_info({'k': {'n': 3, 'first_utc': hour2_ts}}, 'k', now) is False)
     check('duty: 3 старых провала — снова работаем',
           run_once.due_skip_info({'k': {'n': 3, 'first_utc': old_ts}}, 'k', now) is False)

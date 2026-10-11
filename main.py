@@ -990,7 +990,7 @@ async def execute_gemini_request(request_params):
     if last_error:
         # Круг проигран (все ключи отказали): пауза — только здесь,
         # не при каждой ротации. Дальше ошибку несёт вызыватель
-        # (чанк-цикл гасит остальные чанки, due уходит в skip на 3 ч).
+        # (чанк-цикл гасит остальные чанки, due уходит в skip на 10 мин).
         await asyncio.sleep(FULL_CIRCLE_FAIL_PAUSE_SEC)
         raise last_error
 
