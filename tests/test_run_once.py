@@ -153,6 +153,7 @@ def main():
     test_telegraph_toc()
     test_telegraph_link_stars()
     test_dedupe_topics()
+    test_rank_topics_by_importance()
     test_chunk_rebalance()
     test_chunk_redrive()
 
@@ -849,6 +850,7 @@ def test_openrouter_nemotron_profile():
     503 на одиночном ключе — пауза 3 мин и выход, без ротации Google."""
     saved_provider = bot.LLM_PROVIDER
     saved_or_effort = bot.OPENROUTER_REASONING_EFFORT
+    saved_chunk = bot.OPENROUTER_CHUNK_MAX_CHARS
     saved = (bot.openrouter_client, bot.asyncio.sleep)
     sleeps = []
     calls = {'n': 0}
@@ -871,6 +873,9 @@ def test_openrouter_nemotron_profile():
     try:
         bot.LLM_PROVIDER = 'openrouter'
         bot.OPENROUTER_REASONING_EFFORT = 'low'
+        # Профиль, а не файл: значение из MODEL_CONFIG.txt важнее профиля
+        # и ломало бы проверку чанка (как у соседних тестов).
+        bot.OPENROUTER_CHUNK_MAX_CHARS = ''
         cfg = bot.get_model_generation_config(
             'nvidia/nemotron-3-ultra-550b-a55b:free', provider='openrouter')
         check('nemotron: окно 1M', cfg['context_limit_tokens'] == 1000000,
@@ -903,6 +908,7 @@ def test_openrouter_nemotron_profile():
     finally:
         bot.LLM_PROVIDER = saved_provider
         bot.OPENROUTER_REASONING_EFFORT = saved_or_effort
+        bot.OPENROUTER_CHUNK_MAX_CHARS = saved_chunk
         (bot.openrouter_client, bot.asyncio.sleep) = saved
 
 
@@ -1978,8 +1984,9 @@ def test_collect_order_and_parents():
     kept_ids = sorted(m['message_id'] for m in kept)
     check('родитель по r не вылетает как шум', 10 in kept_ids, kept_ids)
     check('несвязанный шум вылетает', 12 not in kept_ids, kept_ids)
-    # Родитель из списка исключённых вылетает вместе со своим текстом —
-    # иначе его цитаты просачиваются в саммари как «контекст» (кейс CALISTA).
+    # Родитель из списка исключённых остаётся, если на него есть «r»:
+    # висячая ссылка оставляла цитату без источника. Без ответов
+    # исключённый вылетает вместе с текстом (защита от кейса CALISTA).
     saved = bot.EXCLUDED_USERS
     bot.EXCLUDED_USERS = ['Spammer']
     try:
@@ -1988,15 +1995,19 @@ def test_collect_order_and_parents():
              'date': '2026-10-06 10:00:00', 'message_id': 20, 'reply_to': None},
             {'sender': 'B', 'text': 'возражение с аргументами по пунктам',
              'date': '2026-10-06 10:00:01', 'message_id': 21, 'reply_to': 20},
+            {'sender': 'Spammer', 'text': 'монолог без ответов и реакции чата',
+             'date': '2026-10-06 10:00:02', 'message_id': 22, 'reply_to': None},
         ]
         with _quiet():
             kept2 = bot.optimize_messages([dict(m) for m in excl], '193')
         kept2_ids = sorted(m['message_id'] for m in kept2)
-        check('родитель-исключённый вылетает', 20 not in kept2_ids, kept2_ids)
+        check('родитель-исключённый с r остаётся', 20 in kept2_ids, kept2_ids)
+        parent = next(m for m in kept2 if m['message_id'] == 20)
+        check('текст родителя-исключённого цел (r разрешается)',
+              parent.get('text') == 'длинный пост с разбором по существу темы',
+              parent.get('text'))
         check('ответ на исключённого остаётся', 21 in kept2_ids, kept2_ids)
-        child = next(m for m in kept2 if m['message_id'] == 21)
-        check('r на выброшенного родителя сохраняется (сигнал связи, PROMPT:11)',
-              child.get('reply_to') == 20, child.get('reply_to'))
+        check('исключённый без ответов вылетает', 22 not in kept2_ids, kept2_ids)
         # Регистр не важен: в файле CAPS, в чате — как отдаст Telegram
         bot.EXCLUDED_USERS = ['CALISTA']
         with _quiet():
@@ -2527,6 +2538,147 @@ def test_dedupe_topics():
     err = (8, 20, '⚠️ Чанк пропущен', True)
     out7 = d([c1, err])
     check('dedupe: ошибочный чанк не тронут', out7[1] == err, out7[1])
+
+
+def test_rank_topics_by_importance():
+    def blk(name, *ids):
+        cites = '\n'.join(f'[{name}](https://t.me/c/1/{i}): суть' for i in ids)
+        return f'💡 **{name}**\n*Идея.*\n\n{cites}'
+
+    def m(mid, sender, nwords, reply_to=None):
+        return {'message_id': mid, 'sender': sender,
+                'text': ' '.join(['слово'] * nwords), 'reply_to': reply_to}
+
+    def title(b):
+        return b.split('**')[1]
+
+    # Широкое обсуждение: 5 авторов по 100 слов + ответы 4 авторов.
+    msgs = [m(100 + i, f'U{i}', 100) for i in range(5)]
+    msgs += [m(200 + i, f'R{i}', 10, reply_to=100 + i) for i in range(4)]
+    # Монолог: один автор, 500 слов.
+    msgs.append(m(1, 'Solo', 500))
+    # Флуд-плоскость: 20 однострочек по 5 слов от 3 авторов, без ответов.
+    for i in range(20):
+        msgs.append(m(10 + i, f'F{i % 3}', 5))
+    lookup = {x['message_id']: {'sender': x['sender'], 'text': x['text'],
+                                'reply_to': x['reply_to']} for x in msgs}
+
+    broad = blk('Broad', 100, 101, 102, 103, 104)
+    mono = blk('Mono', 1)
+    flood = blk('Flood', 10, 11)
+    ordered = bot.rank_topic_blocks([mono, flood, broad], lookup)
+    check('rank: широкое выше монолога выше флуда',
+          [title(b) for b in ordered] == ['Broad', 'Mono', 'Flood'],
+          [round(bot.topic_importance_score(
+              {int(x) for x in __import__('re').findall(
+                  r'https://t\.me/c/\d+/(\d+)', b)}, lookup), 2) for b in ordered])
+
+    # Глушение накрутки: 19 ответов одного автора весят как 1 отвечающий,
+    # а 19 ответов 19 авторов — на порядок больше (считаем уникальных,
+    # а не сырое число ответов).
+    same = {50: {'sender': 'A', 'text': 'слово ' * 50, 'reply_to': None}}
+    same.update({60 + i: {'sender': 'B', 'text': 'слово ' * 5, 'reply_to': 50}
+                         for i in range(19)})
+    diff = {50: {'sender': 'A', 'text': 'слово ' * 50, 'reply_to': None}}
+    diff.update({60 + i: {'sender': f'B{i}', 'text': 'слово ' * 5, 'reply_to': 50}
+                         for i in range(19)})
+    s_same = bot.topic_importance_score({50}, same)
+    s_diff = bot.topic_importance_score({50}, diff)
+    check('rank: уникальные отвечающие давят накрутку',
+          s_diff > 5 * s_same, (round(s_same, 2), round(s_diff, 2)))
+
+    # Тема без ответов не обнуляется (старый дефект: ln(1+0) = 0).
+    check('rank: тема без ответов имеет балл > 0',
+          bot.topic_importance_score({1}, lookup) > 0,
+          bot.topic_importance_score({1}, lookup))
+
+    # Блоки без ссылок тонут в конец, сохраняя взаимный порядок.
+    no_a = '💡 **Без ссылок A**\n*Идея.*'
+    no_b = '💡 **Без ссылок B**\n*Идея.*'
+    ordered2 = bot.rank_topic_blocks([no_a, broad, no_b], lookup)
+    check('rank: блоки без ссылок в конце, порядок стабилен',
+          [title(b) for b in ordered2] == ['Broad', 'Без ссылок A', 'Без ссылок B'],
+          [title(b) for b in ordered2])
+
+    # Равные баллы: исходный порядок держится.
+    twin1 = blk('Twin1', 1)
+    twin2 = blk('Twin2', 1)
+    check('rank: ничья — порядок модели сохранён',
+          [title(b) for b in bot.rank_topic_blocks([twin1, twin2], lookup)]
+          == ['Twin1', 'Twin2'])
+
+    # Неизвестные ID: балл 0, без падения.
+    ghost = blk('Ghost', 999999)
+    check('rank: неизвестные ID дают 0',
+          bot.topic_importance_score({999999}, lookup) == 0.0)
+    check('rank: неизвестные ID не роняют сортировку',
+          len(bot.rank_topic_blocks([ghost, broad], lookup)) == 2)
+
+    # sort_topics_in_summary_text: один блок — без изменений дословно.
+    check('sort-text: один блок не тронут',
+          bot.sort_topics_in_summary_text(mono, lookup) == mono)
+    two = mono + '\n---\n' + broad
+    check('sort-text: два блока переупорядочены',
+          bot.sort_topics_in_summary_text(two, lookup) == broad + '\n---\n' + mono,
+          bot.sort_topics_in_summary_text(two, lookup)[:60])
+    check('sort-text: текст без цитат не тронут',
+          bot.sort_topics_in_summary_text('💡 **A**\n*Идея.*\n---\nX', lookup)
+          == '💡 **A**\n*Идея.*\n---\nX')
+    check('sort-text: пусто/None безопасны',
+          bot.sort_topics_in_summary_text('', lookup) == ''
+          and bot.sort_topics_in_summary_text(None, lookup) is None)
+
+    # build_message_lookup: перехлёст чанков схлопывается по id.
+    dup = m(7, 'U', 3)
+    lk = bot.build_message_lookup([([dup], 1, 1), ([dup], 1, 1)])
+    check('lookup: дубли id схлопываются', lk == {
+        7: {'sender': 'U', 'text': 'слово слово слово', 'reply_to': None}}, lk)
+
+    # Сквозная: важная тема второго чанка всплывает первой после склейки.
+    from types import SimpleNamespace
+    real_exec = bot.execute_gemini_request
+    real_pause = bot.CHUNK_DELAY_SECONDS
+    bot.CHUNK_DELAY_SECONDS = 0
+    try:
+        class FakeResp:
+            def __init__(self, text):
+                self.choices = [SimpleNamespace(
+                    message=SimpleNamespace(content=text))]
+
+        lo = blk('Low', 1)
+        hi = blk('High', 2, 3)
+
+        async def fake(params):
+            fake.n += 1
+            return FakeResp(lo if fake.n == 1 else hi)
+        fake.n = 0
+        bot.execute_gemini_request = fake
+        ch1 = ([m(1, 'Solo', 5)], 1, 1)
+        ch2 = ([m(2, 'A', 100), m(3, 'B', 100),
+                m(4, 'C', 10, reply_to=2), m(5, 'D', 10, reply_to=3)], 2, 5)
+        loop = asyncio.get_event_loop()
+        with _quiet():
+            combined, _ = loop.run_until_complete(
+                bot.create_summary([ch1, ch2], '1', model='test-model'))
+        check('rank e2e: тема 2-го чанка первая после склейки',
+              'High' in combined and 'Low' in combined
+              and combined.index('High') < combined.index('Low'),
+              combined[:200])
+
+        # Сквозная одночанковая: тот же ранкер внутри единственного чанка.
+        async def fake2(params):
+            return FakeResp(lo + '\n---\n' + hi)
+        bot.execute_gemini_request = fake2
+        ch = ([m(1, 'Solo', 5), m(2, 'A', 100), m(3, 'B', 100),
+               m(4, 'C', 10, reply_to=2), m(5, 'D', 10, reply_to=3)], 1, 5)
+        with _quiet():
+            single, _ = loop.run_until_complete(
+                bot.create_summary([ch], '1', model='test-model'))
+        check('rank e2e: один чанк переупорядочен',
+              single.index('High') < single.index('Low'), single[:120])
+    finally:
+        bot.execute_gemini_request = real_exec
+        bot.CHUNK_DELAY_SECONDS = real_pause
 
 
 def test_chunk_rebalance():

@@ -1,5 +1,6 @@
 import os
 import asyncio
+import math
 import random
 import re
 import shutil
@@ -1794,21 +1795,20 @@ def optimize_messages(messages_data, chat_id_str):
         sender = msg.get('sender')
         unique_senders.add(sender)
 
-        # Исключённые вылетают всегда — даже если на них отвечают.
-        # Иначе их тексты попадали в анализ как «контекст» и цитировались
-        # в саммари. Bypass ниже — только для шумовых родителей.
-        # Поле r у ответов НЕ трогаем: PROMPT.txt велит модели считать
-        # отсутствующего родителя только сигналом связи и никогда его
-        # не цитировать — ответы с общим r образуют тему без утечки автора.
-        if sender and sender.casefold() in excluded_lc:
-            excluded_count += 1
-            continue
-
-        # Родитель чужой цепочки — только контекст, фильтры не применяем
-        # (кроме исключённых выше)
+        # Родитель чужой цепочки — только контекст, фильтры не применяем.
+        # На него есть «r»-ссылка: без текста родителя цепочка рвётся,
+        # а висячий r оставляет цитату без источника. Исключённые родители
+        # тоже остаются — только если на них отвечают; без ответов они
+        # вылетают ниже, их тексты в анализ не попадают.
         if msg.get('message_id') in referenced_ids:
             msg['chat_id'] = chat_id_str
             optimized.append(msg)
+            continue
+
+        # Исключённые без ответов вылетают: их тексты не должны попадать
+        # в анализ как «контекст» и цитироваться в саммари (кейс CALISTA).
+        if sender and sender.casefold() in excluded_lc:
+            excluded_count += 1
             continue
 
         # Фильтруем бессодержательные сообщения
@@ -2687,6 +2687,98 @@ def dedupe_topics_across_chunks(chunk_summaries):
     return result
 
 
+def build_message_lookup(chunks):
+    """Flattens chunk messages into {id: {'sender', 'text', 'reply_to'}}.
+
+    Chunks overlap, so one id may appear twice with identical content —
+    last write wins. Pure, no network.
+    """
+    lookup = {}
+    for chunk_messages, _, _ in chunks:
+        for msg in chunk_messages:
+            mid = msg.get('message_id')
+            if mid is None:
+                continue
+            lookup[mid] = {
+                'sender': msg.get('sender', ''),
+                'text': msg.get('text', '') or '',
+                'reply_to': msg.get('reply_to'),
+            }
+    return lookup
+
+
+def topic_importance_score(citation_ids, messages_by_id):
+    """Deterministic importance of one summary topic block.
+
+    Seeds are the message ids cited in the block. The topic set is the
+    seeds plus their direct parents (via reply_to) plus direct replies
+    to the seeds — one hop on the reply graph, no transitive expansion.
+
+    score = (1 + ln(1 + U_replies)) * (1 + V) * (1 + ln(1 + U_part))
+    where U_replies is unique repliers, U_part unique authors,
+    V = sum over authors of ln(1 + words by that author).
+    Per-author log compression replaces a tunable per-author cap: one
+    verbose author collapses into a single logarithm instead of
+    inflating the whole topic volume. No noise filtering here —
+    filtering already happened upstream.
+    """
+    seeds = {i for i in citation_ids if i in messages_by_id}
+    if not seeds:
+        return 0.0
+    topic_ids = set(seeds)
+    for sid in seeds:
+        parent = messages_by_id[sid].get('reply_to')
+        if parent in messages_by_id:
+            topic_ids.add(parent)
+    for mid, msg in messages_by_id.items():
+        if msg.get('reply_to') in seeds:
+            topic_ids.add(mid)
+    repliers = {messages_by_id[mid].get('sender', '')
+                for mid in topic_ids - seeds
+                if messages_by_id[mid].get('reply_to') in seeds}
+    words_by_author = {}
+    for mid in topic_ids:
+        msg = messages_by_id[mid]
+        words = len(str(msg.get('text', '')).split())
+        author = msg.get('sender', '')
+        words_by_author[author] = words_by_author.get(author, 0) + words
+    volume = sum(math.log1p(w) for w in words_by_author.values())
+    return ((1.0 + math.log1p(len(repliers)))
+            * (1.0 + volume)
+            * (1.0 + math.log1p(len(words_by_author))))
+
+
+def rank_topic_blocks(blocks, messages_by_id):
+    """Stable descending sort of topic blocks by importance.
+
+    Blocks without resolvable citations score 0 and sink to the end
+    keeping their relative order. Pure.
+    """
+    scored = [(topic_importance_score(
+        {int(x) for x in re.findall(r'https://t\.me/c/\d+/(\d+)', block)},
+        messages_by_id), pos, block)
+        for pos, block in enumerate(blocks)]
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [block for _, _, block in scored]
+
+
+def sort_topics_in_summary_text(summary_text, messages_by_id):
+    """Reorders topic blocks inside one summary text by importance.
+
+    Split/join separator is '\\n---\\n' (same as the Telegraph export
+    below). Texts with fewer than 2 non-empty blocks or without any
+    citation are returned unchanged. Pure.
+    """
+    if not summary_text or not isinstance(summary_text, str):
+        return summary_text
+    fragments = [b for b in summary_text.split('\n---\n') if b.strip()]
+    if len(fragments) < 2:
+        return summary_text
+    if not re.search(r'https://t\.me/c/\d+/\d+', summary_text):
+        return summary_text
+    return '\n---\n'.join(rank_topic_blocks(fragments, messages_by_id))
+
+
 async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False):
     """
     Создает выжимку из сообщений с помощью LLM активного провайдера.
@@ -3051,25 +3143,42 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False):
         # (один контроль на пару чанков, не более одного удаления на пару).
         chunk_summaries = dedupe_topics_across_chunks(chunk_summaries)
 
+        # Глобальная сортировка тем по важности ПОСЛЕ склейки: границы
+        # чанков — техническая нарезка под вход модели, а не смысловая
+        # граница, поэтому темы всех неошибочных частей складываются
+        # в один список и упорядочиваются один раз по полному множеству
+        # сообщений. Ошибочные части — не темы, идут следом без изменений.
+        lookup_all = build_message_lookup(chunks)
+        topic_fragments = []
+        error_sections = []
+        for start_idx, end_idx, summary_text, is_error in chunk_summaries:
+            if is_error:
+                error_sections.append((start_idx, end_idx, summary_text))
+            elif summary_text and str(summary_text).strip():
+                topic_fragments.extend(
+                    b for b in str(summary_text).split('\n---\n') if b.strip())
+
         # Формируем объединенный текст
         combined_parts = []
         combined_parts.append(f"📊 Обработано {total_messages} сообщений в {num_chunks} частях")
         if errors_count > 0:
             combined_parts.append(f"⚠️ Внимание: {errors_count} из {num_chunks} частей обработаны с ошибками")
         combined_parts.append("")
-        
-        for part_idx, (start_idx, end_idx, summary_text, is_error) in enumerate(chunk_summaries, 1):
+
+        if topic_fragments:
+            combined_parts.append(
+                '\n---\n'.join(rank_topic_blocks(topic_fragments, lookup_all)))
+            combined_parts.append("")
+
+        for err_idx, (start_idx, end_idx, summary_text) in enumerate(error_sections, 1):
             combined_parts.append("═══════════════════════════════════════")
-            if is_error:
-                combined_parts.append(f"ЧАСТЬ {part_idx} (сообщения {start_idx}-{end_idx}): ⚠️ ОШИБКА")
-            else:
-                combined_parts.append(f"ЧАСТЬ {part_idx} (сообщения {start_idx}-{end_idx}):")
+            combined_parts.append(f"ЧАСТЬ {err_idx} (сообщения {start_idx}-{end_idx}): ⚠️ ОШИБКА")
             combined_parts.append("═══════════════════════════════════════")
             combined_parts.append(summary_text)
             combined_parts.append("")
-        
+
         combined_summary = "\n".join(combined_parts)
-        
+
         return combined_summary, total_usage
     
     # ═══════════════════════════════════════════════════════════════════
@@ -3145,6 +3254,11 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False):
         # иначе None упадёт у вызывателя на .startswith/.
         if not summary or not str(summary).strip():
             return (f"❌ Пустой ответ модели {actual_model} (нет текста)", None)
+
+        # Порядок тем по важности (тот же ранкер, что и в многочанковом
+        # пути; здесь множество сообщений — единственный чанк).
+        summary = sort_topics_in_summary_text(
+            summary, build_message_lookup([(chunk_messages, start_idx, end_idx)]))
 
         print("✅ Выжимка успешно создана")
         
