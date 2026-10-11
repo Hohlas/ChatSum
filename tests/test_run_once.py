@@ -160,6 +160,8 @@ def main():
     test_resume_messages()
     test_analysis_retried_loop()
     test_notify_progress()
+    test_big_volume_warning_first_attempt_only()
+    test_run_analysis_reuses_passed_topic()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")
@@ -3191,6 +3193,150 @@ def test_notify_progress():
         bot.execute_gemini_request = saved_exec
         bot.CHUNK_REDRIVE_PAUSE_SEC = saved_redrive
         bot.CHUNK_DELAY_SECONDS = saved_delay
+
+
+def test_big_volume_warning_first_attempt_only():
+    """⚠️ Большой объем: первая попытка (даже hold_partial) — есть;
+    повтор досчёта с готовыми чанками в кэше — нет."""
+    loop = asyncio.get_event_loop()
+    saved = (bot.get_or_create_topic, bot.collect_messages,
+             bot.optimize_messages, bot.count_messages_with_urls,
+             bot.get_model_generation_config, bot.split_messages_by_chars,
+             bot.create_summary, bot.telegram_client, bot.GOOGLE_API_KEYS)
+
+    class _StopEarly(Exception):
+        pass
+
+    sent = []
+
+    class FakeTg:
+        async def send_message(self, *a, **kw):
+            if len(a) >= 2:
+                sent.append(a[1])
+            elif 'message' in kw:
+                sent.append(kw['message'])
+            return None
+
+    msgs = [{'message_id': i, 'sender': 'U',
+             'date': '2026-10-09 10:00:00',
+             'text': f'содержательный текст сообщения номер {i} для объёма'}
+            for i in range(1, 7)]
+    chunks = [(msgs[:3], 1, 3), (msgs[3:], 4, 6)]
+
+    async def fake_topic(name):
+        return 777
+
+    async def fake_collect(*a, **kw):
+        return (msgs, '1', '2026-10-09')
+
+    async def fake_summary(*a, **kw):
+        raise _StopEarly()
+
+    bot.get_or_create_topic = fake_topic
+    bot.collect_messages = fake_collect
+    bot.optimize_messages = lambda m, c: m
+    bot.count_messages_with_urls = lambda m: (0, [])
+    bot.get_model_generation_config = lambda model: {
+        'chunk_max_chars': 1000, 'chunk_overlap_chars': 100}
+    bot.split_messages_by_chars = (
+        lambda m, max_chars=0, overlap_chars=0: chunks)
+    bot.create_summary = fake_summary
+    bot.telegram_client = FakeTg()
+    bot.GOOGLE_API_KEYS = []
+    try:
+        async def drive():
+            try:
+                await bot.run_analysis('1', 'ТестЧат', limit=6,
+                                       resume_key='t-bigwarn',
+                                       hold_partial=True)
+            except _StopEarly:
+                pass
+
+        with _quiet():
+            loop.run_until_complete(drive())
+        check('предупреждение: первая попытка hold_partial — есть',
+              any('Большой объем' in t for t in sent), sent)
+        # Повтор: готовые чанки уже в кэше — молчим.
+        bot.resume_cache_store('t-bigwarn', chunks,
+                               {0: 'готовый текст один',
+                                1: 'готовый текст два'},
+                               {0: {}, 1: {}})
+        sent.clear()
+        with _quiet():
+            loop.run_until_complete(drive())
+        check('предупреждение: повтор досчёта — нет',
+              not any('Большой объем' in t for t in sent), sent)
+    finally:
+        (bot.get_or_create_topic, bot.collect_messages,
+         bot.optimize_messages, bot.count_messages_with_urls,
+         bot.get_model_generation_config, bot.split_messages_by_chars,
+         bot.create_summary, bot.telegram_client,
+         bot.GOOGLE_API_KEYS) = saved
+        bot.resume_cache_drop('t-bigwarn')
+
+
+def test_run_analysis_reuses_passed_topic():
+    """run_analysis(topic_id=...): стартавый резолв пропущен — ровно один
+    вызов get_or_create_topic (из error-ветки сторожа), дубля
+    'Найдена существующая тема' нет."""
+    loop = asyncio.get_event_loop()
+    saved = (bot.get_or_create_topic, bot.collect_messages,
+             bot.optimize_messages, bot.count_messages_with_urls,
+             bot.get_model_generation_config, bot.split_messages_by_chars,
+             bot.create_summary, bot.telegram_client, bot.GOOGLE_API_KEYS)
+
+    class _StopEarly(Exception):
+        pass
+
+    calls = []
+
+    async def counting_topic(name):
+        calls.append(name)
+        return 777
+
+    class FakeTg:
+        async def send_message(self, *a, **kw):
+            return None
+
+    msgs = [{'message_id': 1, 'sender': 'U',
+             'date': '2026-10-09 10:00:00', 'text': 'раз два три'}]
+    one_chunk = [(msgs, 1, 1)]
+
+    async def fake_collect(*a, **kw):
+        return (msgs, '1', '2026-10-09')
+
+    async def fake_summary(*a, **kw):
+        raise _StopEarly()
+
+    bot.get_or_create_topic = counting_topic
+    bot.collect_messages = fake_collect
+    bot.optimize_messages = lambda m, c: m
+    bot.count_messages_with_urls = lambda m: (0, [])
+    bot.get_model_generation_config = lambda model: {
+        'chunk_max_chars': 1000, 'chunk_overlap_chars': 100}
+    bot.split_messages_by_chars = (
+        lambda m, max_chars=0, overlap_chars=0: one_chunk)
+    bot.create_summary = fake_summary
+    bot.telegram_client = FakeTg()
+    bot.GOOGLE_API_KEYS = []
+    try:
+        async def drive():
+            try:
+                await bot.run_analysis('1', 'ТестЧат', limit=1,
+                                       topic_id=777)
+            except _StopEarly:
+                pass
+
+        with _quiet():
+            loop.run_until_complete(drive())
+        check('run_analysis: переданный topic_id — без стартового резолва',
+              calls == ['ТестЧат'], calls)
+    finally:
+        (bot.get_or_create_topic, bot.collect_messages,
+         bot.optimize_messages, bot.count_messages_with_urls,
+         bot.get_model_generation_config, bot.split_messages_by_chars,
+         bot.create_summary, bot.telegram_client,
+         bot.GOOGLE_API_KEYS) = saved
 
 
 def _now_utc():

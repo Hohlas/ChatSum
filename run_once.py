@@ -1917,6 +1917,7 @@ async def process_inbox_message(main, mem, dest, msg):
             **inbox_kwargs,
             resume_key=resume_key,
             hold_partial=True,
+            topic_id=topic_out,
         )
     except Exception as e:
         ok = False
@@ -1952,6 +1953,7 @@ async def process_inbox_message(main, mem, dest, msg):
                 hold_partial=False,
                 extra_stats_line=(f"⛔ Попытки исчерпаны ({n}/{INBOX_MAX_ATTEMPTS}) — "
                                   f"результат частичный"),
+                topic_id=topic_out,
             )
         except Exception as e:
             print(f"⚠️ Inbox {msg.id}: финальная публикация частичного не удалась: {e}")

@@ -4720,7 +4720,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                          range_start=None, range_end=None, time_range_start=None,
                          time_range_end=None, use_ai=True, post_to_source=False, post_as_telegram=False, scheduled=False,
                          resume_key=None, hold_partial=False, extra_stats_line=None,
-                         notify=None):
+                         notify=None, topic_id=None):
     """
     Ядро анализа: выполняет сбор сообщений, AI анализ и публикацию.
 
@@ -4742,6 +4742,9 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
         notify: async fn(text) — краткая диагностика в канал (ход чанков,
             503-сон, добой). None — построится отправка в топик
             RESULTS_DESTINATION.
+        topic_id: ID темы уже найден вызывателем (inbox резолвит её для
+            стартового уведомления). None — найти здесь. Избавляет от
+            повторного запроса к API и дубля 'Найдена существующая тема'.
 
     Returns:
         True — полный успех (опубликовано); False — провал (повторяемо);
@@ -4750,8 +4753,10 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
         с маркировкой (финалы без внешнего цикла; тоже не успех).
     """
     try:
-        # Получаем или создаем тему для этого чата
-        topic_id = await get_or_create_topic(chat_name)
+        # Тему мог уже найти вызыватель (inbox резолвит её для стартового
+        # уведомления) — повторный запрос к API и дубль в логе не нужны.
+        if topic_id is None:
+            topic_id = await get_or_create_topic(chat_name)
 
         # Диагностика в канал: по умолчанию — в тот же топик, куда уйдёт
         # итог. Никогда не роняет анализ (ошибки отправки гасятся внутри).
@@ -4831,9 +4836,11 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
         num_chunks = len(chunks)
 
         # Предупреждение о больших запросах (особенно для AI анализа).
-        # При hold_partial (промежуточные попытки досчёта) не шумим: итоговая
-        # публикация всё равно будет одна.
-        if use_ai and num_chunks > 1 and not hold_partial:
+        # Первая попытка всегда предупреждает. Повторы досчёта (готовые
+        # чанки уже лежат в кэше) и финальная сборка частичного — нет:
+        # там оценка времени не про новые запросы.
+        resumed_ready = resume_cache_lookup(resume_key, chunks)
+        if use_ai and num_chunks > 1 and not resumed_ready:
             # Расчет примерного полного времени: AI + паузы + публикация
             wait_time_seconds = estimate_total_ai_processing_seconds(
                 chunks,
