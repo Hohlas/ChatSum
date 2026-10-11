@@ -159,6 +159,7 @@ def main():
     test_resume_cache()
     test_resume_messages()
     test_analysis_retried_loop()
+    test_notify_progress()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")
@@ -725,7 +726,7 @@ def test_key_cursor():
 
 
 def test_503_holds_key():
-    """503: один запрос, пауза 3 мин, выход наружу (внутреннего повтора нет,
+    """503: один запрос, пауза 60с, выход наружу (внутреннего повтора нет,
     поэтому успех в тесте недостижим). Ключ не меняется. 429 — старый путь."""
     saved = (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
              bot.google_analysis_counter, bot.google_client, bot.asyncio.sleep,
@@ -759,7 +760,7 @@ def test_503_holds_key():
         bot.google_client = FakeClient()
         bot.set_google_api_key_index = fake_set_index
 
-        # 503: один запрос, пауза 180, выход наружу — без повтора на ключе
+        # 503: один запрос, пауза 60, выход наружу — без повтора на ключе
         try:
             with _quiet():
                 loop.run_until_complete(bot.execute_gemini_request({}))
@@ -769,7 +770,7 @@ def test_503_holds_key():
                   '503' in str(e) and bot.current_google_key_index == 0
                   and calls['n'] == 1,
                   (str(e)[:40], bot.current_google_key_index, calls))
-        check('503: пауза 3 мин, повтора нет', sleeps == [180], sleeps)
+        check('503: пауза 60 с, повтора нет', sleeps == [60], sleeps)
     finally:
         (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
          bot.google_analysis_counter, bot.google_client,
@@ -907,7 +908,7 @@ def test_openrouter_nemotron_profile():
             check('nemotron 503: raise после 1 запроса',
                   '503' in str(e) and calls['n'] == 1,
                   (str(e)[:40], calls))
-        check('nemotron 503: пауза 3 мин', sleeps == [180], sleeps)
+        check('nemotron 503: пауза 60 с', sleeps == [60], sleeps)
     finally:
         bot.LLM_PROVIDER = saved_provider
         bot.OPENROUTER_REASONING_EFFORT = saved_or_effort
@@ -1044,7 +1045,7 @@ def test_empty_model_response_is_error():
                                              completion_tokens=5,
                                              total_tokens=15)
 
-        async def empty_then_ok(params):
+        async def empty_then_ok(params, **kw):
             # Чанк 1: запрос + до 3 retry валидации — пусто (n=1..4),
             # чанк 2 — нормальный текст (n=5), добой чанка 1 (n=6) — текст.
             empty_then_ok.n += 1
@@ -1067,7 +1068,7 @@ def test_empty_model_response_is_error():
               and '❌' not in combined,
               combined[:200])
 
-        async def always_empty(params):
+        async def always_empty(params, **kw):
             return FakeResp(None)
         bot.execute_gemini_request = always_empty
         with _quiet():
@@ -1126,7 +1127,7 @@ def test_none_choices_is_error():
                                     completion_tokens=5,
                                     total_tokens=15)
 
-        async def no_choices(params):
+        async def no_choices(params, **kw):
             return NoChoicesResp()
         bot.execute_gemini_request = no_choices
         chunks = [([fake_msg(1, 'U1')], 1, 1),
@@ -1178,7 +1179,7 @@ def test_raw_answer_dump_on_json():
         raw_json = ('{"topic": "T", "summary": "S", '
                     '"messages": [{"author": "U", "text": "hi"}]}')
 
-        async def json_then_ok(params):
+        async def json_then_ok(params, **kw):
             # Первый запрос чанка — JSON (валидация не проходит),
             # retry с усиленным промптом — нормальный текст.
             json_then_ok.n += 1
@@ -1208,7 +1209,7 @@ def test_raw_answer_dump_on_json():
                   (combined[:200], usage['errors']))
 
             # Пустота — не JSON: дамп не пишется, сразу ошибка чанка.
-            async def always_none(params):
+            async def always_none(params, **kw):
                 return FakeResp(None)
             bot.execute_gemini_request = always_none
             before2 = set(glob.glob(
@@ -1944,8 +1945,8 @@ def test_flat_rotation():
                       ('45s', '45s'), ('24445s', '6h47m'), ('xx', 'xx')):
         check(f'плоская: retry {raw} → {want}',
               bot._short_retry_delay(raw) == want, bot._short_retry_delay(raw))
-    check('503: пауза 3 мин',
-          bot.SERVER_OVERLOAD_PAUSE_SEC == 180, bot.SERVER_OVERLOAD_PAUSE_SEC)
+    check('503: пауза 60 с',
+          bot.SERVER_OVERLOAD_PAUSE_SEC == 60, bot.SERVER_OVERLOAD_PAUSE_SEC)
     for text in ('Error code: 503 - Service Unavailable',
                  'UNAVAILABLE: server overloaded',
                  'HTTP 503: upstream overloaded'):
@@ -2374,17 +2375,17 @@ def test_telegraph_toc():
 
     html_two = bot.convert_markdown_to_html(md_two)
     check('toc: содержание в Telegraph-вёрстке',
-          '<h4>Темы по важности</h4>' in html_two and '<ol>' in html_two, html_two[:200])
+          '<h4>Темы по популярности</h4>' in html_two and '<ol>' in html_two, html_two[:200])
     check('toc: href пережил санитарку',
           'href="#💡-Вспышка-кори-в-США"' in html_two, html_two[:400])
     check('toc: содержание до первого топика',
-          html_two.index('Темы по важности') < html_two.index('<h3'))
+          html_two.index('Темы по популярности') < html_two.index('<h3'))
     md_one = '💡 **Один топик**\n*Идея.*\n'
     check('toc: один топик — без содержания',
-          'Темы по важности' not in bot.convert_markdown_to_html(md_one))
+          'Темы по популярности' not in bot.convert_markdown_to_html(md_one))
     tg_html = bot.convert_markdown_to_html(md_two, for_telegram=True)
     check('toc: Telegram-ветка — без содержания',
-          'Темы по важности' not in tg_html and '<ol>' not in tg_html, tg_html[:200])
+          'Темы по популярности' not in tg_html and '<ol>' not in tg_html, tg_html[:200])
     dup = bot.build_toc_html(['Повтор', 'Повтор'])
     check('toc: дубли — одинаковый href (прыжок на первое вхождение)',
           dup.count('href="#💡-Повтор"') == 2, dup)
@@ -2651,7 +2652,7 @@ def test_rank_topics_by_importance():
         lo = blk('Low', 1)
         hi = blk('High', 2, 3)
 
-        async def fake(params):
+        async def fake(params, **kw):
             fake.n += 1
             return FakeResp(lo if fake.n == 1 else hi)
         fake.n = 0
@@ -2669,7 +2670,7 @@ def test_rank_topics_by_importance():
               combined[:200])
 
         # Сквозная одночанковая: тот же ранкер внутри единственного чанка.
-        async def fake2(params):
+        async def fake2(params, **kw):
             return FakeResp(lo + '\n---\n' + hi)
         bot.execute_gemini_request = fake2
         ch = ([m(1, 'Solo', 5), m(2, 'A', 100), m(3, 'B', 100),
@@ -2778,7 +2779,7 @@ def test_chunk_redrive():
     try:
         calls = []
 
-        async def flaky(params):
+        async def flaky(params, **kw):
             calls.append(1)
             if len(calls) == 1:
                 raise Exception('boom-spike')
@@ -2797,7 +2798,7 @@ def test_chunk_redrive():
         # Добой не помог — ошибка остаётся, попыток больше нет (4 запроса).
         calls2 = []
 
-        async def always_fail(params):
+        async def always_fail(params, **kw):
             calls2.append(1)
             raise Exception('still-down')
 
@@ -2819,7 +2820,7 @@ def test_chunk_redrive():
             status_code=503, request=object(), headers={},
             text='UNAVAILABLE: backend overloaded', json=no_json)
 
-        async def overloaded(params):
+        async def overloaded(params, **kw):
             calls3.append(1)
             raise bot.APIStatusError('overloaded', response=fake_http, body=None)
 
@@ -2884,7 +2885,7 @@ def test_resume_cache():
         # Попытка 1: чанк 1 ок, чанк 2 — 503 (стоп-флаг, добоя нет).
         calls = []
 
-        async def storm_then_heal(params):
+        async def storm_then_heal(params, **kw):
             calls.append(1)
             if len(calls) == 1:
                 return FakeResp(good1)
@@ -3050,6 +3051,146 @@ def test_analysis_retried_loop():
               ok3 is True and len(calls) == 1, (ok3, len(calls)))
     finally:
         bot.run_analysis = real
+
+
+def test_notify_progress():
+    # Краткая диагностика: 503-сон и ход чанков уходят в notify
+    # однострочниками; без notify — тишина и старое поведение.
+    from types import SimpleNamespace
+    loop = asyncio.get_event_loop()
+
+    # 1. Настоящий execute_gemini_request, 503: сон 60 + строка в notify.
+    saved = (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
+             bot.google_analysis_counter, bot.google_client,
+             bot.asyncio.sleep, bot.LLM_PROVIDER)
+    saved_set_index = bot.set_google_api_key_index
+    sleeps = []
+    noted = []
+
+    async def fake_sleep(sec):
+        sleeps.append(sec)
+
+    async def fake_notify(text):
+        noted.append(text)
+
+    class FakeCompletions503:
+        async def create(self, **kw):
+            raise Exception(
+                "Error code: 503 - high demand, status UNAVAILABLE")
+
+    class FakeClient503:
+        chat = type('C', (), {'completions': FakeCompletions503()})()
+
+    def fake_set_index(idx):
+        bot.current_google_key_index = idx % len(bot.GOOGLE_API_KEYS)
+
+    try:
+        bot.LLM_PROVIDER = 'google'
+        bot.GOOGLE_API_KEYS = ['k1', 'k2', 'k3']
+        bot.current_google_key_index = 1
+        bot.google_analysis_counter = 0
+        bot.asyncio.sleep = fake_sleep
+        bot.google_client = FakeClient503()
+        bot.set_google_api_key_index = fake_set_index
+        try:
+            with _quiet():
+                loop.run_until_complete(
+                    bot.execute_gemini_request({}, notify=fake_notify))
+            check('notify 503: должен был raise', False)
+        except Exception:
+            pass
+        check('notify 503: сон 60 и строка про 503/ключ/сон',
+              sleeps == [60] and len(noted) == 1
+              and '503' in noted[0] and '1 мин' in noted[0]
+              and '2/3' in noted[0],
+              (sleeps, noted))
+        # Без notify — тот же сон, тишина.
+        noted.clear()
+        sleeps.clear()
+        try:
+            with _quiet():
+                loop.run_until_complete(bot.execute_gemini_request({}))
+            check('notify 503: без notify должен был raise', False)
+        except Exception:
+            pass
+        check('notify 503: без notify — сон есть, строк нет',
+              sleeps == [60] and noted == [], (sleeps, noted))
+    finally:
+        (bot.GOOGLE_API_KEYS, bot.current_google_key_index,
+         bot.google_analysis_counter, bot.google_client,
+         bot.asyncio.sleep, bot.LLM_PROVIDER) = saved
+        bot.set_google_api_key_index = saved_set_index
+
+    # 2. Здоровый прогон: тишина, как раньше (доп. строк нет).
+    saved_provider = bot.LLM_PROVIDER
+    saved_exec = bot.execute_gemini_request
+    saved_redrive = bot.CHUNK_REDRIVE_PAUSE_SEC
+    saved_delay = bot.CHUNK_DELAY_SECONDS
+    try:
+        bot.LLM_PROVIDER = 'google'
+        bot.CHUNK_REDRIVE_PAUSE_SEC = 0
+        bot.CHUNK_DELAY_SECONDS = 0
+
+        class FakeResp:
+            def __init__(self, text):
+                self.choices = [SimpleNamespace(
+                    message=SimpleNamespace(content=text))]
+                self.usage = SimpleNamespace(prompt_tokens=10,
+                                             completion_tokens=5,
+                                             total_tokens=15)
+
+        async def ok_text(params, **kw):
+            return FakeResp('💡 **T**\nтекст\n\n[U](https://t.me/c/1/1): суть\n')
+        bot.execute_gemini_request = ok_text
+        chunks = [([{'message_id': 1, 'sender': 'U',
+                     'date': '2026-10-09 10:00:00', 'text': 'hi'}], 1, 1),
+                  ([{'message_id': 2, 'sender': 'U',
+                     'date': '2026-10-09 10:01:00', 'text': 'hi2'}], 2, 2)]
+        noted2 = []
+
+        async def collect(text):
+            noted2.append(text)
+
+        with _quiet():
+            loop.run_until_complete(
+                bot.create_summary(chunks, '1', model='gemini-3.8-flash',
+                                   notify=collect))
+        check('notify: здоровый прогон — тишина', noted2 == [], noted2)
+
+        # 3. Битый чанк: строка с ❌ и добой в ленте.
+        async def always_empty(params, **kw):
+            return FakeResp(None)
+        bot.execute_gemini_request = always_empty
+        noted3 = []
+
+        async def collect3(text):
+            noted3.append(text)
+
+        with _quiet():
+            loop.run_until_complete(
+                bot.create_summary(chunks, '1', model='gemini-3.8-flash',
+                                   notify=collect3))
+        check('notify чанки: ошибка чанка и добой видны',
+              any('📦 Чанк' in t and '❌' in t for t in noted3)
+              and any('Добой' in t for t in noted3),
+              noted3)
+
+        # 4. Падающий notify анализ не роняет.
+        async def bad_notify(text):
+            raise RuntimeError('канал недоступен')
+
+        with _quiet():
+            combined, _usage = loop.run_until_complete(
+                bot.create_summary(chunks[:1], '1',
+                                   model='gemini-3.8-flash',
+                                   notify=bad_notify))
+        check('notify: падающий колбэк не роняет анализ',
+              'Пустой ответ модели' in combined, combined[:120])
+    finally:
+        bot.LLM_PROVIDER = saved_provider
+        bot.execute_gemini_request = saved_exec
+        bot.CHUNK_REDRIVE_PAUSE_SEC = saved_redrive
+        bot.CHUNK_DELAY_SECONDS = saved_delay
 
 
 def _now_utc():

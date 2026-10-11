@@ -593,6 +593,31 @@ def resume_cache_take_messages(resume_key):
 # дёргает его между чанками. Без run_once остаётся None — поведение не меняется.
 PROGRESS_HOOK = None
 
+# Краткая диагностика в канал: create_summary и execute_* шлют сюда
+# однострочники о ходе (чанк начат/готов/ошибка, 503-сон, добой),
+# run_analysis подставляет отправку в топик RESULTS_DESTINATION.
+# notify=None — тишина, поведение не меняется. Best-effort: неуспех
+# отправки анализ не роняет никогда.
+async def _safe_notify(notify, text):
+    if notify is None or not text:
+        return
+    try:
+        await notify(text)
+    except Exception as e:
+        print(f"⚠️ notify не ушёл: {e}")
+
+
+def _format_pause_sec(sec):
+    sec = int(sec)
+    if sec >= 60 and sec % 60 == 0:
+        return f"{sec // 60} мин"
+    return f"{sec}с"
+
+
+def _short_err(text, limit=140):
+    s = str(text or "").split("\n")[0].strip()
+    return s[:limit] + ("…" if len(s) > limit else "")
+
 def get_model_generation_config(model_name, provider=None):
     """
     Возвращает параметры генерации и чанкования для выбранной модели.
@@ -1039,9 +1064,10 @@ def is_quota_rate_limit(error):
 # ноя 2025; офиц. строки в доках нет — данные вторичные, но два независимых
 # наблюдения + механика «503 падает ПОСЛЕ аутентификации ключа» сходятся).
 # (3) Официальная рекомендация при 503 — «backoff and retry with a long
-# maximum delay» (ответ команды Gemini, форум, фев 2026): ждать — буквально
-# то, о чём просят. Не переделывать обратно в обход ключей.
-SERVER_OVERLOAD_PAUSE_SEC = 180
+# maximum delay» (ответ команды Gemini, форум, фев 2026). Операторское решение
+# от 2026-10-11: пауза ужата до 60с — меньше холостого сна при шторме, ценой
+# более частых стуков (идёт вразрез с рекомендацией выше — осознанно).
+SERVER_OVERLOAD_PAUSE_SEC = 60
 
 
 def is_server_overloaded(error_str):
@@ -1060,13 +1086,15 @@ def is_server_overloaded(error_str):
     return re.search(r'\b503\b', error_str) is not None
 
 
-async def execute_gemini_request(request_params):
+async def execute_gemini_request(request_params, notify=None):
     """
     Выполняет запрос к LLM активного провайдера (имя историческое: тесты
     и вызыватели используют execute_gemini_request).
     google: retry при временных сбоях + ротация ключей при квоте/доступе.
     openrouter/nvidia: один ключ — та же обработка 503/пауз/ретраев, но без
     обхода ключей (attempts=1, rotate не вызывается).
+    notify: async fn(text) — краткая диагностика в канал (503-сон,
+    проигрыш круга). None — тишина.
     """
     if LLM_PROVIDER in ('openrouter', 'nvidia'):
         return await _execute_single_key_request(request_params)
@@ -1095,14 +1123,22 @@ async def execute_gemini_request(request_params):
                         rotate_google_api_key("квота исчерпана, сразу следующий ключ")
                     break
 
-                # 503/UNAVAILABLE: сервер перегружен — пауза 3 мин на ТОМ ЖЕ
-                # ключе и сразу выход наружу. Без обхода ключей: шторм общий
+                # 503/UNAVAILABLE: сервер перегружен — пауза
+                # SERVER_OVERLOAD_PAUSE_SEC на ТОМ ЖЕ ключе и сразу выход
+                # наружу. Без обхода ключей: шторм общий
                 # на бэкенд, соседний ключ упрётся в ту же стену, а 503-запрос,
                 # вероятно, уже засчитан в дневной лимит. Повтор сделает
                 # внешний цикл (inbox «Попытка N/5» / due «провал N»).
                 if is_server_overloaded(error_str):
                     _log_response_headers(e)
-                    print(f"   ⏳ Сервер перегружен, ждём {SERVER_OVERLOAD_PAUSE_SEC // 60} мин...")
+                    pause_txt = _format_pause_sec(SERVER_OVERLOAD_PAUSE_SEC)
+                    print(f"   ⏳ Сервер перегружен, ждём {pause_txt}...")
+                    await _safe_notify(
+                        notify,
+                        f"⏳ 503 от {provider_display_name()} "
+                        f"(ключ {current_google_key_index + 1}/"
+                        f"{max(1, len(GOOGLE_API_KEYS))}): жду {pause_txt} — "
+                        f"дальше добой/повтор")
                     await asyncio.sleep(SERVER_OVERLOAD_PAUSE_SEC)
                     raise
 
@@ -1147,22 +1183,26 @@ async def execute_gemini_request(request_params):
         # Круг проигран (все ключи отказали): пауза — только здесь,
         # не при каждой ротации. Дальше ошибку несёт вызыватель
         # (чанк-цикл гасит остальные чанки, due уходит в skip на 10 мин).
+        await _safe_notify(notify, "⛔ Все ключи ответили сбоем — дальше добой/повтор")
         await asyncio.sleep(FULL_CIRCLE_FAIL_PAUSE_SEC)
         raise last_error
 
 
-async def _execute_single_key_request(request_params):
+async def _execute_single_key_request(request_params, notify=None):
     """Запрос для openrouter/nvidia: один ключ, без ротации.
 
-    503/UNAVAILABLE — пауза 3 мин и выход наружу (повтор делает внешний
-    цикл). 429-квота — сразу наружу без сна (сухой ключ от повторов не
-    мокреет). 500/502/504 и таймауты — короткие повторы на том же ключе.
+    503/UNAVAILABLE — пауза SERVER_OVERLOAD_PAUSE_SEC и выход наружу
+    (повтор делает внешний цикл). 429-квота — сразу наружу без сна (сухой
+    ключ от повторов не мокреет). 500/502/504 и таймауты — короткие повторы
+    на том же ключе.
+    notify: async fn(text) — краткая диагностика в канал (503-сон).
+    None — тишина.
     """
     max_retries = 3
     last_error = None
     # Медленные бесплатные модели отвечают минутами: короткий общий таймаут
     # приводил бы к повторам всего тяжелого запроса заново. Google-клиент
-    # не трогаем (у него свой круг ключей и свои 180с).
+    # не трогаем (у него свой круг ключей и свои 60с).
     try:
         client = get_active_llm_client().with_options(timeout=600.0)
     except Exception:
@@ -1177,7 +1217,12 @@ async def _execute_single_key_request(request_params):
                 raise
             if is_server_overloaded(error_str):
                 _log_response_headers(e, provider_display_name())
-                print(f"   ⏳ Сервер перегружен, ждём {SERVER_OVERLOAD_PAUSE_SEC // 60} мин...")
+                pause_txt = _format_pause_sec(SERVER_OVERLOAD_PAUSE_SEC)
+                print(f"   ⏳ Сервер перегружен, ждём {pause_txt}...")
+                await _safe_notify(
+                    notify,
+                    f"⏳ 503 от {provider_display_name()}: жду {pause_txt} — "
+                    f"дальше добой/повтор")
                 await asyncio.sleep(SERVER_OVERLOAD_PAUSE_SEC)
                 raise
             is_retryable = any(
@@ -2935,7 +2980,7 @@ def sort_topics_in_summary_text(summary_text, messages_by_id):
 
 
 async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
-                         resume_key=None, detail=None):
+                         resume_key=None, detail=None, notify=None):
     """
     Создает выжимку из сообщений с помощью LLM активного провайдера.
     Использует предварительно разбитые на чанки сообщения.
@@ -2951,6 +2996,8 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
         detail: Список, куда допишутся тройки (start_idx, end_idx, is_error)
             по чанкам в порядке их обработки (для решения «успех/частично»
             и маркировки пропущенных диапазонов). None — не собирать.
+        notify: async fn(text) — краткая диагностика в канал (ход чанков,
+            503-сон, добой). None — тишина.
 
     Returns:
         Кортеж (текст выжимки, информация об использовании токенов)
@@ -3043,6 +3090,10 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
         if resumed:
             print(f"♻️ Досчёт: {len(resumed)} из {num_chunks} чанков уже готовы (кэш), "
                   f"досчитываем остальные")
+            await _safe_notify(
+                notify,
+                f"♻️ Досчёт: {len(resumed)} из {num_chunks} ч. уже готовы — "
+                f"считаю остальные")
         
         for chunk_idx, (chunk_messages, start_idx, end_idx) in enumerate(chunks, 1):
             # Маркер прогресса для дежурства: честная длинная работа доказывает,
@@ -3054,10 +3105,17 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
                     pass
             if stop_due_to_quota or stop_due_to_overload:
                 reason = ("исчерпания квоты API" if stop_due_to_quota
-                          else f"затяжной перегрузки сервера ({provider_label}, 3 мин ожидания не помогли)")
+                          else f"затяжной перегрузки сервера ({provider_label}, "
+                               f"{_format_pause_sec(SERVER_OVERLOAD_PAUSE_SEC)} ожидания не помогли)")
+                reason_short = ("квота API" if stop_due_to_quota
+                                else "перегрузка сервера")
                 skipped_msg = f"⚠️ Чанк пропущен: обработка остановлена после {reason}"
                 chunk_summaries.append((start_idx, end_idx, skipped_msg, True))
                 errors_count += 1
+                await _safe_notify(
+                    notify,
+                    f"📦 Чанк {chunk_idx}/{num_chunks} — пропуск "
+                    f"(остановка: {reason_short})")
                 continue
 
             if (chunk_idx - 1) in resumed:
@@ -3106,7 +3164,8 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
             
             # Отправляем запрос
             try:
-                response = await execute_gemini_request(request_params)
+                response = await execute_gemini_request(request_params,
+                                                        notify=notify)
 
                 chunk_summary = _first_choice_text(response)
                 
@@ -3147,7 +3206,8 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
                     validation_passed = False
                     while retry_valid_count <= max_valid_retries:
                         try:
-                            response = await execute_gemini_request(request_params)
+                            response = await execute_gemini_request(
+                                request_params, notify=notify)
                             chunk_summary = _first_choice_text(response)
                             if is_valid_summary(chunk_summary):
                                 print(f"   ✅ Валидация пройдена после retry {retry_valid_count}")
@@ -3173,6 +3233,9 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
                     error_msg = (f"❌ Пустой ответ модели {actual_model} "
                                  f"(чанк {chunk_idx}, сообщения {start_idx}-{end_idx})")
                     print(f"   {error_msg}")
+                    await _safe_notify(
+                        notify,
+                        f"📦 Чанк {chunk_idx}/{num_chunks} — {_short_err(error_msg)}")
                     chunk_summaries.append((start_idx, end_idx, error_msg, True))
                     total_usage['errors'].append(error_msg)
                     errors_count += 1
@@ -3220,6 +3283,9 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
                 error_msg = (f"❌ {text}" if text
                              else f"❌ Ошибка доступа к API: {api_message}")
                 print(f"   {error_msg}")
+                await _safe_notify(
+                    notify,
+                    f"📦 Чанк {chunk_idx}/{num_chunks} — {_short_err(error_msg)}")
                 chunk_summaries.append((start_idx, end_idx, error_msg, True))
                 total_usage['errors'].append(error_msg)
                 errors_count += 1
@@ -3239,6 +3305,9 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
                     error_msg = (f"❌ {text}" if text
                                  else f"❌ Ошибка API (HTTP {status_code}): {api_message}")
                 print(f"   {error_msg}")
+                await _safe_notify(
+                    notify,
+                    f"📦 Чанк {chunk_idx}/{num_chunks} — {_short_err(error_msg)}")
                 chunk_summaries.append((start_idx, end_idx, error_msg, True))
                 total_usage['errors'].append(error_msg)
                 errors_count += 1
@@ -3247,15 +3316,18 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
                     stop_due_to_quota = True
                     print("   ⛔ Обработка следующих чанков остановлена: исчерпана квота API")
                 elif is_server_overloaded(api_message):
-                    # Затяжной 503 (3 мин ожидания на чанке не помогли):
-                    # остальные чанки упрутся в тот же шторм — не ждём
-                    # по 3 мин на каждый, гасим сразу.
+                    # Затяжной 503 (пауза SERVER_OVERLOAD_PAUSE_SEC на чанке
+                    # не помогла): остальные чанки упрутся в тот же шторм —
+                    # не ждём на каждый, гасим сразу.
                     stop_due_to_overload = True
                     print("   ⛔ Обработка следующих чанков остановлена: затяжная перегрузка сервера")
                 
             except Exception as e:
                 error_msg = f"❌ Ошибка: {type(e).__name__}: {e}"
                 print(f"   {error_msg}")
+                await _safe_notify(
+                    notify,
+                    f"📦 Чанк {chunk_idx}/{num_chunks} — {_short_err(error_msg)}")
                 chunk_summaries.append((start_idx, end_idx, error_msg, True))
                 total_usage['errors'].append(error_msg)
                 errors_count += 1
@@ -3280,6 +3352,10 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
         if failed_for_redrive and not stop_due_to_quota and not stop_due_to_overload:
             print(f"\n🔁 Добой {len(failed_for_redrive)} битых чанков "
                   f"(пауза {CHUNK_REDRIVE_PAUSE_SEC}с, по одному)...")
+            await _safe_notify(
+                notify,
+                f"🔁 Добой {len(failed_for_redrive)} бит. ч. "
+                f"(пауза {CHUNK_REDRIVE_PAUSE_SEC}с)…")
             if PROGRESS_HOOK is not None:
                 try:
                     PROGRESS_HOOK()
@@ -3299,6 +3375,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
                 healed, healed_usage = await create_summary(
                     [(chunk_messages, start_idx, end_idx)],
                     chat_id_str, model=model, use_reasoning=use_reasoning,
+                    notify=notify,
                 )
                 if healed and not healed.startswith('❌'):
                     chunk_summaries[list_idx] = (start_idx, end_idx, healed, False)
@@ -3321,8 +3398,12 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
                                                   'thinking_tokens': 0, 'total_tokens': 0}
                     fresh_texts[list_idx] = healed
                     print(f"   ✅ Добой удался: чанк {start_idx}-{end_idx} досчитан")
+                    await _safe_notify(
+                        notify, f"✅ Добой: чанк {start_idx}-{end_idx} досчитан")
                 else:
                     print(f"   ⚠️ Добой не помог, оставляем ошибку чанка {start_idx}-{end_idx}")
+                    await _safe_notify(
+                        notify, f"⚠️ Добой не помог: чанк {start_idx}-{end_idx}")
         
         # ═══════════════════════════════════════════════════════════════
         # Объединение саммари всех чанков
@@ -3445,7 +3526,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
             print(f"   ⏳ Пожалуйста, подождите...")
         
         # Отправляем запрос
-        response = await execute_gemini_request(request_params)
+        response = await execute_gemini_request(request_params, notify=notify)
         
         summary = _first_choice_text(response)
         
@@ -3875,7 +3956,7 @@ def build_toc_html(entries):
             norm.append((t, when))
     if len(norm) < 2:
         return ''
-    parts = ['<h4>Темы по важности</h4>', '<ol>']
+    parts = ['<h4>Темы по популярности</h4>', '<ol>']
     for t, when in norm:
         href = _escape_attr('#' + telegraph_slug(t))
         text = t.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
@@ -4638,7 +4719,8 @@ async def run_analysis_retried(resume_key=None, attempts=RETRY_MAX_ATTEMPTS,
 async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                          range_start=None, range_end=None, time_range_start=None,
                          time_range_end=None, use_ai=True, post_to_source=False, post_as_telegram=False, scheduled=False,
-                         resume_key=None, hold_partial=False, extra_stats_line=None):
+                         resume_key=None, hold_partial=False, extra_stats_line=None,
+                         notify=None):
     """
     Ядро анализа: выполняет сбор сообщений, AI анализ и публикацию.
 
@@ -4657,6 +4739,9 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             публикуется сразу и считается успехом (старое поведение VPS).
         extra_stats_line: Дополнительная строка в блок статистики (например,
             пометка об исчерпании попыток при финальной публикации частичного).
+        notify: async fn(text) — краткая диагностика в канал (ход чанков,
+            503-сон, добой). None — построится отправка в топик
+            RESULTS_DESTINATION.
 
     Returns:
         True — полный успех (опубликовано); False — провал (повторяемо);
@@ -4667,6 +4752,16 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
     try:
         # Получаем или создаем тему для этого чата
         topic_id = await get_or_create_topic(chat_name)
+
+        # Диагностика в канал: по умолчанию — в тот же топик, куда уйдёт
+        # итог. Никогда не роняет анализ (ошибки отправки гасятся внутри).
+        if notify is None:
+            async def notify(text):
+                try:
+                    await telegram_client.send_message(
+                        RESULTS_DESTINATION, text, reply_to=topic_id)
+                except Exception as e:
+                    print(f"⚠️ Прогресс в канал не ушёл: {e}")
         
         if scheduled:
             action = "анализ" if use_ai else "экспорт"
@@ -4680,6 +4775,9 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             messages_data, chat_id_str, period_start_date = reused
             print(f"♻️ Досчёт: {len(messages_data)} сообщений взяты из прошлой "
                   f"попытки (без повторной загрузки)")
+            await _safe_notify(
+                notify,
+                f"♻️ Досчёт: {len(messages_data)} сообщений из прошлой попытки")
         else:
             messages_data, chat_id_str, period_start_date = await collect_messages(
                 chat_id,
@@ -4778,7 +4876,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             summary, usage_info = await create_summary(
                 chunks, chat_id_str, model=CURRENT_MODEL,
                 use_reasoning=USE_REASONING, resume_key=resume_key,
-                detail=chunk_detail)
+                detail=chunk_detail, notify=notify)
             missing_ranges = [(s, e) for s, e, is_err in chunk_detail if is_err]
 
             # Проверяем, что summary не является сообщением об ошибке
