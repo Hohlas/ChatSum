@@ -2543,7 +2543,7 @@ def test_chunk_rebalance():
           bot.CHUNK_OVERLAP_CHARS == 3000, bot.CHUNK_OVERLAP_CHARS)
 
     # 9 сообщений по 100 символов + одно на 151 => жадная нарезка даёт
-    # чанки 900 и 251 символа; последний меньше половины лимита.
+    # чанки 900 и 251 символа; меньший делит сумму как 0.22, хуже 60/40.
     msgs = [m(i, 68) for i in range(1, 10)] + [m(10, 113)]
     chunks = bot.split_messages_by_chars(msgs, max_chars=1000, overlap_chars=100)
     check('rebalance: число чанков сохранено', len(chunks) == 2, len(chunks))
@@ -2559,13 +2559,23 @@ def test_chunk_rebalance():
           chunks[1][0][0]['message_id'] == msgs[5]['message_id'],
           chunks[1][0][0].get('message_id'))
 
-    # достаточно полный последний чанк не трогаем
-    ch_full = [
+    # косая пара хуже 60/40 (200/651, доля 0.24) пересобирается в те же (1,6,6,10)
+    ch_skewed = [
         ([m(1, 68), m(2, 68)], 1, 3),
         ([m(5, 68), m(6, 68), m(7, 68), m(8, 68), m(9, 68), m(10, 113)], 3, 9),
     ]
-    check('rebalance: полный последний чанк не тронут',
-          bot.rebalance_last_two_chunks(ch_full, msgs, 1000, 100) is ch_full)
+    rebalanced = bot.rebalance_last_two_chunks(ch_skewed, msgs, 1000, 100)
+    check('rebalance: косая пара 60/40 выровнена',
+          (rebalanced[0][1], rebalanced[0][2],
+           rebalanced[1][1], rebalanced[1][2]) == (1, 6, 6, 10),
+          (rebalanced[0][1:], rebalanced[1][1:]))
+    # ровная пара в пределах 60/40 (400/551, доля 0.42) не трогается
+    ch_even = [
+        ([m(1, 68), m(2, 68), m(3, 68), m(4, 68)], 1, 4),
+        ([m(5, 68), m(6, 68), m(7, 68), m(8, 68), m(10, 113)], 4, 9),
+    ]
+    check('rebalance: ровная пара 60/40 не тронута',
+          bot.rebalance_last_two_chunks(ch_even, msgs, 1000, 100) is ch_even)
     check('rebalance: один чанк не трогается',
           bot.rebalance_last_two_chunks([(msgs, 1, 10)], msgs, 1000, 100)[0][0] is msgs)
 

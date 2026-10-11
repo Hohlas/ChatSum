@@ -415,6 +415,11 @@ DEFAULT_CHUNK_OVERLAP_CHARS = 3000
 # Потолок: перехлёст не должен занимать больше четверти чанка, иначе
 # на маленьких лимитах он съедает полезный объём.
 DEFAULT_CHUNK_OVERLAP_MAX_RATIO = 0.25
+# Порог ровности двух последних чанков: если меньший делит их общий размер
+# хуже чем 60/40, хвост пересобирается примерно пополам. Грубее некуда:
+# точный порог вроде 55/45 чаще упирался бы в охранное условие (половины
+# с перехлёстом не влезают в лимит) и оставлял исходное деление.
+REBALANCE_MIN_SHARE = 0.40
 CHUNK_MAX_CHARS = DEFAULT_CHUNK_MAX_CHARS
 
 
@@ -2308,16 +2313,20 @@ def take_overlap_tail(messages, overlap_chars):
 
 
 def rebalance_last_two_chunks(chunks, messages_data, max_chars, overlap_chars):
-    """Выравнивает последние два чанка, если последний слишком мал.
+    """Выравнивает последние два чанка, если они различаются сильнее 60/40.
 
-    Первые чанки не трогаются. Если последний чанк занимает меньше
-    половины лимита, последние два чанка пересобираются из общего хвоста
-    сообщений примерно поровну (с сохранением перехлёста). Возвращает
-    исходный список, если выравнивание неприменимо или нарушает max_chars.
+    Первые чанки не трогаются. Если меньший из двух последних делит их общий
+    размер хуже чем REBALANCE_MIN_SHARE, последние два чанка пересобираются
+    из общего хвоста сообщений примерно поровну (с сохранением перехлёста).
+    Возвращает исходный список, если выравнивание неприменимо или нарушает
+    max_chars.
     """
     if len(chunks) < 2:
         return chunks
-    if estimate_messages_size(chunks[-1][0]) >= max_chars // 2:
+    first_size = estimate_messages_size(chunks[-2][0])
+    last_size = estimate_messages_size(chunks[-1][0])
+    pair_total = first_size + last_size
+    if pair_total == 0 or min(first_size, last_size) / pair_total >= REBALANCE_MIN_SHARE:
         return chunks
 
     tail_start = chunks[-2][1] - 1  # 0-based начало предпоследнего чанка
@@ -2419,7 +2428,7 @@ def split_messages_by_chars(messages_data, max_chars=CHUNK_MAX_CHARS, overlap_ch
     if current_chunk:
         chunks.append((current_chunk, chunk_start_index + 1, len(messages_data)))
 
-    # Последний чанк не должен быть огрызком: выравниваем последние два.
+    # Два последних чанка не должны различаться сильнее 60/40.
     return rebalance_last_two_chunks(chunks, messages_data, max_chars, overlap_chars)
 
 
