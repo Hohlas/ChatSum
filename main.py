@@ -434,6 +434,105 @@ CHUNK_DELAY_SECONDS = 10   # Задержка между запросами к A
 CHUNK_REDRIVE_PAUSE_SEC = 15   # Пауза перед добоем битых чанков (вариант C): всплеск
 # перегрузки обычно секундный; одна попытка, только genuine-ошибки, без стоп-флагов.
 
+# Кэш досчёта частичных сводок: удачные чанки прошлой попытки переиспользуются,
+# повторная попытка досчитывает только битые (не платим заново за готовое,
+# меньше шансов снова упереться в шторм 503). Ключ — resume_key вызывателя
+# ('inbox:<msg_id>' / 'due:<task_key>:<date_key>'), внутри — по отпечатку чанка
+# (кортеж message_id): границы могли сдвинуться из-за новых сообщений, чужое
+# не переиспользуется никогда. Только память процесса: промах (рестарт, смена
+# лидера, сдвиг нарезки) — обычный полный пересчёт, правильность от кэша
+# не зависит. Числа ниже — предложение, владелец правит осознанно.
+RESUME_CACHE_TTL_SEC = 6 * 3600  # запись живёт дольше худшей серии повторов
+RESUME_CACHE_MAX_ENTRIES = 30    # потолок записей (тексты чанков ~100-200КБ)
+_resume_cache = {}  # resume_key -> {'ts': monotonic, 'items': {fp: {'text', 'usage'}}}
+
+
+def _chunk_fingerprint(chunk_messages):
+    """Отпечаток чанка для кэша досчёта: кортеж message_id по порядку.
+
+    Без отпечатка (нет id) — None: такой чанк не кэшируем и не переиспользуем.
+    Чистая логика.
+    """
+    try:
+        fp = tuple(m.get('message_id') for m in chunk_messages)
+    except AttributeError:
+        return None
+    if not fp or any(mid is None for mid in fp):
+        return None
+    return fp
+
+
+def _resume_cache_prune(now=None):
+    """Выкинуть протухшие записи и ужать до потолка (по старшинству ts)."""
+    now = now if now is not None else time.monotonic()
+    stale = [k for k, e in _resume_cache.items()
+             if not isinstance(e, dict) or now - e.get('ts', 0) > RESUME_CACHE_TTL_SEC]
+    for k in stale:
+        _resume_cache.pop(k, None)
+    while len(_resume_cache) > RESUME_CACHE_MAX_ENTRIES:
+        oldest = min(_resume_cache, key=lambda k: _resume_cache[k].get('ts', 0))
+        _resume_cache.pop(oldest, None)
+
+
+def resume_cache_lookup(resume_key, chunks):
+    """Найти переиспользуемые чанки: {позиция: (text, usage)} по отпечатку.
+
+    Позиция — порядковый номер чанка в текущем списке. Нет ключа/записи —
+    пусто. Чистая логика (чтение; TTL чистится на записи).
+    """
+    if not resume_key or not chunks:
+        return {}
+    entry = _resume_cache.get(resume_key)
+    if not isinstance(entry, dict):
+        return {}
+    items = entry.get('items')
+    if not isinstance(items, dict):
+        return {}
+    found = {}
+    for pos, (chunk_messages, _s, _e) in enumerate(chunks):
+        fp = _chunk_fingerprint(chunk_messages)
+        if fp is None:
+            continue
+        hit = items.get(fp)
+        if (isinstance(hit, dict) and isinstance(hit.get('text'), str)
+                and hit['text'].strip()):
+            found[pos] = (hit['text'], hit.get('usage') or {})
+    return found
+
+
+def resume_cache_store(resume_key, chunks, texts_by_pos, usages_by_pos):
+    """Положить удачные чанки попытки в кэш (позиция -> текст/токены)."""
+    if not resume_key:
+        return
+    now = time.monotonic()
+    _resume_cache_prune(now)
+    entry = _resume_cache.get(resume_key)
+    if not isinstance(entry, dict) or not isinstance(entry.get('items'), dict):
+        entry = {'ts': now, 'items': {}}
+        _resume_cache[resume_key] = entry
+    entry['ts'] = now
+    for pos, text in (texts_by_pos or {}).items():
+        if pos < 0 or pos >= len(chunks):
+            continue
+        if not isinstance(text, str) or not text.strip():
+            continue
+        fp = _chunk_fingerprint(chunks[pos][0])
+        if fp is None:
+            continue
+        usage = (usages_by_pos or {}).get(pos) or {}
+        entry['items'][fp] = {
+            'text': text,
+            'usage': {k: usage.get(k, 0) for k in
+                      ('prompt_tokens', 'completion_tokens', 'thinking_tokens', 'total_tokens')},
+        }
+    _resume_cache_prune(now)
+
+
+def resume_cache_drop(resume_key):
+    """Убрать запись досчёта (успех/тотальный провал — хранить нечего)."""
+    if resume_key:
+        _resume_cache.pop(resume_key, None)
+
 # Хук маркера прогресса (сессия 12): run_once ставит сюда колбэк, create_summary
 # дёргает его между чанками. Без run_once остаётся None — поведение не меняется.
 PROGRESS_HOOK = None
@@ -2779,7 +2878,8 @@ def sort_topics_in_summary_text(summary_text, messages_by_id):
     return '\n---\n'.join(rank_topic_blocks(fragments, messages_by_id))
 
 
-async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False):
+async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
+                         resume_key=None, detail=None):
     """
     Создает выжимку из сообщений с помощью LLM активного провайдера.
     Использует предварительно разбитые на чанки сообщения.
@@ -2789,6 +2889,12 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False):
         chat_id_str: ID чата для ссылок
         model: Название модели (например, значение из MODEL_CONFIG.txt). Если None, используется CURRENT_MODEL
         use_reasoning: Использовать ли reasoning режим (для моделей с поддержкой)
+        resume_key: Ключ досчёта (кэш удачных чанков прошлой попытки той же
+            команды). Удачные чанки с тем же отпечатком сообщений в API не
+            ходят. None — обычный полный расчёт.
+        detail: Список, куда допишутся тройки (start_idx, end_idx, is_error)
+            по чанкам в порядке их обработки (для решения «успех/частично»
+            и маркировки пропущенных диапазонов). None — не собирать.
 
     Returns:
         Кортеж (текст выжимки, информация об использовании токенов)
@@ -2873,6 +2979,14 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False):
         errors_count = 0
         stop_due_to_quota = False
         stop_due_to_overload = False
+        # Досчёт: удачные чанки прошлой попытки той же команды (по отпечатку
+        # message_id; сдвинувшиеся не совпадут и посчитаются заново).
+        resumed = resume_cache_lookup(resume_key, chunks)
+        fresh_texts = {}   # позиция чанка -> текст (для кэша досчёта)
+        fresh_usages = {}  # позиция чанка -> токены (для кэша досчёта)
+        if resumed:
+            print(f"♻️ Досчёт: {len(resumed)} из {num_chunks} чанков уже готовы (кэш), "
+                  f"досчитываем остальные")
         
         for chunk_idx, (chunk_messages, start_idx, end_idx) in enumerate(chunks, 1):
             # Маркер прогресса для дежурства: честная длинная работа доказывает,
@@ -2888,6 +3002,17 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False):
                 skipped_msg = f"⚠️ Чанк пропущен: обработка остановлена после {reason}"
                 chunk_summaries.append((start_idx, end_idx, skipped_msg, True))
                 errors_count += 1
+                continue
+
+            if (chunk_idx - 1) in resumed:
+                # Готово в прошлой попытке: в API не ходим, токены приплюсовываем.
+                cached_text, cached_usage = resumed[chunk_idx - 1]
+                print(f"\n♻️ Чанк {chunk_idx} из {num_chunks} взят из кэша "
+                      f"(сообщения {start_idx}-{end_idx}, без запроса к API)")
+                for _k in ('prompt_tokens', 'completion_tokens',
+                           'thinking_tokens', 'total_tokens'):
+                    total_usage[_k] += (cached_usage or {}).get(_k, 0)
+                chunk_summaries.append((start_idx, end_idx, cached_text, False))
                 continue
 
             chunk_size = len(chunk_messages)
@@ -3001,8 +3126,10 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False):
                     continue
 
                 print(f"   ✅ Чанк {chunk_idx} обработан успешно")
-                
+
                 # Собираем статистику токенов
+                chunk_usage = {'prompt_tokens': 0, 'completion_tokens': 0,
+                               'thinking_tokens': 0, 'total_tokens': 0}
                 if hasattr(response, 'usage'):
                     usage = response.usage
                     prompt_tokens = usage.prompt_tokens if hasattr(usage, 'prompt_tokens') else 0
@@ -3015,14 +3142,20 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False):
                     total_usage['completion_tokens'] += completion_tokens
                     total_usage['thinking_tokens'] += thinking_tokens
                     total_usage['total_tokens'] += chunk_total
+                    chunk_usage = {'prompt_tokens': prompt_tokens,
+                                   'completion_tokens': completion_tokens,
+                                   'thinking_tokens': thinking_tokens,
+                                   'total_tokens': chunk_total}
 
                     print(
                         f"   📊 Токены чанка {chunk_idx}: промпт {prompt_tokens:,} + "
                         f"ответ {completion_tokens:,} + мышление {thinking_tokens:,} = "
                         f"{chunk_total:,}"
                     )
-                
+
                 chunk_summaries.append((start_idx, end_idx, chunk_summary, False))
+                fresh_texts[chunk_idx - 1] = chunk_summary
+                fresh_usages[chunk_idx - 1] = chunk_usage
                 
             except AuthenticationError as e:
                 api_message = extract_api_error_message(e)
@@ -3071,8 +3204,9 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False):
                 total_usage['errors'].append(error_msg)
                 errors_count += 1
             
-            # Пауза между запросами (кроме последнего чанка)
-            if chunk_idx < num_chunks:
+            # Пауза между запросами (кроме последнего чанка; взятые из кэша
+            # запросов не делали — им пауза не нужна).
+            if chunk_idx < num_chunks and (chunk_idx - 1) not in resumed:
                 print(f"   ⏳ Пауза {CHUNK_DELAY_SECONDS} секунд перед следующим чанком...")
                 await asyncio.sleep(CHUNK_DELAY_SECONDS)
 
@@ -3122,6 +3256,14 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False):
                         total_usage['completion_tokens'] += healed_usage.get('completion_tokens', 0)
                         total_usage['thinking_tokens'] += healed_usage.get('thinking_tokens', 0)
                         total_usage['total_tokens'] += healed_usage.get('total_tokens', 0)
+                        fresh_usages[list_idx] = {
+                            k: healed_usage.get(k, 0) for k in
+                            ('prompt_tokens', 'completion_tokens',
+                             'thinking_tokens', 'total_tokens')}
+                    else:
+                        fresh_usages[list_idx] = {'prompt_tokens': 0, 'completion_tokens': 0,
+                                                  'thinking_tokens': 0, 'total_tokens': 0}
+                    fresh_texts[list_idx] = healed
                     print(f"   ✅ Добой удался: чанк {start_idx}-{end_idx} досчитан")
                 else:
                     print(f"   ⚠️ Добой не помог, оставляем ошибку чанка {start_idx}-{end_idx}")
@@ -3178,6 +3320,13 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False):
             combined_parts.append("")
 
         combined_summary = "\n".join(combined_parts)
+
+        # Досчёт: кладём удачные чанки попытки в кэш (следующий повтор той же
+        # команды возьмёт их без запросов). Промах кэша позже — полный пересчёт.
+        if resume_key:
+            resume_cache_store(resume_key, chunks, fresh_texts, fresh_usages)
+        if detail is not None:
+            detail.extend((s, e, bool(err)) for s, e, _t, err in chunk_summaries)
 
         return combined_summary, total_usage
     
@@ -4381,11 +4530,12 @@ async def _send_telegram_single(chat_name, chat_id, topic_id, full_content, post
 
 
 async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
-                        range_start=None, range_end=None, time_range_start=None,
-                        time_range_end=None, use_ai=True, post_to_source=False, post_as_telegram=False, scheduled=False):
+                         range_start=None, range_end=None, time_range_start=None,
+                         time_range_end=None, use_ai=True, post_to_source=False, post_as_telegram=False, scheduled=False,
+                         resume_key=None, hold_partial=False, extra_stats_line=None):
     """
     Ядро анализа: выполняет сбор сообщений, AI анализ и публикацию.
-    
+
     Args:
         chat_id: ID чата
         chat_name: Имя чата (для отображения)
@@ -4393,6 +4543,18 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
         use_ai: True для /sum, False для /copy
         post_to_source: публиковать ли результат в исходном чате
         scheduled: True при вызове из планировщика
+        resume_key: Ключ досчёта частичных сводок (см. create_summary).
+            Повторная попытка той же команды досчитывает только битые чанки.
+        hold_partial: Не публиковать частичный результат (с ошибками чанков),
+            а вернуть маркер {'held_partial': True, ...} для повтора вызывателем.
+            Полный успех и тотальный провал идут как раньше. Без hold частичное
+            публикуется сразу и считается успехом (старое поведение VPS).
+        extra_stats_line: Дополнительная строка в блок статистики (например,
+            пометка об исчерпании попыток при финальной публикации частичного).
+
+    Returns:
+        True — полный успех (опубликовано); False — провал (повторяемо);
+        dict с held_partial — частичное при hold_partial (повторяемо).
     """
     try:
         # Получаем или создаем тему для этого чата
@@ -4452,8 +4614,10 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
         )
         num_chunks = len(chunks)
 
-        # Предупреждение о больших запросах (особенно для AI анализа)
-        if use_ai and num_chunks > 1:
+        # Предупреждение о больших запросах (особенно для AI анализа).
+        # При hold_partial (промежуточные попытки досчёта) не шумим: итоговая
+        # публикация всё равно будет одна.
+        if use_ai and num_chunks > 1 and not hold_partial:
             # Расчет примерного полного времени: AI + паузы + публикация
             wait_time_seconds = estimate_total_ai_processing_seconds(
                 chunks,
@@ -4491,8 +4655,13 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
         # Ветвление: с AI или без
         if use_ai:
             # Режим /sum - анализ с AI
-            summary, usage_info = await create_summary(chunks, chat_id_str, model=CURRENT_MODEL, use_reasoning=USE_REASONING)
-            
+            chunk_detail = []
+            summary, usage_info = await create_summary(
+                chunks, chat_id_str, model=CURRENT_MODEL,
+                use_reasoning=USE_REASONING, resume_key=resume_key,
+                detail=chunk_detail)
+            missing_ranges = [(s, e) for s, e, is_err in chunk_detail if is_err]
+
             # Проверяем, что summary не является сообщением об ошибке
             if summary.startswith('❌'):
                 # Если получили ошибку, отправляем её пользователю и выходим
@@ -4511,7 +4680,17 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                     f"{summary}\n\n{hint}",
                     reply_to=topic_id
                 )
+                resume_cache_drop(resume_key)
                 return False
+
+            if missing_ranges and hold_partial:
+                # Частичное при досчёте: не публикуем и не засчитываем успех —
+                # вызыватель повторит команду, взяв готовые чанки из кэша.
+                print(f"   ⏳ Частично: {len(missing_ranges)} из {len(chunk_detail)} "
+                      f"частей с ошибками — держим для досчёта "
+                      f"(resume_key={resume_key})")
+                return {'held_partial': True, 'errors': len(missing_ranges)}
+            resume_cache_drop(resume_key)
             
             summary = enrich_summary_with_timestamps(summary, optimized_messages, period_start_date)
             
@@ -4570,6 +4749,13 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                     stats_message += f"• {trim_text_for_telegram(error_text, max_length=500)}\n"
                 if len(usage_info['errors']) > 3:
                     stats_message += f"• ... и ещё {len(usage_info['errors']) - 3}\n"
+            if missing_ranges:
+                # Честная маркировка неполноты: какие диапазоны не вошли.
+                ranges_txt = ", ".join(f"{s}–{e}" for s, e in missing_ranges)
+                stats_message += (f"\n⚠️ Неполный результат: не вошли сообщения "
+                                  f"{ranges_txt} — досчёт не удался\n")
+            if extra_stats_line:
+                stats_message += f"{extra_stats_line}\n"
 
             # Инвариант source_post_allowed: отчёт с ошибками API — только
             # в группу, в исходный чат уходит лишь полностью успешное саммари.
@@ -5335,7 +5521,8 @@ async def schedule_listing_text():
 scheduler = AsyncIOScheduler()
 
 
-async def scheduled_analysis_job(chat_id, period, post_to_source, post_as_telegram=False):
+async def scheduled_analysis_job(chat_id, period, post_to_source, post_as_telegram=False,
+                                 resume_key=None, hold_partial=False, extra_stats_line=None):
     """Job wrapper для запланированного анализа — разрешает chat_name и вызывает run_analysis."""
     try:
         chat_entity = await telegram_client.get_entity(chat_id)
@@ -5366,7 +5553,10 @@ async def scheduled_analysis_job(chat_id, period, post_to_source, post_as_telegr
         post_to_source=post_to_source,
         post_as_telegram=post_as_telegram,
         use_ai=True,
-        scheduled=True
+        scheduled=True,
+        resume_key=resume_key,
+        hold_partial=hold_partial,
+        extra_stats_line=extra_stats_line
     )
 
 

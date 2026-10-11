@@ -186,6 +186,16 @@ DUE_FAIL_SKIP_SEC = 600      # пропуск падающего due-ключа:
 MAX_DUE_PER_ITERATION = 1    # due-саммари за итерацию: inbox опрашивается первым
                              # каждую итерацию, догон расписания идёт по одному —
                              # иначе шторм догона (4–6 слотов) хоронит команды
+try:
+    IDLE_LOG_EVERY = int((os.getenv('IDLE_LOG_EVERY', '') or '').strip() or 20)
+except ValueError:
+    IDLE_LOG_EVERY = 20        # прореживание пустых итераций лидера: заголовок
+                               # «Итерация» + «Нет необработанных слотов» печатаем
+                               # на 1-й пустой после работы и дальше каждую 20-ю
+                               # подряд пустую (~10 мин при опросе 30с); занятые
+                               # итерации (команды/слоты/ошибки) печатаем всегда
+if IDLE_LOG_EVERY < 1:
+    IDLE_LOG_EVERY = 1
 
 try:
     GAP_WARN_SEC = int((os.getenv('GAP_WARN_SEC', '') or '').strip() or 240)
@@ -1107,7 +1117,8 @@ def due_skip_info(due_fails, key, now=None):
     return (now - last).total_seconds() < DUE_FAIL_SKIP_SEC
 
 
-async def run_due_once(main, args, state, path, max_tasks=None):
+async def run_due_once(main, args, state, path, max_tasks=None, quiet_idle=False,
+                     hold_partial=False):
     """Одна итерация due-задач: compute → dedup → выполнение → save.
 
     Соединение уже установлено вызывателем (run_due / run_watch).
@@ -1116,13 +1127,19 @@ async def run_due_once(main, args, state, path, max_tasks=None):
     трёх подряд провалов. max_tasks ограничивает число задач за вызов
     (watch ставит MAX_DUE_PER_ITERATION, чтобы догон не хоронил inbox;
     None = все, для ручного --due). Возвращает число невыполненных задач.
+    quiet_idle=True — пустые исходы («нет слотов» / «всё на backoff»)
+    молчат (для прореживания лога лидера); рабочая печать не трогается.
+    hold_partial=True — частичное не публикуется сразу, а возвращается
+    маркером для досчёта повтором слота (только дежурный цикл; ручной --due
+    без повторов публикует как раньше).
     """
     now_msk = datetime.now(MSK)
     now_naive = now_msk.replace(second=0, microsecond=0)
     entries = main.load_schedule(main.SCHEDULE_FILE)
     due = compute_due(entries, now_naive, state.get('completed'))
     if not due:
-        print(f"[{now_msk.strftime('%Y-%m-%d %H:%M:%S')} МСК] Нет необработанных слотов.")
+        if not quiet_idle:
+            print(f"[{now_msk.strftime('%Y-%m-%d %H:%M:%S')} МСК] Нет необработанных слотов.")
         return 0
 
     completed = state.setdefault('completed', {})
@@ -1141,7 +1158,8 @@ async def run_due_once(main, args, state, path, max_tasks=None):
         pending.append((entry, occurrence, key, date_key))
 
     if not pending:
-        print("Все должные задания выполнены или на backoff.")
+        if not quiet_idle:
+            print("Все должные задания выполнены или на backoff.")
         return 0
 
     if max_tasks is not None and len(pending) > max_tasks:
@@ -1156,12 +1174,16 @@ async def run_due_once(main, args, state, path, max_tasks=None):
     failed = 0
     for entry, occurrence, key, date_key in pending:
         print(f"▶️  Выполняю: {key} (слот {occurrence} МСК)")
+        # Досчёт как у inbox: повтор слота берёт готовые чанки из кэша.
+        resume_key = f"due:{key}:{date_key}"
         try:
             ok = await main.scheduled_analysis_job(
                 entry['chat_id'],
                 entry['period'],
                 entry['post_to_source'],
                 entry.get('post_as_telegram', False),
+                resume_key=resume_key,
+                hold_partial=hold_partial,
             )
         except Exception as e:
             ok = False
@@ -1178,12 +1200,33 @@ async def run_due_once(main, args, state, path, max_tasks=None):
             print(f"✅ {key} выполнено, записано в state")
         else:
             failed += 1
+            held = isinstance(ok, dict) and ok.get('held_partial')
+            if held:
+                print(f"⏳ {key} частично ({ok.get('errors', '?')} ч. с ошибками) — "
+                      f"досчёт следующим повтором слота")
             due_fails[key] = due_fail_record(due_fails, key)
             rec = due_fails[key]
             save_state(path, state)
             if handoff_enabled():
                 push_state_best_effort(path)
             print(f"❌ {key} НЕ выполнено (провал {rec['n']}) — повтор позже")
+            if held and hold_partial and rec.get('n') == DUE_FAIL_THRESHOLD:
+                # Только вошли в тишину скипа: отдать честно помеченное
+                # частичное (пересборка из кэша; целый кэш — без запросов к
+                # API). Слот всё равно досчитается после окна.
+                try:
+                    await main.scheduled_analysis_job(
+                        entry['chat_id'],
+                        entry['period'],
+                        entry['post_to_source'],
+                        entry.get('post_as_telegram', False),
+                        resume_key=resume_key,
+                        hold_partial=False,
+                        extra_stats_line=(f"⏳ Слот уходит в тишину после {rec['n']} провалов — "
+                                          f"результат частичный, досчёт продолжится"),
+                    )
+                except Exception as e:
+                    print(f"⚠️ {key}: публикация частичного при входе в скип не удалась: {e}")
     return failed
 
 
@@ -1831,6 +1874,24 @@ async def process_inbox_message(main, mem, dest, msg):
     notify_topic = home
     attempt_no = _attempt_number(mem, msg.id)
     retry_note = f" 🔁 Попытка {attempt_no}/{INBOX_MAX_ATTEMPTS}." if attempt_no > 1 else ""
+    # Досчёт частичных сводок: повтор той же команды берёт готовые чанки из
+    # кэша (main.py), в API ходят только битые. Ритм повторов прежний (~30с).
+    resume_key = f"inbox:{msg.id}"
+    inbox_kwargs = dict(
+        chat_id=source_id,
+        chat_name=chat_name,
+        hours=parsed['hours'],
+        days=parsed['days'],
+        limit=parsed['limit'],
+        range_start=parsed['range_start'],
+        range_end=parsed['range_end'],
+        time_range_start=parsed['time_range_start'],
+        time_range_end=parsed['time_range_end'],
+        use_ai=use_ai,
+        post_to_source=parsed['post_to_source'],
+        post_as_telegram=parsed['post_as_telegram'],
+        scheduled=False,
+    )
     try:
         topic_out = await main.get_or_create_topic(chat_name)
         notify_topic = topic_out
@@ -1840,19 +1901,9 @@ async def process_inbox_message(main, mem, dest, msg):
                   f"\nМодель {_model_diag_label(main)}",
             reply_to=topic_out)
         ok = await main.run_analysis(
-            chat_id=source_id,
-            chat_name=chat_name,
-            hours=parsed['hours'],
-            days=parsed['days'],
-            limit=parsed['limit'],
-            range_start=parsed['range_start'],
-            range_end=parsed['range_end'],
-            time_range_start=parsed['time_range_start'],
-            time_range_end=parsed['time_range_end'],
-            use_ai=use_ai,
-            post_to_source=parsed['post_to_source'],
-            post_as_telegram=parsed['post_as_telegram'],
-            scheduled=False,
+            **inbox_kwargs,
+            resume_key=resume_key,
+            hold_partial=True,
         )
     except Exception as e:
         ok = False
@@ -1864,12 +1915,39 @@ async def process_inbox_message(main, mem, dest, msg):
         await _drop_command(main, dest, msg, 'выполнено')
         print(f"✅ Inbox {msg.id}: выполнено")
         return 'ok'
-    print(f"❌ Inbox {msg.id}: НЕ выполнено")
+    held = isinstance(ok, dict) and ok.get('held_partial')
+    if held:
+        # Частичное: опубликовано ничего, готовые чанки в кэше — следующий
+        # повтор досчитает только битые.
+        print(f"⏳ Inbox {msg.id}: частично ({ok.get('errors', '?')} ч. с ошибками) — "
+              f"досчёт следующим повтором")
+    else:
+        print(f"❌ Inbox {msg.id}: НЕ выполнено")
     n, exhausted = _attempt_bump(mem, msg.id)
     _inbox_state_save(mem)
     if not exhausted:
         print(f"⏳ Inbox {msg.id}: попытка {n}/{INBOX_MAX_ATTEMPTS} — команда оставлена для повтора")
         return 'retry'
+    if held:
+        # Попытки кончились: финальная сборка из кэша (целый кэш — без новых
+        # запросов к API) и публикация честно помеченного частичного.
+        try:
+            await main.run_analysis(
+                **inbox_kwargs,
+                resume_key=resume_key,
+                hold_partial=False,
+                extra_stats_line=(f"⛔ Попытки исчерпаны ({n}/{INBOX_MAX_ATTEMPTS}) — "
+                                  f"результат частичный"),
+            )
+        except Exception as e:
+            print(f"⚠️ Inbox {msg.id}: финальная публикация частичного не удалась: {e}")
+            await _notify_inbox(main, dest, notify_topic,
+                                f"⛔ Inbox {msg.id}: не выполнено после {n} попыток — "
+                                f"команда удалена.\nКоманда: {snippet!r}")
+        if not await _drop_command(main, dest, msg, 'провал'):
+            _log_once(mem, f"dropfail:{msg.id}",
+                      f"⚠️ Inbox {msg.id}: команда не удалена — повторится следующим опросом")
+        return 'fail'
     if await _drop_command(main, dest, msg, 'провал'):
         # Детали провала анализа уже в топике (error-path run_analysis) —
         # здесь однострочник, чтобы не ждали впустую.
@@ -2091,6 +2169,7 @@ async def _run_leader_loop(main, args, state, path, me, poll, use_handoff,
     inbox_mem['state'] = state  # счётчик попыток живёт в state (переживает handoff)
     sched_every = max(1, SCHEDULE_REFRESH_SEC // poll)
     iteration = 0
+    idle_streak = 0  # подряд пустых итераций (сброс при любой активности)
     hb_task = None
     if use_handoff:
         hb_task = asyncio.create_task(_heartbeat_loop(me, path, main))
@@ -2104,7 +2183,14 @@ async def _run_leader_loop(main, args, state, path, me, poll, use_handoff,
             print(f"⚠️ Маяк: не удалось посчитать конец вахты: {e}")
         while True:
             iteration += 1
-            print(f"─── Итерация {iteration} ───")
+            # Прореживание пустого лога: заголовок печатаем на 1-й пустой
+            # после работы и дальше каждую IDLE_LOG_EVERY-ю подряд пустую
+            # (~10 мин при опросе 30с). Занятые итерации допечатываем после
+            # (ниже): команда/слот/ошибка никогда не остаются без заголовка.
+            show_idle = (idle_streak == 0 or
+                         (idle_streak + 1) % IDLE_LOG_EVERY == 0)
+            if show_idle:
+                print(f"─── Итерация {iteration} ───")
             note_work_progress()  # маркер: цикл жив, даже если задач нет
             if use_handoff:
                 remote, _ = leader_read()
@@ -2118,13 +2204,36 @@ async def _run_leader_loop(main, args, state, path, me, poll, use_handoff,
             if iteration % sched_every == 0:
                 refresh_runtime_files_best_effort(main)
             # Inbox всегда первый: команды не ждут догона расписания.
+            old_last_seen = last_seen
+            completed_before = dict(state.get('completed') or {})
+            inbox_failed = 0
+            inbox_error = False
             try:
                 last_seen, inbox_failed = await poll_inbox_once(main, last_seen, inbox_mem)
                 failed_total += inbox_failed
             except Exception as e:
+                inbox_error = True
                 print(f"⚠️ Ошибка опроса inbox (итерация {iteration}): {e}")
-            failed_total += await run_due_once(main, args, state, path,
-                                               max_tasks=MAX_DUE_PER_ITERATION)
+            due_failed = await run_due_once(main, args, state, path,
+                                              max_tasks=MAX_DUE_PER_ITERATION,
+                                              quiet_idle=not show_idle,
+                                              hold_partial=True)
+            failed_total += due_failed
+            # Успех due из возврата не виден (0 и при простое, и при успехе),
+            # поэтому смотрим на приросший completed; провал виден по счётчику.
+            had_work = (
+                inbox_error
+                or (last_seen != old_last_seen)
+                or (due_failed > 0)
+                or (dict(state.get('completed') or {}) != completed_before)
+            )
+            # failed_total уже вобрал оба счётчика выше.
+            if had_work:
+                idle_streak = 0
+                if not show_idle:
+                    print(f"─── Итерация {iteration} ───")
+            else:
+                idle_streak += 1
             now = time.monotonic()
             if now >= deadline:
                 if use_handoff:

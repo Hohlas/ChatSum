@@ -156,6 +156,7 @@ def main():
     test_rank_topics_by_importance()
     test_chunk_rebalance()
     test_chunk_redrive()
+    test_resume_cache()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")
@@ -2280,7 +2281,7 @@ def test_due_cap():
 
         @staticmethod
         async def scheduled_analysis_job(chat_id, period, post_to_source,
-                                         post_as_telegram=False):
+                                         post_as_telegram=False, **kw):
             calls.append(chat_id)
             return True
 
@@ -2832,6 +2833,133 @@ def test_chunk_redrive():
         bot.execute_gemini_request = real_exec
         bot.CHUNK_REDRIVE_PAUSE_SEC = real_redrive_pause
         bot.CHUNK_DELAY_SECONDS = real_chunk_pause
+
+
+def test_resume_cache():
+    # Досчёт частичных сводок: удачный чанк прошлой попытки переиспользуется
+    # (в API не ходим), битый досчитывается; сдвинувшаяся нарезка — заново.
+    from types import SimpleNamespace
+
+    def fake_msg(mid, sender):
+        return {'message_id': mid, 'sender': sender,
+                'date': '2026-10-09 10:00:00', 'text': f'текст {mid}'}
+
+    chunks = [
+        ([fake_msg(1, 'U1')], 1, 1),
+        ([fake_msg(2, 'U2')], 2, 2),
+    ]
+    good1 = '💡 **Тема один**\n*Идея один.*\n\n[U1](https://t.me/c/1/1): суть один\n'
+    good2 = '💡 **Тема два**\n*Идея два.*\n\n[U2](https://t.me/c/1/2): суть два\n'
+
+    class FakeResp:
+        def __init__(self, text):
+            self.choices = [SimpleNamespace(message=SimpleNamespace(content=text))]
+
+    def no_json():
+        raise Exception('no json')
+
+    fake_http = SimpleNamespace(
+        status_code=503, request=object(), headers={},
+        text='UNAVAILABLE: backend overloaded', json=no_json)
+
+    real_exec = bot.execute_gemini_request
+    real_redrive_pause = bot.CHUNK_REDRIVE_PAUSE_SEC
+    real_chunk_pause = bot.CHUNK_DELAY_SECONDS
+    bot.CHUNK_REDRIVE_PAUSE_SEC = 0
+    bot.CHUNK_DELAY_SECONDS = 0
+    loop = asyncio.get_event_loop()
+    try:
+        bot._resume_cache.clear()
+
+        # Отпечаток: нет id — None; порядок id значим.
+        check('resume: fp без id — None',
+              bot._chunk_fingerprint([{'sender': 'U'}]) is None,
+              bot._chunk_fingerprint([{'sender': 'U'}]))
+        check('resume: fp по message_id',
+              bot._chunk_fingerprint(chunks[0][0]) == (1,),
+              bot._chunk_fingerprint(chunks[0][0]))
+
+        # Попытка 1: чанк 1 ок, чанк 2 — 503 (стоп-флаг, добоя нет).
+        calls = []
+
+        async def storm_then_heal(params):
+            calls.append(1)
+            if len(calls) == 1:
+                return FakeResp(good1)
+            if len(calls) == 2:
+                raise bot.APIStatusError('overloaded', response=fake_http, body=None)
+            return FakeResp(good2)
+
+        bot.execute_gemini_request = storm_then_heal
+        with _quiet():
+            combined1, usage1 = loop.run_until_complete(
+                bot.create_summary(chunks, '1', model='test-model',
+                                   resume_key='test-resume-1'))
+        check('resume: попытка 1 частичная',
+              len(usage1['errors']) == 1 and 'Тема один' in combined1,
+              (usage1['errors'], combined1[:100]))
+        check('resume: попытка 1 — два запроса', len(calls) == 2, len(calls))
+
+        # Попытка 2 с тем же ключом: чанк 1 из кэша, чанк 2 досчитан.
+        with _quiet():
+            combined2, usage2 = loop.run_until_complete(
+                bot.create_summary(chunks, '1', model='test-model',
+                                   resume_key='test-resume-1'))
+        check('resume: попытка 2 — один запрос (второй чанк)',
+              len(calls) == 3, len(calls))
+        check('resume: попытка 2 полная',
+              'Тема один' in combined2 and 'Тема два' in combined2
+              and usage2['errors'] == [],
+              (combined2[:150], usage2['errors']))
+        check('resume: токены кэша приплюсованы',
+              usage2['total_tokens'] >= usage1['total_tokens'],
+              (usage1['total_tokens'], usage2['total_tokens']))
+
+        # detail: позиции ошибок для маркировки диапазонов.
+        detail = []
+        bot.execute_gemini_request = storm_then_heal
+        calls.clear()
+        with _quiet():
+            loop.run_until_complete(
+                bot.create_summary(chunks, '1', model='test-model',
+                                   resume_key='test-resume-2', detail=detail))
+        check('resume: detail отмечает битый чанк',
+              detail == [(1, 1, False), (2, 2, True)], detail)
+
+        # Сдвинувшаяся нарезка: запись есть, но отпечатки не совпали —
+        # кэш не применим, всё считается заново (2 свежих запроса).
+        calls.clear()
+        with _quiet():
+            loop.run_until_complete(
+                bot.create_summary(chunks, '1', model='test-model',
+                                   resume_key='test-resume-3'))
+        shifted = [
+            ([fake_msg(11, 'U1')], 1, 1),
+            ([fake_msg(12, 'U2')], 2, 2),
+        ]
+        calls.clear()
+        with _quiet():
+            combined3, usage3 = loop.run_until_complete(
+                bot.create_summary(shifted, '1', model='test-model',
+                                   resume_key='test-resume-3'))
+        check('resume: сдвиг — полный пересчёт без переиспользования',
+              len(calls) == 2, len(calls))
+        check('resume: сдвиг — тоже частичный (шторм в моке)',
+              len(usage3['errors']) == 1 and 'Тема один' in combined3,
+              (usage3['errors'], combined3[:100]))
+
+        # Жизненным циклом записи владеет run_analysis (успех/тотал — drop):
+        # create_summary только кладёт, не чистит.
+        check('resume: успех не трогает чужой слой (чистит run_analysis)',
+              'test-resume-1' in bot._resume_cache, list(bot._resume_cache))
+        bot.resume_cache_drop('test-resume-1')
+        check('resume: drop чистит ключ',
+              'test-resume-1' not in bot._resume_cache, list(bot._resume_cache))
+    finally:
+        bot.execute_gemini_request = real_exec
+        bot.CHUNK_REDRIVE_PAUSE_SEC = real_redrive_pause
+        bot.CHUNK_DELAY_SECONDS = real_chunk_pause
+        bot._resume_cache.clear()
 
 
 def _now_utc():
