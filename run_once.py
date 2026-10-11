@@ -1440,6 +1440,19 @@ def _inbox_state_save(mem):
         push_state_best_effort(state_path())
 
 
+def _drop_resume_cache(main, resume_key):
+    """Убрать запись досчёта (терминальный исход: саммари сформировано).
+
+    Best-effort через getattr: у тестовых фейков метода нет — молча мимо.
+    """
+    try:
+        drop = getattr(main, 'resume_cache_drop', None)
+        if callable(drop):
+            drop(resume_key)
+    except Exception:
+        pass
+
+
 def _attempt_bump(mem, msg_id):
     """Зарегистрировать провал: возвращает (n, exhausted).
 
@@ -1912,6 +1925,7 @@ async def process_inbox_message(main, mem, dest, msg):
     if ok is True:
         _attempt_clear(mem, msg.id)
         _inbox_state_save(mem)
+        _drop_resume_cache(main, resume_key)  # саммари готово — кэш больше не нужен
         await _drop_command(main, dest, msg, 'выполнено')
         print(f"✅ Inbox {msg.id}: выполнено")
         return 'ok'
@@ -1947,6 +1961,7 @@ async def process_inbox_message(main, mem, dest, msg):
         if not await _drop_command(main, dest, msg, 'провал'):
             _log_once(mem, f"dropfail:{msg.id}",
                       f"⚠️ Inbox {msg.id}: команда не удалена — повторится следующим опросом")
+        _drop_resume_cache(main, resume_key)  # финал опубликован — кэш больше не нужен
         return 'fail'
     if await _drop_command(main, dest, msg, 'провал'):
         # Детали провала анализа уже в топике (error-path run_analysis) —

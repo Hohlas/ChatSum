@@ -438,13 +438,23 @@ CHUNK_REDRIVE_PAUSE_SEC = 15   # Пауза перед добоем битых �
 # повторная попытка досчитывает только битые (не платим заново за готовое,
 # меньше шансов снова упереться в шторм 503). Ключ — resume_key вызывателя
 # ('inbox:<msg_id>' / 'due:<task_key>:<date_key>'), внутри — по отпечатку чанка
-# (кортеж message_id): границы могли сдвинуться из-за новых сообщений, чужое
-# не переиспользуется никогда. Только память процесса: промах (рестарт, смена
-# лидера, сдвиг нарезки) — обычный полный пересчёт, правильность от кэша
-# не зависит. Числа ниже — предложение, владелец правит осознанно.
-RESUME_CACHE_TTL_SEC = 6 * 3600  # запись живёт дольше худшей серии повторов
-RESUME_CACHE_MAX_ENTRIES = 30    # потолок записей (тексты чанков ~100-200КБ)
-_resume_cache = {}  # resume_key -> {'ts': monotonic, 'items': {fp: {'text', 'usage'}}}
+# (кортеж message_id). Повтор обрабатывает ТЕ ЖЕ собранные сообщения (тот же
+# JSON, без повторной загрузки из Telegram): messages_data лежат в той же
+# записи. Только память процесса: промах (рестарт, смена лидера) — обычное
+# выполнение с нуля, правильность от кэша не зависит. Живёт запись только пока
+# идёт борьба: успех/финал/тотальный провал удаляют её явно (см. run_analysis
+# и run_once), TTL и потолок — лишь страховка от бесхозных остатков
+# (например, слот в долгой тишине скипа). Числа ниже — предложение, владелец
+# правит осознанно.
+RESUME_CACHE_TTL_SEC = 3 * 3600  # страховка для долгих штормов в тишине скипов
+RESUME_CACHE_MAX_ENTRIES = 10    # потолок записей (сообщения + тексты чанков)
+_resume_cache = {}  # resume_key -> {'ts': monotonic, 'items': {fp: {...}}, 'messages': {...}|None}
+
+# Повторы анализа в режимах без внешнего цикла (VPS-команда, VPS-планировщик,
+# ручной --due): столько же попыток и та же пауза, что у inbox-дежурства.
+# Числа — предложение, владелец правит осознанно.
+RETRY_MAX_ATTEMPTS = 5
+RETRY_PAUSE_SEC = 30
 
 
 def _chunk_fingerprint(chunk_messages):
@@ -532,6 +542,52 @@ def resume_cache_drop(resume_key):
     """Убрать запись досчёта (успех/тотальный провал — хранить нечего)."""
     if resume_key:
         _resume_cache.pop(resume_key, None)
+
+
+def resume_cache_store_messages(resume_key, messages_data, chat_id_str,
+                                period_start_date):
+    """Запомнить собранные сообщения команды для повторов (тот же JSON).
+
+    Повторная попытка не грузит сообщения из Telegram заново, а берёт их
+    отсюда. Без сообщений (пусто) — не храним. Чистая механика записи.
+    """
+    if not resume_key or not messages_data:
+        return
+    now = time.monotonic()
+    _resume_cache_prune(now)
+    entry = _resume_cache.get(resume_key)
+    if not isinstance(entry, dict):
+        entry = {'ts': now, 'items': {}}
+        _resume_cache[resume_key] = entry
+    entry['ts'] = now
+    entry['messages'] = {
+        'messages_data': messages_data,
+        'chat_id_str': chat_id_str,
+        'period_start_date': period_start_date,
+    }
+    _resume_cache_prune(now)
+
+
+def resume_cache_take_messages(resume_key):
+    """Забрать собранные сообщения прошлой попытки той же команды.
+
+    Возвращает (messages_data, chat_id_str, period_start_date) или None
+    (нет записи / битая). Запись не удаляет: повторов может быть несколько,
+    чистка — на терминальных исходах. Чтение, без сети.
+    """
+    if not resume_key:
+        return None
+    entry = _resume_cache.get(resume_key)
+    if not isinstance(entry, dict):
+        return None
+    stored = entry.get('messages')
+    if not isinstance(stored, dict):
+        return None
+    messages_data = stored.get('messages_data')
+    if not messages_data or not isinstance(messages_data, list):
+        return None
+    return (messages_data, stored.get('chat_id_str'),
+            stored.get('period_start_date'))
 
 # Хук маркера прогресса (сессия 12): run_once ставит сюда колбэк, create_summary
 # дёргает его между чанками. Без run_once остаётся None — поведение не меняется.
@@ -4529,6 +4585,56 @@ async def _send_telegram_single(chat_name, chat_id, topic_id, full_content, post
     print(f"✅ Саммари отправлено как Telegram-сообщение ({len(chunks)} частей)")
 
 
+async def run_analysis_retried(resume_key=None, attempts=RETRY_MAX_ATTEMPTS,
+                               pause_sec=RETRY_PAUSE_SEC, final_note=None,
+                               progress_cb=None, **kwargs):
+    """Анализ с повторами и досчётом для режимов без внешнего цикла.
+
+    VPS-команда, VPS-планировщик, ручной --due: повтор той же задачи берёт
+    готовые чанки и собранные сообщения из кэша досчёта (тот же resume_key
+    на все попытки), в API ходят только битые. Последняя попытка публикует
+    что есть (полное или честно помеченное частичное).
+
+    Args:
+        resume_key: Ключ досчёта; None — разовый сгенерированный на серию.
+        attempts: Попыток всего (включая первую).
+        pause_sec: Пауза между попытками.
+        final_note: Строка в статистику финальной публикации частичного.
+        progress_cb: async fn(n, attempts) перед попытками 2+ (заметки в чат).
+        kwargs: Аргументы run_analysis.
+
+    Returns:
+        True — только полный успех. Иначе False (частичное опубликовано
+        финалом либо тотальный провал).
+    """
+    key = resume_key or f"adhoc:{time.monotonic_ns()}"
+    for n in range(1, attempts + 1):
+        last = (n == attempts)
+        if n > 1:
+            print(f"🔁 Попытка {n}/{attempts} (досчёт по кэшу, ключ {key})")
+            if progress_cb is not None:
+                try:
+                    await progress_cb(n, attempts)
+                except Exception:
+                    pass
+        call_kw = dict(kwargs)
+        if last and final_note and not call_kw.get('extra_stats_line'):
+            call_kw['extra_stats_line'] = final_note
+        try:
+            ok = await run_analysis(
+                resume_key=key,
+                hold_partial=not last,
+                **call_kw)
+        except Exception as e:
+            ok = False
+            print(f"❌ Попытка {n}/{attempts} упала исключением: {e}")
+        if ok is True:
+            return True
+        if not last:
+            await asyncio.sleep(pause_sec)
+    return False
+
+
 async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                          range_start=None, range_end=None, time_range_start=None,
                          time_range_end=None, use_ai=True, post_to_source=False, post_as_telegram=False, scheduled=False,
@@ -4554,7 +4660,9 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
 
     Returns:
         True — полный успех (опубликовано); False — провал (повторяемо);
-        dict с held_partial — частичное при hold_partial (повторяемо).
+        dict с held_partial — частичное при hold_partial (повторяемо,
+        не опубликовано); dict с published_partial — частичное, опубликованное
+        с маркировкой (финалы без внешнего цикла; тоже не успех).
     """
     try:
         # Получаем или создаем тему для этого чата
@@ -4564,17 +4672,27 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             action = "анализ" if use_ai else "экспорт"
             status_msg = f"🔄 Запланированный {action} чата '{chat_name}'..."
             await telegram_client.send_message(RESULTS_DESTINATION, status_msg, reply_to=topic_id)
-        # Собираем сообщения
-        messages_data, chat_id_str, period_start_date = await collect_messages(
-            chat_id,
-            hours=hours,
-            days=days,
-            limit=limit,
-            range_start=range_start,
-            range_end=range_end,
-            time_range_start=time_range_start,
-            time_range_end=time_range_end
-        )
+        # Собираем сообщения. Повтор той же команды (тот же resume_key) берёт
+        # ТОТ ЖЕ собранный JSON из кэша досчёта, а не грузит заново: иначе в
+        # живом чате нарезка чанков сдвинется и готовое не переиспользуется.
+        reused = resume_cache_take_messages(resume_key)
+        if reused is not None:
+            messages_data, chat_id_str, period_start_date = reused
+            print(f"♻️ Досчёт: {len(messages_data)} сообщений взяты из прошлой "
+                  f"попытки (без повторной загрузки)")
+        else:
+            messages_data, chat_id_str, period_start_date = await collect_messages(
+                chat_id,
+                hours=hours,
+                days=days,
+                limit=limit,
+                range_start=range_start,
+                range_end=range_end,
+                time_range_start=time_range_start,
+                time_range_end=time_range_end
+            )
+            resume_cache_store_messages(resume_key, messages_data, chat_id_str,
+                                        period_start_date)
         
         if not messages_data:
             await telegram_client.send_message(
@@ -4653,6 +4771,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             return True
         
         # Ветвление: с AI или без
+        missing_ranges = []  # диапазоны чанков с ошибками (только /sum)
         if use_ai:
             # Режим /sum - анализ с AI
             chunk_detail = []
@@ -5126,6 +5245,10 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
             
             print(f"✅ Экспорт завершен: {len(optimized_messages)} сообщений")
 
+        if missing_ranges:
+            # Опубликованное частичное — не успех: вызыватели с проверкой
+            # `is True` пойдут в повтор/провал, а не в зачёт.
+            return {'published_partial': True, 'errors': len(missing_ranges)}
         return True
 
     except Exception as e:
@@ -5346,8 +5469,20 @@ async def process_chat_command(event, use_ai=True):
             status_msg,
             reply_to=topic_id
         )
-        
-        await run_analysis(
+
+        # Та же логика, что у дежурства: повторы с досчётом готовых чанков.
+        async def _vps_progress(n, total):
+            await telegram_client.send_message(
+                RESULTS_DESTINATION,
+                f"🔁 Попытка {n}/{total}: досчитываем недостающее...",
+                reply_to=topic_id
+            )
+
+        await run_analysis_retried(
+            resume_key=f"vps:{event.chat_id}:{event.id}",
+            final_note=(f"⛔ Попытки исчерпаны ({RETRY_MAX_ATTEMPTS}/"
+                        f"{RETRY_MAX_ATTEMPTS}) — результат частичный"),
+            progress_cb=_vps_progress,
             chat_id=event.chat_id,
             chat_name=chat_name,
             hours=hours,
@@ -5523,7 +5658,12 @@ scheduler = AsyncIOScheduler()
 
 async def scheduled_analysis_job(chat_id, period, post_to_source, post_as_telegram=False,
                                  resume_key=None, hold_partial=False, extra_stats_line=None):
-    """Job wrapper для запланированного анализа — разрешает chat_name и вызывает run_analysis."""
+    """Job wrapper для запланированного анализа — разрешает chat_name и вызывает run_analysis.
+
+    hold_partial=True (дежурный цикл Actions): одна попытка, частичное
+    возвращается маркером — повторами владеет вызыватель. Иначе (VPS-планировщик,
+    ручной --due): серия повторов с досчётом внутри, наружу только итог.
+    """
     try:
         chat_entity = await telegram_client.get_entity(chat_id)
         chat_name = chat_entity.title if hasattr(chat_entity, 'title') else f"чат {chat_id}"
@@ -5544,7 +5684,25 @@ async def scheduled_analysis_job(chat_id, period, post_to_source, post_as_telegr
     else:
         days = 1
 
-    return await run_analysis(
+    if hold_partial:
+        return await run_analysis(
+            chat_id=chat_id,
+            chat_name=chat_name,
+            hours=hours,
+            days=days,
+            limit=limit,
+            post_to_source=post_to_source,
+            post_as_telegram=post_as_telegram,
+            use_ai=True,
+            scheduled=True,
+            resume_key=resume_key,
+            hold_partial=True,
+            extra_stats_line=extra_stats_line
+        )
+    return await run_analysis_retried(
+        resume_key=resume_key,
+        final_note=(extra_stats_line
+                    or "⛔ Попытки исчерпаны — результат частичный"),
         chat_id=chat_id,
         chat_name=chat_name,
         hours=hours,
@@ -5554,9 +5712,6 @@ async def scheduled_analysis_job(chat_id, period, post_to_source, post_as_telegr
         post_as_telegram=post_as_telegram,
         use_ai=True,
         scheduled=True,
-        resume_key=resume_key,
-        hold_partial=hold_partial,
-        extra_stats_line=extra_stats_line
     )
 
 

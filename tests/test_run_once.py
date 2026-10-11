@@ -157,6 +157,8 @@ def main():
     test_chunk_rebalance()
     test_chunk_redrive()
     test_resume_cache()
+    test_resume_messages()
+    test_analysis_retried_loop()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")
@@ -2960,6 +2962,94 @@ def test_resume_cache():
         bot.CHUNK_REDRIVE_PAUSE_SEC = real_redrive_pause
         bot.CHUNK_DELAY_SECONDS = real_chunk_pause
         bot._resume_cache.clear()
+
+
+def test_resume_messages():
+    # Повтор берёт тот же собранный JSON, а не грузит заново; битого нет.
+    msgs = [{'message_id': 1, 'sender': 'U', 'text': 'a'},
+            {'message_id': 2, 'sender': 'U', 'text': 'b'}]
+    try:
+        bot._resume_cache.clear()
+        check('resume-msg: пусто — None',
+              bot.resume_cache_take_messages('k-msg') is None,
+              list(bot._resume_cache))
+        bot.resume_cache_store_messages('k-msg', msgs, '-1001', '2026-10-11')
+        got = bot.resume_cache_take_messages('k-msg')
+        check('resume-msg: roundtrip тот же JSON',
+              got is not None and got[0] == msgs and got[1] == '-1001'
+              and got[2] == '2026-10-11', got)
+        bot.resume_cache_store_messages('k-empty', [], '-1001', None)
+        check('resume-msg: пустое не храним',
+              bot.resume_cache_take_messages('k-empty') is None,
+              list(bot._resume_cache))
+        bot.resume_cache_drop('k-msg')
+        check('resume-msg: drop чистит вместе с сообщениями',
+              bot.resume_cache_take_messages('k-msg') is None,
+              list(bot._resume_cache))
+    finally:
+        bot._resume_cache.clear()
+
+
+def test_analysis_retried_loop():
+    # Общий цикл повторов: held — дальше, True — стоп, финал без hold.
+    real = bot.run_analysis
+    try:
+        calls = []
+
+        held = {'held_partial': True, 'errors': 1}
+        loop = asyncio.get_event_loop()
+
+        # Успех с третьей: два held, затем True.
+        async def script1(**kw):
+            calls.append(kw)
+            return [held, held, True][min(len(calls) - 1, 2)]
+        bot.run_analysis = script1
+        with _quiet():
+            ok = loop.run_until_complete(
+                bot.run_analysis_retried(resume_key='t-retry', attempts=5,
+                                         pause_sec=0, chat_id=-1,
+                                         chat_name='t'))
+        check('retried: успех с 3-й — True',
+              ok is True and len(calls) == 3, (ok, len(calls)))
+        check('retried: один ключ на серию',
+              all(c.get('resume_key') == 't-retry' for c in calls), calls)
+        check('retried: hold до последней попытки',
+              [c.get('hold_partial') for c in calls] == [True, True, True],
+              [c.get('hold_partial') for c in calls])
+
+        # Все held: финал тоже held-маркер, итог False.
+        calls.clear()
+
+        async def script2(**kw):
+            calls.append(kw)
+            return held
+        bot.run_analysis = script2
+        with _quiet():
+            ok2 = loop.run_until_complete(
+                bot.run_analysis_retried(resume_key='t-retry', attempts=3,
+                                         pause_sec=0, chat_id=-1,
+                                         chat_name='t'))
+        check('retried: все held — False, три попытки, финал без hold',
+              ok2 is False and len(calls) == 3
+              and [c.get('hold_partial') for c in calls] == [True, True, False],
+              (ok2, len(calls), [c.get('hold_partial') for c in calls]))
+
+        # Первая сразу True: один вызов, стоп сразу.
+        calls.clear()
+
+        async def script3(**kw):
+            calls.append(kw)
+            return True
+        bot.run_analysis = script3
+        with _quiet():
+            ok3 = loop.run_until_complete(
+                bot.run_analysis_retried(resume_key='t-retry', attempts=5,
+                                         pause_sec=0, chat_id=-1,
+                                         chat_name='t'))
+        check('retried: успех с первой — один вызов',
+              ok3 is True and len(calls) == 1, (ok3, len(calls)))
+    finally:
+        bot.run_analysis = real
 
 
 def _now_utc():
