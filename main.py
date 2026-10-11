@@ -3670,7 +3670,7 @@ def build_toc_html(entries):
             norm.append((t, when))
     if len(norm) < 2:
         return ''
-    parts = ['<h4>Содержание</h4>', '<ol>']
+    parts = ['<h4>Темы по важности</h4>', '<ol>']
     for t, when in norm:
         href = _escape_attr('#' + telegraph_slug(t))
         text = t.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')

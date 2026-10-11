@@ -2371,17 +2371,17 @@ def test_telegraph_toc():
 
     html_two = bot.convert_markdown_to_html(md_two)
     check('toc: содержание в Telegraph-вёрстке',
-          '<h4>Содержание</h4>' in html_two and '<ol>' in html_two, html_two[:200])
+          '<h4>Темы по важности</h4>' in html_two and '<ol>' in html_two, html_two[:200])
     check('toc: href пережил санитарку',
           'href="#💡-Вспышка-кори-в-США"' in html_two, html_two[:400])
     check('toc: содержание до первого топика',
-          html_two.index('Содержание') < html_two.index('<h3'))
+          html_two.index('Темы по важности') < html_two.index('<h3'))
     md_one = '💡 **Один топик**\n*Идея.*\n'
     check('toc: один топик — без содержания',
-          'Содержание' not in bot.convert_markdown_to_html(md_one))
+          'Темы по важности' not in bot.convert_markdown_to_html(md_one))
     tg_html = bot.convert_markdown_to_html(md_two, for_telegram=True)
     check('toc: Telegram-ветка — без содержания',
-          'Содержание' not in tg_html and '<ol>' not in tg_html, tg_html[:200])
+          'Темы по важности' not in tg_html and '<ol>' not in tg_html, tg_html[:200])
     dup = bot.build_toc_html(['Повтор', 'Повтор'])
     check('toc: дубли — одинаковый href (прыжок на первое вхождение)',
           dup.count('href="#💡-Повтор"') == 2, dup)
