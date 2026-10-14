@@ -149,6 +149,7 @@ def main():
     test_handoff()
     test_duty()
     test_heartbeat_loop()
+    test_tg_dead_watchdog()
     test_due_cap()
     test_telegraph_toc()
     test_telegraph_link_stars()
@@ -652,6 +653,53 @@ def test_sched_flows():
         check('sch: список опубликован',
               any('LISTING' in t for (_d, t, _r) in client.sent)
               and 53 in client.deleted and len(pushes) == n_push, client.sent)
+
+        # sch_list (словами VPS-справки) → та же выдача, без пуша
+        n_push = len(pushes)
+        client.msgs = [FakeMsg(63, 'sch_list'), FakeMsg(64, '/sch_list')]
+        client.sent.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            ls, failed = loop.run_until_complete(
+                run_once.poll_inbox_once(fake, None, mem))
+        check('sch_list: список опубликован на обе формы',
+              sum('LISTING' in t for (_d, t, _r) in client.sent) == 2
+              and failed == 0 and len(pushes) == n_push, client.sent)
+        check('sch_list: команды удалены',
+              63 in client.deleted and 64 in client.deleted, client.deleted)
+
+        # help → справка опубликована, команда удалена, без пуша и без попыток
+        n_push = len(pushes)
+        client.msgs = [FakeMsg(59, 'help'), FakeMsg(60, '/help')]
+        client.sent.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            ls, failed = loop.run_until_complete(
+                run_once.poll_inbox_once(fake, None, mem))
+        check('help: справка опубликована на обе формы',
+              sum('Справка (дежурный режим)' in t for (_d, t, _r) in client.sent) == 2
+              and failed == 0 and len(pushes) == n_push, client.sent)
+        check('help: команды удалены',
+              59 in client.deleted and 60 in client.deleted, client.deleted)
+        check('help: счётчик попыток не тронут',
+              mem.get('state', {}).get('inbox_attempts', {}) == {}, mem.get('state'))
+
+        # help в топике → ответ в тот же топик
+        client.msgs = [FakeMsg(61, 'help', top=7)]
+        client.sent.clear()
+        mem['topics'] = {7: 'PairChat'}
+        with contextlib.redirect_stdout(io.StringIO()):
+            loop.run_until_complete(run_once.poll_inbox_once(fake, None, mem))
+        check('help: в топике отвечает в тот же топик',
+              any('Справка (дежурный режим)' in t and r == 7
+                  for (_d, t, r) in client.sent)
+              and 61 in client.deleted, client.sent)
+
+        # 'helper' — не команда: не трогаем
+        client.msgs = [FakeMsg(62, 'helper')]
+        client.sent.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            loop.run_until_complete(run_once.poll_inbox_once(fake, None, mem))
+        check('help: helper — не команда, висит без ответа',
+              62 not in client.deleted and client.sent == [], client.sent)
 
         # unsch по ссылке → чат убран, пуш
         client.msgs = [FakeMsg(54, 'unsch t.me/c/1892263845/50')]
@@ -2259,6 +2307,85 @@ def test_heartbeat_loop():
         run_once.leader_claim = saved_claim
         run_once.push_state_best_effort = saved_push
         run_once.work_claim = saved_work
+
+
+def test_tg_dead_watchdog():
+    """Немая вахта: мёртвый Telegram — reconnect каждую итерацию,
+    на пределе TG_MAX_DEAD_STREAK — retiring (standby принимает ~за минуту)."""
+    from types import SimpleNamespace
+
+    class DeadClient:
+        def __init__(self):
+            self.connects = 0
+
+        def is_connected(self):
+            return False
+
+        async def connect(self):
+            self.connects += 1
+
+        async def iter_messages(self, dest, **kw):
+            raise ConnectionError('Cannot send requests while disconnected')
+            yield  # async-генератор: raise на первом next
+
+    class FlakyClient(DeadClient):
+        """Один обрыв, дальше reconnect чинит."""
+        def __init__(self):
+            super().__init__()
+            self.dead = True
+
+        def is_connected(self):
+            return not self.dead
+
+        async def connect(self):
+            self.connects += 1
+            self.dead = False
+
+        async def iter_messages(self, dest, **kw):
+            if self.dead:
+                raise ConnectionError('Cannot send requests while disconnected')
+            return
+            yield
+
+    class FakeMain:
+        RESULTS_DESTINATION = 'test-inbox'
+        SCHEDULE_FILE = '/tmp/opencode/test_watchdog_sched.txt'
+        load_schedule = staticmethod(lambda path: [])
+
+        def __init__(self, client):
+            self.telegram_client = client
+
+    check('watchdog: disconnect опознаётся',
+          run_once._is_tg_disconnect_error(
+              ConnectionError('Cannot send requests while disconnected')) is True)
+    check('watchdog: чужие ошибки — не disconnect',
+          run_once._is_tg_disconnect_error(ValueError('x')) is False
+          and run_once._is_tg_disconnect_error(None) is False)
+
+    loop = asyncio.get_event_loop()
+    args = SimpleNamespace(watch_seconds=18000)
+
+    # Мёртвый клиент: 5 подряд — retiring, reconnect дёргали каждый раз
+    client = DeadClient()
+    me = {'run_id': 't/1'}
+    with _quiet():
+        loop.run_until_complete(run_once._run_leader_loop(
+            FakeMain(client), args, {}, '/tmp/opencode/test_watchdog_state.json',
+            me, 0.01, False, watch_remaining=60))
+    check('watchdog: 5 мёртвых итераций — retiring', me.get('retiring') is True, me)
+    check('watchdog: reconnect каждую мёртвую итерацию',
+          client.connects >= 5, client.connects)
+
+    # Разовый обрыв + успешный reconnect — дежурим дальше, не сдаёмся
+    flaky = FlakyClient()
+    me2 = {'run_id': 't/2'}
+    with _quiet():
+        loop.run_until_complete(run_once._run_leader_loop(
+            FakeMain(flaky), args, {}, '/tmp/opencode/test_watchdog_state.json',
+            me2, 0.01, False, watch_remaining=0.15))
+    check('watchdog: разовый обрыв — без retiring',
+          me2.get('retiring') is None, me2)
+    check('watchdog: reconnect был ровно один', flaky.connects == 1, flaky.connects)
 
 
 def test_due_cap():

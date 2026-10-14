@@ -186,6 +186,12 @@ DUE_FAIL_SKIP_SEC = 600      # пропуск падающего due-ключа:
 MAX_DUE_PER_ITERATION = 1    # due-саммари за итерацию: inbox опрашивается первым
                              # каждую итерацию, догон расписания идёт по одному —
                              # иначе шторм догона (4–6 слотов) хоронит команды
+TG_MAX_DEAD_STREAK = 5       # подряд итераций с мёртвым Telegram-соединением
+                             # ('Cannot send requests while disconnected') —
+                             # сдаём дежурство: reconnect каждую итерацию, на
+                             # пределе — retiring, standby принимает (~1 мин).
+                             # Иначе немая вахта: heartbeat/work едут по HTTP,
+                             # standby считает лидера живым до 5.5ч (2026-10-14).
 try:
     IDLE_LOG_EVERY = int((os.getenv('IDLE_LOG_EVERY', '') or '').strip() or 20)
 except ValueError:
@@ -1530,6 +1536,51 @@ async def _drop_command(main, dest, msg, why):
         return False
 
 
+INBOX_HELP_TEXT = """📖 Справка (дежурный режим)
+
+Разбор чата — сообщением в канал (без слеша):
+• `sum` — за последние 24 часа
+• `sum 3h` / `sum 2d` — за период
+• `sum 45` / `sum 100` — последние N сообщений
+• `sum 600-800` — диапазон от конца
+• `sum 2d-3d` — окно по времени
+• `+` — ответ и в исходный чат (`sum 1d+`); `-` — ответ сообщением в канал вместо Telegraph (`sum 1d-`)
+• `copy ...` — те же периоды, вывоз без AI (JSON + текст)
+
+Где писать:
+• прямо в топике чата: просто `sum 1d`
+• в General: со ссылкой или названием — `sum 1d t.me/...` / `sum 1d Название чата`
+• команда удаляется после выполнения; провал повторяется (до 5 попыток)
+
+Расписание:
+• `HH:MM sum1d [ссылка]` — добавить слот (в топике — без ссылки)
+• `sch` или `sch_list` — показать расписание
+• `unsch [ссылка]` — убрать чат из расписания
+
+Своим сообщением со слешем (срабатывают, пока дежурный на связи):
+• `/sum ...`, `/copy ...` — разбор прямо из исходного чата; шлите из него, а не из канала — иначе сработает дважды
+• `/help`, `/sch_list` — полная справка и расписание
+• `/config`, `/show_excluded`, `/show_priority`, `/show_prompt`, `/show_model` — текущие настройки
+
+В дежурстве — не командами, только через git:
+• `/sch`, `/unsch`, `/set_model`, `/set_provider`, `/add_*`, `/remove_*`, `/reload_config` — правки живут в файлах и пушатся коммитом; своими сообщениями в Actions они либо молча гаснут, либо слетят при смене дежурного
+
+Эта справка: `help`
+Команды в канал — без ведущего `/`: слеш зовёт чужих ботов."""
+
+HELP_RE = re.compile(r'^/?help(@[\w_]+)?$', re.IGNORECASE)
+
+
+async def _inbox_help(main, mem, dest, msg):
+    """'help' → публикация справки. Команда удаляется."""
+    top_id = msg_topic_id(msg)
+    home = top_id if top_id and top_id != 1 else None
+    await _drop_command(main, dest, msg, 'выполнено')
+    await _notify_inbox(main, dest, home, INBOX_HELP_TEXT)
+    print(f"📖 Inbox {msg.id}: help — справка опубликована")
+    return 'ok'
+
+
 async def _sched_list(main, mem, dest, msg):
     """'sch' → публикация полного расписания. Команда удаляется."""
     top_id = msg_topic_id(msg)
@@ -1760,8 +1811,14 @@ async def process_inbox_message(main, mem, dest, msg):
     if not text:
         return 'skip'
 
+    # Справка: 'help' | '/help' (точное совпадение; '@bot' Telegram
+    # дописывает сам в группах с несколькими ботами — тоже принимаем).
+    if HELP_RE.match(text):
+        return await _inbox_help(main, mem, dest, msg)
     # Команды расписания: 'sch' | 'unsch [link]' | 'HH:MM sum1d [link]' | '/sch HH:MM 1d'
-    if text.lower() in ('sch', '/sch'):
+    # 'sch_list' — та же выдача расписания словами VPS-справки (исходящий
+    # /sch_list тоже живёт, пока лидер на связи; inbox — страховка для дыр).
+    if text.lower() in ('sch', '/sch', 'sch_list', '/sch_list'):
         return await _sched_list(main, mem, dest, msg)
     if re.match(r'^/?unsch(\s|$)', text, re.IGNORECASE):
         return await _sched_unsch(main, mem, dest, msg, text)
@@ -2173,6 +2230,35 @@ async def _heartbeat_loop(me, path, main=None):
         pass
 
 
+def _is_tg_disconnect_error(e):
+    """Мёртвое Telegram-соединение: запросы бьют мимо ('Cannot send requests
+    while disconnected' от Telethon). Чистая, тестируется."""
+    if e is None:
+        return False
+    return 'while disconnected' in f"{type(e).__name__}: {e}".lower()
+
+
+async def _tg_try_reconnect(main):
+    """Best-effort переподключение Telegram. True — соединение живо."""
+    client = getattr(main, 'telegram_client', None)
+    if client is None:
+        return False
+    try:
+        is_conn = getattr(client, 'is_connected', None)
+        if callable(is_conn) and is_conn():
+            return True
+        conn = getattr(client, 'connect', None)
+        if callable(conn):
+            await conn()
+        ok = is_conn() if callable(is_conn) else True
+        print("✅ Telegram переподключён" if ok
+              else "⚠️ Telegram reconnect: соединение всё ещё мёртво")
+        return ok
+    except Exception as e:
+        print(f"⚠️ Telegram reconnect не удался: {e}")
+        return False
+
+
 async def _run_leader_loop(main, args, state, path, me, poll, use_handoff,
                          watch_remaining=None):
     """Дежурный цикл лидера: due + inbox до дедлайна. Возвращает exit-код.
@@ -2187,6 +2273,7 @@ async def _run_leader_loop(main, args, state, path, me, poll, use_handoff,
     sched_every = max(1, SCHEDULE_REFRESH_SEC // poll)
     iteration = 0
     idle_streak = 0  # подряд пустых итераций (сброс при любой активности)
+    dc_streak = 0  # подряд итераций с мёртвым Telegram (сторож немой вахты)
     hb_task = None
     if use_handoff:
         hb_task = asyncio.create_task(_heartbeat_loop(me, path, main))
@@ -2231,6 +2318,25 @@ async def _run_leader_loop(main, args, state, path, me, poll, use_handoff,
             except Exception as e:
                 inbox_error = True
                 print(f"⚠️ Ошибка опроса inbox (итерация {iteration}): {e}")
+                if _is_tg_disconnect_error(e):
+                    dc_streak += 1
+                    await _tg_try_reconnect(main)
+                else:
+                    dc_streak = 0
+            else:
+                dc_streak = 0
+            if dc_streak >= TG_MAX_DEAD_STREAK:
+                # Немая вахта: опрос мёртв, а heartbeat/work свежие (HTTP) —
+                # standby не перехватит сам. Сдаёмся: преемник поднимется
+                # со свежим соединением (~1 мин), due не жжёт провалы.
+                me['retiring'] = True
+                me['heartbeat_utc'] = _utc_str(_utc_now())
+                if use_handoff:
+                    leader_claim(me)
+                    push_state_best_effort(path)
+                print(f"👑 Telegram disconnected {dc_streak} итераций подряд — "
+                      f"сдаю дежурство (reconnect не поднял соединение).")
+                break
             due_failed = await run_due_once(main, args, state, path,
                                               max_tasks=MAX_DUE_PER_ITERATION,
                                               quiet_idle=not show_idle,
