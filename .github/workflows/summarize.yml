@@ -132,7 +132,11 @@ jobs:
           git config user.name  "chatsum-bot"
           git config user.email "chatsum-bot@users.noreply.github.com"
           if git fetch --quiet --depth=1 origin +refs/heads/state:refs/remotes/origin/state 2>/dev/null; then
-            git checkout -B state origin/state
+            # -f: во время рана refresh_runtime_files_best_effort перезаписывает
+            # SCHEDULE.txt/MODEL_CONFIG.txt из origin/main → дерево грязное, и
+            # обычный checkout падает ("local changes would be overwritten").
+            # Ветка state несёт только state.json — правки кода не нужны, гасим их.
+            git checkout -f -B state origin/state
           else
             git checkout --orphan state
             git read-tree --empty

@@ -147,6 +147,7 @@ def main():
     test_flat_rotation()
     test_collect_order_and_parents()
     test_handoff()
+    test_startup_election()
     test_duty()
     test_heartbeat_loop()
     test_tg_dead_watchdog()
@@ -2159,6 +2160,172 @@ def test_handoff():
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+def test_startup_election():
+    """Выборы на старте: подключается ровно один. Проигравший уходит
+    в standby без Telegram; проигрыш после connect — с disconnect.
+    Ручной прогон при живом лидере отклоняется без connect."""
+    from datetime import timezone
+    now = datetime(2026, 10, 14, 10, 0, tzinfo=timezone.utc)
+
+    def doc(run, ready, hb_sec_ago, started, retiring=False):
+        hb = (now - timedelta(seconds=hb_sec_ago)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        d = {'run_id': run, 'ready': ready,
+             'heartbeat_utc': hb, 'watch_started_utc': started}
+        if retiring:
+            d['retiring'] = True
+        return d
+
+    mine = doc('111/1', False, 0, '2026-10-14T09:58:00Z')
+    newer_ready = doc('222/1', True, 0, '2026-10-14T09:59:00Z')
+    check('выборы: готовый новее — уступаем',
+          run_once.startup_should_yield(mine, newer_ready, now) is True)
+    newer_starting = doc('222/1', False, 0, '2026-10-14T09:59:00Z')
+    check('выборы: стартующий новее — уступаем',
+          run_once.startup_should_yield(mine, newer_starting, now) is True)
+    check('выборы: порядок готовых стартущего игнорит',
+          run_once.leader_should_yield(mine, newer_starting, now) is False)
+    older_ready = doc('000/1', True, 0, '2026-10-14T09:00:00Z')
+    older_starting = doc('000/1', False, 0, '2026-10-14T09:00:00Z')
+    check('выборы: готовый старше — не уступаем',
+          run_once.startup_should_yield(mine, older_ready, now) is False)
+    check('выборы: стартующий старше — не уступаем',
+          run_once.startup_should_yield(mine, older_starting, now) is False)
+    check('выборы: tie — меньший уступает',
+          run_once.startup_should_yield(
+              doc('aaa', False, 0, '2026-10-14T09:58:00Z'),
+              doc('zzz', False, 0, '2026-10-14T09:58:00Z'), now) is True)
+    check('выборы: свой флаг — не уступаем',
+          run_once.startup_should_yield(mine, dict(mine), now) is False)
+    check('выборы: нет флага — не уступаем',
+          run_once.startup_should_yield(mine, None, now) is False)
+    stale = doc('999/1', False, 1800, '2026-10-14T09:59:00Z')
+    check('выборы: протухший стартущий — не конкурент',
+          run_once.startup_should_yield(mine, stale, now) is False)
+    retiring = doc('555/1', True, 0, '2026-10-14T09:59:00Z', retiring=True)
+    check('выборы: retiring — не конкурент',
+          run_once.startup_should_yield(mine, retiring, now) is False)
+
+    class FakeTg:
+        def __init__(self):
+            self.starts = 0
+            self.disconnects = 0
+
+        async def start(self, phone=None):
+            self.starts += 1
+
+        async def disconnect(self):
+            self.disconnects += 1
+
+    class FakeMain:
+        def __init__(self, tg):
+            self.telegram_client = tg
+            self.PHONE = 'x'
+            self.PROGRESS_HOOK = None
+            self._parse_suffixes = bot._parse_suffixes
+
+    def live_doc(run, ready, started):
+        return {'run_id': run, 'ready': ready,
+                'heartbeat_utc': run_once._utc_str(run_once._utc_now()),
+                'watch_started_utc': started}
+
+    loop = asyncio.get_event_loop()
+    saved = (run_once.STARTUP_BARRIER_SEC, run_once.leader_claim,
+             run_once.leader_read, run_once.prev_duty_heartbeat,
+             run_once.pull_state_best_effort, run_once.load_state,
+             run_once.restore_key_cursor,
+             run_once.refresh_runtime_files_best_effort,
+             run_once.note_work_progress, run_once.liveness_ensure)
+    try:
+        run_once.STARTUP_BARRIER_SEC = 0
+        run_once.leader_claim = lambda doc: True
+        run_once.prev_duty_heartbeat = lambda rid: (None, None)
+        run_once.pull_state_best_effort = lambda path: True
+        run_once.load_state = lambda path: {}
+        run_once.restore_key_cursor = lambda m, s: None
+        run_once.refresh_runtime_files_best_effort = lambda m, fresh=None: True
+        run_once.note_work_progress = lambda: None
+
+        async def fake_liveness(m, dest=None):
+            return None
+        run_once.liveness_ensure = fake_liveness
+
+        # Проигравший: конкурент новее уже на барьере — start не вызван
+        tg1 = FakeTg()
+        run_once.leader_read = lambda: (
+            live_doc('222/1', False, '2026-10-14T09:59:00Z'), 'sha')
+        with _quiet():
+            res = loop.run_until_complete(run_once._leader_startup(
+                FakeMain(tg1), object(), {}, '/tmp/x.json',
+                live_doc('111/1', False, '2026-10-14T09:58:00Z'), 0))
+        check('выборы: проигравший — standby без connect',
+              res == 'standby' and tg1.starts == 0, (res, tg1.starts))
+
+        # Победитель: конкурентов нет — один connect, итог leader
+        tg2 = FakeTg()
+        run_once.leader_read = lambda: (None, None)
+        with _quiet():
+            res = loop.run_until_complete(run_once._leader_startup(
+                FakeMain(tg2), object(), {}, '/tmp/x.json',
+                live_doc('333/1', False, '2026-10-14T09:58:00Z'), 0))
+        check('выборы: победитель — leader с одним connect',
+              res == 'leader' and tg2.starts == 1, (res, tg2.starts))
+
+        # Гонка после connect: флаг у более нового — standby С disconnect
+        tg3 = FakeTg()
+        reads = iter([(None, None),
+                      (live_doc('999/1', True, '2026-10-14T09:59:30Z'), 'sha')])
+        run_once.leader_read = lambda: next(reads)
+        with _quiet():
+            res = loop.run_until_complete(run_once._leader_startup(
+                FakeMain(tg3), object(), {}, '/tmp/x.json',
+                live_doc('111/1', False, '2026-10-14T09:58:00Z'), 0))
+        check('выборы: проигрыш после connect — standby + disconnect',
+              res == 'standby' and tg3.starts == 1 and tg3.disconnects == 1,
+              (res, tg3.starts, tg3.disconnects))
+
+        # Ручной прогон при живом лидере отклоняется без connect
+        tg4 = FakeTg()
+        saved2 = (run_once.state_path, run_once.handoff_enabled,
+                  run_once.leader_read)
+        saved_env = (os.getenv('GITHUB_RUN_ID'),
+                     os.getenv('GITHUB_RUN_ATTEMPT'))
+        try:
+            run_once.state_path = lambda: '/tmp/x.json'
+            run_once.handoff_enabled = lambda: True
+            os.environ['GITHUB_RUN_ID'] = '777'
+            os.environ['GITHUB_RUN_ATTEMPT'] = '1'
+            run_once.leader_read = lambda: (
+                live_doc('888/1', True, '2026-10-14T09:00:00Z'), 'sha')
+
+            class Args:
+                chat_id = '1'
+                period = '1d'
+                post_source = False
+                post_tg = False
+
+            with _quiet():
+                res = loop.run_until_complete(
+                    run_once.run_manual(FakeMain(tg4), Args()))
+            check('ручной: при живом лидере — отказ без connect',
+                  res == 1 and tg4.starts == 0, (res, tg4.starts))
+        finally:
+            (run_once.state_path, run_once.handoff_enabled,
+             run_once.leader_read) = saved2
+            for k, v in (('GITHUB_RUN_ID', saved_env[0]),
+                         ('GITHUB_RUN_ATTEMPT', saved_env[1])):
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    finally:
+        (run_once.STARTUP_BARRIER_SEC, run_once.leader_claim,
+         run_once.leader_read, run_once.prev_duty_heartbeat,
+         run_once.pull_state_best_effort, run_once.load_state,
+         run_once.restore_key_cursor,
+         run_once.refresh_runtime_files_best_effort,
+         run_once.note_work_progress, run_once.liveness_ensure) = saved
 
 
 def test_duty():

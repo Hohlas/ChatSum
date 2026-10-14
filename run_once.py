@@ -180,6 +180,12 @@ LEADER_STALE_SEC = 300       # лидер без heartbeat дольше этог
 LEADER_HEARTBEAT_SEC = 120   # период heartbeat + push state
 SCHEDULE_REFRESH_SEC = 600   # период обновления SCHEDULE.txt из origin/main
 PROMOTE_CONFIRM_READS = 2    # подряд протухших чтений перед promotion
+STARTUP_BARRIER_SEC = 15     # пауза claim→connect: конкурентная заявка должна
+                             # успеть отразиться во флаге до подключения Telegram.
+                             # Два одновременных подключения с одной сессией
+                             # сжигают ключ (Telegram: "used under two different
+                             # IP addresses simultaneously"), платим один раз
+                             # за старт/промоушен, не за итерацию.
 INBOX_MAX_ATTEMPTS = 5       # попыток inbox-команды, дальше — удалить
 DUE_FAIL_THRESHOLD = 3       # подряд провалов due-ключа до пропуска
 DUE_FAIL_SKIP_SEC = 600      # пропуск падающего due-ключа: 10 минут
@@ -283,6 +289,31 @@ def leader_should_yield(mine, remote, now=None):
     if not leader_is_live(remote, now):
         return False
     if not remote.get('ready'):
+        return False
+    rs = str(remote.get('watch_started_utc') or '')
+    ms = str((mine or {}).get('watch_started_utc') or '')
+    if rs != ms:
+        return rs >= ms
+    return str(remote.get('run_id') or '') > str((mine or {}).get('run_id') or '')
+
+
+def startup_should_yield(mine, remote, now=None):
+    """Уступить ли подъём конкуренту ДО подключения Telegram.
+
+    Чистая логика, тестируется. От leader_should_yield отличается одним:
+    готовность НЕ требуется — стартующая заявка (ready=false, но свежий
+    heartbeat) тоже конкурент. Порядок тот же («новее побеждает»:
+    watch_started_utc, при равенстве — больший run_id), поэтому все
+    одновременно стартующие выбирают одного победителя и подключается
+    ровно один. Протухший/retiring/чужой-флаг-отсутствует — не конкурент.
+    """
+    if not isinstance(remote, dict):
+        return False
+    if remote.get('run_id') == (mine or {}).get('run_id'):
+        return False
+    if remote.get('retiring'):
+        return False
+    if not leader_is_live(remote, now):
         return False
     rs = str(remote.get('watch_started_utc') or '')
     ms = str((mine or {}).get('watch_started_utc') or '')
@@ -2152,9 +2183,12 @@ async def _watch_cleanup(main, state, path, use_handoff=False):
 async def _leader_startup(main, args, state, path, me, poll):
     """Заявить лидерство и подняться. Возвращает 'leader' | 'standby'.
 
-    Claim неготовым → connect → ready + pull предшественника + пауза →
-    проверка: флаг уже у более нового (стартовали толпой) — идём в standby,
-    а не выходим: толпа сама рассосётся, дежурство не прервётся.
+    Claim неготовым → барьер → перечитать флаг: конкурент-новичок новее
+    меня — ухожу в standby БЕЗ подключения (две одновременные сессии
+    с одним ключом сжигают его на стороне Telegram). Победитель:
+    connect → ready + pull предшественника + пауза → проверка: флаг уже
+    у более нового (стартовали толпой) — disconnect и в standby, держать
+    второе подключение до конца standby-вахты запрещено.
     Самодиагностика пропусков: чужой heartbeat читаем ДО claim'а (свой claim
     его перезапишет); если тишина дольше GAP_WARN_SEC — варнинг в General
     по факту восстановления (слать раньше некому).
@@ -2162,11 +2196,25 @@ async def _leader_startup(main, args, state, path, me, poll):
     prev_hb, prev_run = prev_duty_heartbeat(me['run_id'])
     print(f"👑 Заявляю лидерство (run {me['run_id']})...")
     leader_claim(me)
+    await asyncio.sleep(STARTUP_BARRIER_SEC)
+    remote, _ = leader_read()
+    if startup_should_yield(me, remote):
+        print(f"👑 Конкурент {remote.get('run_id')} новее — ухожу в standby "
+              f"без подключения Telegram.")
+        return 'standby'
     try:
         await main.telegram_client.start(phone=main.PHONE)
     except Exception as e:
         print(f"❌ Не удалось подключиться к Telegram: {e}")
-        print("   Проверьте TELEGRAM_SESSION / TELEGRAM_API_ID / TELEGRAM_API_HASH.")
+        if 'two different ip' in str(e).lower():
+            print("   ⚠️ Telegram сжёг ключ сессии: она использовалась с двух "
+                  "адресов одновременно. Проверьте второй потребитель "
+                  "(VPS-бот рядом с Actions, ручной прогон во время дежурства, "
+                  "два лидера), затем создайте новую сессию: "
+                  "tools/gen_session.py → scripts/push_github_secrets.sh. "
+                  "Старая строка больше не оживёт.")
+        else:
+            print("   Проверьте TELEGRAM_SESSION / TELEGRAM_API_ID / TELEGRAM_API_HASH.")
         return 'fail'
     me['ready'] = True
     me['heartbeat_utc'] = _utc_str(_utc_now())
@@ -2189,7 +2237,16 @@ async def _leader_startup(main, args, state, path, me, poll):
     await asyncio.sleep(poll)
     remote, _ = leader_read()
     if leader_should_yield(me, remote):
-        print(f"👑 Пока я стартовал, флаг у {remote.get('run_id')} — ухожу в standby.")
+        print(f"👑 Пока я стартовал, флаг у {remote.get('run_id')} — "
+              f"отключаю Telegram и ухожу в standby.")
+        try:
+            main.PROGRESS_HOOK = None
+        except AttributeError:
+            pass
+        try:
+            await main.telegram_client.disconnect()
+        except Exception as e:
+            print(f"⚠️ Ошибка при disconnect: {e}")
         return 'standby'
     gap_sec, warn = duty_gap_info(prev_hb)
     if gap_sec is not None:
@@ -2523,6 +2580,17 @@ async def run_manual(main, args):
     path = state_path()
     state = load_state(path)
     restore_key_cursor(main, state)
+    if handoff_enabled():
+        # Ручной прогон во время живой вахты — второе подключение с той же
+        # сессией: Telegram сжигает ключ ("two different IP addresses").
+        remote, _ = leader_read()
+        if (isinstance(remote, dict) and remote.get('run_id') != my_run_id()
+                and not remote.get('retiring') and leader_is_live(remote)):
+            print(f"❌ Ручной прогон отклонён: дежурство держит живой лидер "
+                  f"{remote.get('run_id')} — второе подключение с той же сессией "
+                  f"сжигает ключ Telegram. Дождитесь конца вахты или остановите "
+                  f"workflow.")
+            return 1
     try:
         await main.telegram_client.start(phone=main.PHONE)
     except Exception as e:
