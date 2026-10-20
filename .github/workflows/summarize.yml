@@ -1,14 +1,21 @@
-name: ChatSum scheduled summaries
+name: ChatSum summaries (manual duty)
 
 on:
-  schedule:
-    # Дежурство лидер+standby (флаги в ветке state): watch до 5 ч мостит
-    # зазоры cron. Тики явным списком 7,19,33,46,58: мимо пика начала часа
-    # (:00-:05, доки: задержки и дропы) и мимо круглых минут (:15/:30/:45 —
-    # стадный выбор, гипотеза, не замер); зазоры 12-14 мин + шов 9 мин
-    # на границе часа. Частота ~5/ч: тики могут прореживаться (замер
-    # tick_probe на */11: раз в 2.5-9.7ч) — зазоры ловит промоушен + варнинги дыр.
-    - cron: '7,19,33,46,58 * * * *'   # UTC
+  # РАСПИСАНИЕ ОТКЛЮЧЕНО 2026-10-20 по решению владельца.
+  # Причина: круглосуточное дежурство на GitHub-hosted раннере расходится с
+  # GitHub Terms for Additional Products and Features, раздел Actions
+  # (редакция 27.08.2026): «You may only access and use GitHub Actions to
+  # develop and test your application(s)», «don't use Actions ... as part of a
+  # serverless application», «burden ... disproportionate to the benefits».
+  # Запуск теперь только вручную (workflow_dispatch). Дежурство как таковое
+  # (лидер/standby, handoff через ветку state) осталось рабочим — смена
+  # триггера его не меняет.
+  # Вернуть: раскомментировать блок schedule. Минуты 7,19,33,46,58 выбраны
+  # мимо пика :00-:05 (доки: задержки и дропы при высокой нагрузке) и мимо
+  # круглых минут (гипотеза о стадном выборе, не замер); зазоры 12-14 мин +
+  # шов 9 мин на границе часа.
+  # schedule:
+  #   - cron: '7,19,33,46,58 * * * *'   # UTC
   workflow_dispatch:          # ручной запуск из UI
     inputs:
       chat_id:
