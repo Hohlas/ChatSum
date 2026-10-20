@@ -29,9 +29,13 @@ on:
         required: false
         default: '30'
       watch_seconds:
-        description: 'Длительность цикла --watch, сек (по умолч. 19800 = 5.5 ч)'
+        description: 'Длительность цикла --watch, сек (по умолч. 7200 = 2 ч)'
         required: false
-        default: '19800'
+        default: '7200'
+      drain_all:
+        description: 'Догнать все накопившиеся слоты расписания в первом проходе'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -44,9 +48,11 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 355   # почти платформенный максимум 360: вотч 330 + хвост 15
-                           # + установка укладываются с запасом ~9мин; топор один,
-                           # держим его ближе к максимуму осознанно и явно
+    timeout-minutes: 150   # вотч 120 + хвост 15 + установка 1 = 136 ≤ 150
+                           # (запас 14 мин). Раньше было 355 под вотч 330 —
+                           # с ручным дежурством 2 ч кил стал вдвое ниже:
+                           # зависший ран держит машину 2.5 ч, а не 5.9 ч.
+                           # Вернёшь длинный вотч — подними и таймаут.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -99,6 +105,12 @@ jobs:
           PERIOD:  ${{ github.event.inputs.period }}
           POLL_INTERVAL:  ${{ github.event.inputs.poll_interval }}
           WATCH_SECONDS:  ${{ github.event.inputs.watch_seconds }}
+          DRAIN_ALL:      ${{ github.event.inputs.drain_all }}
+          # Сторож пропусков (GAP_WARN_SEC) под ручным режимом молчит: пауза
+          # между прогонами — норма, а не авария. Порог в неделю: за это время
+          # тишины стоит напомнить, что бот не работал. Вернёшь крон —
+          # поставь 240 (или убери строку, это дефолт кода).
+          GAP_WARN_SEC: '604800'
           # run_once.py читает/пишет state по этому пути (вне рабочего дерева)
           STATE_PATH: ${{ runner.temp }}/state.json
           # Без буфера stdout: иначе print копится по 8КБ и веб-лог
@@ -117,12 +129,18 @@ jobs:
             # от schedule-событий иначе проскочила бы в argparse как ''.
             POLL_INTERVAL="${POLL_INTERVAL:-30}"
             case "$POLL_INTERVAL" in ''|*[!0-9]*) POLL_INTERVAL=30 ;; esac
-            # Формула: вотч 330 + хвост 15 + установка 1 = 346 ≤ 355, запас 9 мин.
+            # Формула: вотч 120 + хвост 15 + установка 1 = 136 ≤ 150, запас 14 мин.
             # Хвост ≤15 — допущение (типовые задачи 5–12 мин на 300K-чанках);
             # патология (~24 мин) упрётся в килл, но громко: варнинг + Persist-сейв.
-            WATCH_SECONDS="${WATCH_SECONDS:-19800}"
-            case "$WATCH_SECONDS" in ''|*[!0-9]*) WATCH_SECONDS=19800 ;; esac
-            python run_once.py --watch --poll-interval "$POLL_INTERVAL" --watch-seconds "$WATCH_SECONDS"
+            WATCH_SECONDS="${WATCH_SECONDS:-7200}"
+            case "$WATCH_SECONDS" in ''|*[!0-9]*) WATCH_SECONDS=7200 ;; esac
+            # Догон на старте: --drain-all берёт в первой итерации все
+            # накопившиеся слоты (в ручном режиме их копятся сутки, а кап
+            # берёт по одному за итерацию). Значение флага — строка из UI.
+            DRAIN_FLAG=""
+            case "$DRAIN_ALL" in true|True|TRUE|1) DRAIN_FLAG="--drain-all" ;; esac
+            python run_once.py --watch --poll-interval "$POLL_INTERVAL" \
+              --watch-seconds "$WATCH_SECONDS" $DRAIN_FLAG
           fi
 
       # state.json должен попасть в ветку state даже при частичном провале

@@ -152,6 +152,7 @@ def main():
     test_heartbeat_loop()
     test_tg_dead_watchdog()
     test_due_cap()
+    test_due_drain_on_start()
     test_telegraph_toc()
     test_telegraph_link_stars()
     test_dedupe_topics()
@@ -271,7 +272,7 @@ def test_extract_link():
 
 def test_watch_args():
     a = run_once.parse_args(['--watch'])
-    check('watch defaults', a.watch and a.watch_seconds == 18000 and a.poll_interval == 30, a)
+    check('watch defaults', a.watch and a.watch_seconds == 7200 and a.poll_interval == 30, a)
     a = run_once.parse_args(['--watch', '--watch-seconds', '120', '--poll-interval', '10'])
     check('watch custom', a.watch_seconds == 120 and a.poll_interval == 10, a)
 
@@ -2618,6 +2619,19 @@ def test_due_cap():
         check('due-кап: без капа всё сразу', calls == [-101, -102, -103] and r == 0, calls)
     finally:
         run_once.handoff_enabled = saved_handoff
+
+
+def test_due_drain_on_start():
+    """Ручной старт: --drain-all снимает кап ТОЛЬКО в первой итерации."""
+    check('дренаж: по умолчанию кап 1',
+          run_once.due_max_tasks(1) == run_once.MAX_DUE_PER_ITERATION,
+          run_once.due_max_tasks(1))
+    check('дренаж: первая итерация с флагом — без капа',
+          run_once.due_max_tasks(1, True) is None)
+    check('дренаж: вторая итерация снова под капом',
+          run_once.due_max_tasks(2, True) == run_once.MAX_DUE_PER_ITERATION)
+    check('дренаж: флаг живёт рядом с --watch',
+          run_once.parse_args(['--watch', '--drain-all']).drain_all is True)
 
 
 def test_telegraph_toc():

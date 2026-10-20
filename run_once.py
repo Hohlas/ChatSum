@@ -50,8 +50,11 @@ def parse_args(argv):
                    help='Цикл ~watch-seconds: due-задачи + опрос inbox (форвард + sum/copy)')
     g.add_argument('--list', action='store_true', help='Напечатать расписание и выйти')
     g.add_argument('--chat-id', type=int, help='Chat ID для ручного прогона')
-    p.add_argument('--watch-seconds', type=int, default=18000,
-                   help='Длительность цикла --watch, секунд (по умолчанию 18000 = 5 ч)')
+    p.add_argument('--watch-seconds', type=int, default=7200,
+                   help='Длительность цикла --watch, секунд (по умолчанию 7200 = 2 ч)')
+    p.add_argument('--drain-all', action='store_true',
+                   help='Только с --watch: в первой итерации выполнить все '
+                        'накопившиеся слоты расписания, дальше обычный кап')
     p.add_argument('--poll-interval', type=int, default=30,
                    help='Пауза между итерациями --watch, секунд (по умолчанию 30)')
     p.add_argument('--period', default='1d', help='Период анализа (1d, 12h)')
@@ -1004,6 +1007,22 @@ def git_push_schedule(message):
 # ──────────────────────────────────────────────
 # Должные задания: персональный водяной знак (чистая логика, тестируется)
 # ──────────────────────────────────────────────
+
+def due_max_tasks(iteration, drain_all=False):
+    """Сколько due-задач брать за итерацию дежурного цикла.
+
+    По умолчанию MAX_DUE_PER_ITERATION=1: догон расписания не должен хоронить
+    inbox (инцидент 4). Ручной старт с --drain-all берёт в ПЕРВОЙ итерации всё
+    накопившееся — это осознанный догон по требованию владельца (ручной режим
+    дежурства: между прогонами слоты копятся сутками). Шторма тут нет по
+    построению: compute_due отдаёт на ключ ровно одно наступление (последнее),
+    то есть потолок — число строк SCHEDULE.txt. Со второй итерации кап
+    возвращается: дальше идёт обычное дежурство, а не догон.
+    """
+    if drain_all and iteration == 1:
+        return None
+    return MAX_DUE_PER_ITERATION
+
 
 def compute_due(entries, now_msk_naive, completed=None):
     """Возвращает [(entry, occurrence_naive_msk, date_key)] для необработанных.
@@ -2332,6 +2351,10 @@ async def _run_leader_loop(main, args, state, path, me, poll, use_handoff,
     idle_streak = 0  # подряд пустых итераций (сброс при любой активности)
     dc_streak = 0  # подряд итераций с мёртвым Telegram (сторож немой вахты)
     hb_task = None
+    # Догон «всё сразу» — только на входе в дежурство (свежий лидер), не при
+    # промоушене из standby: у промоушена watch_remaining не None, и там уже
+    # идёт обычная работа, а не ручной старт.
+    drain_all = bool(getattr(args, 'drain_all', False)) and watch_remaining is None
     if use_handoff:
         hb_task = asyncio.create_task(_heartbeat_loop(me, path, main))
     try:
@@ -2395,7 +2418,8 @@ async def _run_leader_loop(main, args, state, path, me, poll, use_handoff,
                       f"сдаю дежурство (reconnect не поднял соединение).")
                 break
             due_failed = await run_due_once(main, args, state, path,
-                                              max_tasks=MAX_DUE_PER_ITERATION,
+                                              max_tasks=due_max_tasks(
+                                                  iteration, drain_all),
                                               quiet_idle=not show_idle,
                                               hold_partial=True)
             failed_total += due_failed

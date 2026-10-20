@@ -63,22 +63,26 @@ every edit.
   **MSK = UTC+3** (`MSK` in `run_once.py`).
 - `SCHEDULE.txt` (on `main`) — slots `chat_id|HH:MM|limit`, one per line.
   Leading `+` is stripped. Limit `10` = cheap probe, `1d` = full summary.
-- `.github/workflows/summarize.yml` — cron `7,19,33,46,58 * * * *` UTC:
-  explicit minute list, no drift (cron is wall-clock-anchored; the old "31 is
-  coprime with 60, ticks drift" note was wrong — `*/31` sat fixed at :00+:31,
-  hitting the load peak every hour). Minutes avoid the :00–:05 peak (docs:
-  delays/drops) and round minutes (:15/:30/:45 herd choice — hypothesis,
-  unmeasured); gaps 12–14 min + 9-min seam at the hour edge. ~5 ticks/h risks
-  GitHub thinning (tick_probe on */11: one run per 2.5–9.7h, session 17) —
-  gaps are bridged by the 5.5h watch + promotion, monitored by gap warnings.
-  `timeout-minutes: 355`
-  (platform max 360; the kill is identical to GitHub's — ours only lands
-  earlier and predictably), **no `concurrency`** (overlap is the design,
-  not an accident). Budget: watch 330 + tail 15 + setup 1 = 346 ≤ 355.
-  Inputs `watch_seconds` (workflow default 19800 = 5.5h; code default 18000),
-  `poll_interval` (default 30). Stdout is unbuffered (`PYTHONUNBUFFERED=1`)
-  so web logs stream in real time instead of arriving in 8KB chunks minutes
-  late (session 27: log lagged reality by ~5 min on silent pauses).
+- `.github/workflows/summarize.yml` — **только ручной запуск** (`workflow_dispatch`).
+  Расписание отключено 2026-10-20 решением владельца: круглосуточное дежурство
+  на GitHub-hosted раннере расходится с GitHub Terms for Additional Products and
+  Features, §Actions (редакция 27.08.2026): «You may only access and use GitHub
+  Actions to develop and test your application(s)», «don't use Actions … as part
+  of a serverless application», «burden … disproportionate to the benefits».
+  Крон-блок законсервирован комментарием в самом файле: включение обратно =
+  раскомментировать `schedule` (минуты `7,19,33,46,58` выбраны мимо пика
+  :00–:05 из-за задержек/дропов по докам; зазоры 12–14 мин + шов 9 мин) и
+  вернуть длину вахты, таймаут и `GAP_WARN_SEC`.
+  `timeout-minutes: 150` (вотч 120 + хвост 15 + установка 1 = 136 ≤ 150;
+  запас 14 мин). **no `concurrency`** (перекрытие — часть протокола: второй
+  ран уходит в standby, а не ждёт в очереди).
+  Входы: `chat_id`/`period` (разовый прогон конкретного чата), `watch_seconds`
+  (default 7200 = 2 ч, он же дефолт кода), `poll_interval` (30), `drain_all`
+  (default true → первая итерация выполняет ВСЕ накопившиеся слоты, дальше
+  обычный кап; в ручном режиме слоты копятся между прогонами).
+  `GAP_WARN_SEC=604800` в env — сторож пропусков молчит: в ручном режиме пауза
+  между прогонами норма, а не авария. Stdout unbuffered (`PYTHONUNBUFFERED=1`),
+  чтобы веб-логи шли в реальном времени (сессия 27: лог отставал на ~5 мин).
 - `state` branch (GitHub Contents API, `STATE_DEFAULT` in `run_once.py`):
   `state.json` {`completed`, `last_run_utc`, `google_key_cursor`,
   `inbox_attempts`, `due_fails`}, `leader.json`, `standby.json`,
@@ -115,11 +119,17 @@ copy). Config is local `private.txt` (+ `PROMPT.txt`, `EXCLUDED_USERS.txt`,
   here. In Actions mode these commands do not exist; model comes from
   `GEMINI_*` repo Variables, schedule only via git commits to `SCHEDULE.txt`.
 
-## GitHub Actions mode (duty on cron, current production mode)
+## GitHub Actions mode (manual duty, current production mode)
 
-No long-lived process: short-lived workflow runs form a relay — each cron tick
-(`7,19,33,46,58 * * * *` UTC) starts a run, the run works as leader or standby
-for up to 5.5h, then the next tick takes over.
+No long-lived process: a manual workflow run (`Run workflow` in the UI) works
+as leader for `watch_seconds` (default 2h) and exits; nothing restarts it.
+Between runs the bot is silent — that is the intended state (решение владельца
+2026-10-20, причины в §Components). Если одновременно поднять второй ран, он
+уйдёт в standby (Telegram не трогает) и будет держать машину до своего дедлайна.
+
+Протокол лидер/standby, handoff через ветку `state`, промоушен и наследование
+дедлайна остались как были — они работают и внутри одного ручного рана
+(standby подхватывает, если лидер умер), и при случайном перекрытии ранов.
 
 ## Leader iteration (the hot loop, `_run_leader_loop` in `run_once.py`)
 
@@ -146,7 +156,7 @@ during a gap are not skipped. Processing via `_process_batch` /
     Telegram awaits — a long summary must NOT look like a dead leader).
     State + work-marker push ride the same 120s rhythm,
     `SCHEDULE.txt` refresh from `origin/main` every
-    `SCHEDULE_REFRESH_SEC` (a 5.5h run would otherwise go stale).
+    `SCHEDULE_REFRESH_SEC` (a 2h run would otherwise go stale).
 
 Cleanup (`_watch_cleanup`) ALWAYS pull-merges first,
 then saves/pushes. The workflow's trailing `Persist state` step does the
@@ -217,8 +227,8 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
 `msg_id` только in-memory (`_liveness_msg_id`; в `me` не кладём, иначе
 утечёт во флаг `leader.json`). Ожидаемый конец вахты считает лидерский цикл
 из своего дедлайна (стена = now + остаток; in-memory `_liveness_next_utc`) —
-это ориентир передачи, не гарантия: при дропах тиков фактический преемник
-встанет позже. Standby ничего не пишет (нет Telegram),
+это ориентир передачи, не гарантия: в ручном режиме автоматического преемника
+нет, и маяк честно протухает до следующего запуска. Standby ничего не пишет (нет Telegram),
 на время дыры маяк честно протухает. Пин ставит владелец вручную.
 Для inbox безвреден (`parse` → None → `skip`).
 
@@ -226,26 +236,29 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
 
 | Symbol | Value | Meaning |
 |---|---|---|
-| cron / timeout | `7,19,33,46,58`, 355 min | off-peak un-round ticks (gaps 12–14 min + 9-min seam); 330 watch + 15 tail + 1 setup (platform max 360) |
-| watch / poll defaults | workflow 19800s / code 18000s / poll 30s | duty length (workflow input wins) / inbox latency while leader lives |
+| watch / timeout | 7200 s / 150 min | длина вахты ручного прогона (120 + 15 хвост + 1 установка = 136 ≤ 150) |
+| poll default | 30 s | inbox latency while the leader lives |
+| `drain_all` (workflow input) | true | первая итерация берёт ВСЕ накопившиеся слоты (`due_max_tasks` → None), дальше кап |
 | `LEADER_HEARTBEAT_SEC` / `LEADER_STALE_SEC` | 120 / 300 | liveness bound ≈ 2 missed beats |
 | `WORK_STALE_SEC` (`work.json`) | 900 | wedge bound: fresh heartbeat + no progress 15 min → takeover |
-| `SCHEDULE_REFRESH_SEC` | 600 | schedule staleness inside a 5.5h run |
+| `SCHEDULE_REFRESH_SEC` | 600 | schedule staleness inside a 2h run |
 | `PROMOTE_CONFIRM_READS` | 2 | anti-flap on promotion |
 | `INBOX_MAX_ATTEMPTS` | 5 | command retries before deletion |
 | `DUE_FAIL_THRESHOLD` / `DUE_FAIL_SKIP_SEC` | 3 / 600 | скип падающего слота 10 мин, возобновляемый: окно меряется от `last_utc`, по истечении — новый эпизод 3 попытки + 10 мин тишины (`due_fail_record`, сессии 22/25; 10 мин — решение владельца 2026-10-11) |
-| `MAX_DUE_PER_ITERATION` | 1 | inbox-first latency bound |
+| `MAX_DUE_PER_ITERATION` | 1 | inbox-first latency bound (снят на первой итерации при `drain_all`) |
 | `LIVENESS_EVERY` / `LIVENESS_SCAN_LIMIT` | 5 / 50 | маяк в General: правка каждый 5-й тик (120с × 5 = 10 мин) / глубина подхвата |
 
 ## Incidents that shaped the design (don't re-learn)
 
 1. LAG-window catch-up dropped slots when cron gaps exceeded the window →
    per-key `completed` dedup replaced windows entirely (`LAG_MAX`,
-   `_last_run_msk_naive` deleted).
+   `_last_run_msk_naive` deleted). Тот же механизм держит ручной режим: опоздание
+   любой длины догоняется, отметка — на дату последнего наступления.
 2. `timeout-minutes: 12` killed a run mid-analysis; command survived,
-    un-deleted → looked like a "repeat". Timeout is 355 now (watch 330 +
-    tail 15 + setup 1 = 346 ≤ 355); undone work
-    retries via `inbox_attempts`, not via restarts.
+    un-deleted → looked like a "repeat". Бюджет считается по формуле
+    «вотч + хвост 15 + установка 1 ≤ таймаут» (`test_timeout_budget` парсит yml);
+    сейчас 120 + 15 + 1 = 136 ≤ 150, до 2026-10-20 было 330 + 15 + 1 ≤ 355.
+    Undone work retries via `inbox_attempts`, not via restarts.
 3. Heartbeat sent once per N iterations froze during long summaries →
    leader looked dead mid-task. Heartbeat is a separate asyncio task now.
 4. Due-drain storm (all unmarked slots in a row, tens of minutes) starved a
@@ -278,10 +291,11 @@ heartbeat (120с). Standby свергает живого по heartbeat лиде
   live in GitHub Secrets + locally only. Never commit, never print.
 - `docs/CONTEXT_HANDOFF.md` = the *now* (live run ids, today's observations);
   stable knowledge lives HERE, not there. One source of truth each.
-- Tests: `./venv/bin/python tests/test_run_once.py` must stay green (390 PASS
-  as of 2026-10-10, plus 1 KNOWN fail: `nemotron: чанк 100K` — fails on the
-  clean tree too, do not chase it; incl. `test_duty`, `test_heartbeat_loop`,
-  `test_due_cap`, `test_inbox_retry_flow`, `test_duty_gap`, `test_work_wedge`,
+- Tests: `./venv/bin/python tests/test_run_once.py` must stay green (**467 PASS,
+  0 FAIL, as of 2026-10-20**; прежняя запись «390 PASS + 1 KNOWN fail
+  `nemotron: чанк 100K`» устарела — тот тест проходит). Включает `test_duty`,
+  `test_heartbeat_loop`, `test_due_cap`, `test_due_drain_on_start`,
+  `test_inbox_retry_flow`, `test_duty_gap`, `test_work_wedge`,
   `test_leader_watch_inherit`, `test_timeout_budget`, `test_liveness`,
   `test_due_fail_renew`, `test_quota_diag`, `test_flat_rotation`,
   `test_503_holds_key`, `test_server_overload_diag`,
