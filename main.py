@@ -1696,12 +1696,20 @@ google_analysis_counter = 0
 # Создаём асинхронный HTTP-клиент с настройками таймаута и лимитов соединений
 # 600с: модели с обдумыванием отвечают минутами (непоточный запрос ждёт
 # полный ответ); 180с рвало такие запросы на полуслове (сессия 27).
+# local_address="0.0.0.0" (сессия 29) — принудительный выход по IPv4: у сервера
+# есть и IPv6-адрес, httpx предпочитает его, а Gemini API отвечает на этот
+# IPv6 «400 FAILED_PRECONDITION: User location is not supported»; те же
+# запросы по IPv4 проходят. Лимиты передаются транспорту: при явном
+# transport аргумент limits у AsyncClient не применяется.
 http_client = httpx.AsyncClient(
     timeout=600.0,
-    limits=httpx.Limits(
-        max_keepalive_connections=5,
-        max_connections=10
-    )
+    transport=httpx.AsyncHTTPTransport(
+        local_address="0.0.0.0",
+        limits=httpx.Limits(
+            max_keepalive_connections=5,
+            max_connections=10
+        ),
+    ),
 )
 
 def create_google_client(api_key):
