@@ -155,6 +155,7 @@ def main():
     test_due_drain_on_start()
     test_telegraph_toc()
     test_telegraph_link_stars()
+    test_telegraph_part_nav()
     test_dedupe_topics()
     test_rank_topics_by_importance()
     test_chunk_rebalance()
@@ -165,6 +166,12 @@ def main():
     test_notify_progress()
     test_big_volume_warning_first_attempt_only()
     test_run_analysis_reuses_passed_topic()
+    test_reply_topic_id()
+    test_topic_command_re()
+    test_topic_command_context()
+    test_topic_command_routing()
+    test_topic_schedule_helpers()
+    test_topic_dispatch()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")
@@ -2803,6 +2810,35 @@ def test_telegraph_link_stars():
     check('этапы: 22 этапа', bot.plural_stages(22) == 'этапа', bot.plural_stages(22))
 
 
+def test_telegraph_part_nav():
+    # Навигация по частям: «назад» сверху, «вперёд» снизу перед подписью.
+    footer = '\n---\ncreated by [ChatSumBot](https://github.com/Hohlas/ChatSum) \n'
+    body = '💡 **Тема**\n*Идея.*\n'
+    b = bot.build_part_page_content
+
+    check('nav: единственная часть — без ссылок', b(body, footer) == body + footer,
+          repr(b(body, footer)))
+    only_prev = b(body, footer, prev_part=(2, 'https://telegra.ph/P2'))
+    check('nav: назад сверху', only_prev.startswith('[← Часть 2](https://telegra.ph/P2)\n\n'), only_prev)
+    check('nav: без следующей — внизу пусто', '→' not in only_prev, only_prev)
+    both = b(body, footer, prev_part=(2, 'https://telegra.ph/P2'),
+             next_part=(4, 'https://telegra.ph/P4'))
+    check('nav: вперёд внизу', '\n[Часть 4 →](https://telegra.ph/P4)\n' in both, both)
+    check('nav: порядок назад-тело-вперёд-подпись',
+          both.index('Часть 2') < both.index('💡') < both.index('Часть 4') < both.index('created by'),
+          both)
+
+    check('path: из адреса страницы', bot.telegraph_path('https://telegra.ph/CHast-1-10-27')
+          == 'CHast-1-10-27')
+    check('path: пустой адрес', bot.telegraph_path(None) == '')
+
+    html = bot.convert_markdown_to_html(both)
+    check('nav: обе ссылки выжили санитарку',
+          html.count('href="https://telegra.ph/') == 2, html)
+    check('nav: ссылки до и после тела',
+          html.index('← Часть 2') < html.index('<h3') < html.index('Часть 4 →'), html)
+
+
 def test_dedupe_topics():
     def blk(name, *ids):
         cites = '\n'.join(f'[{name}](https://t.me/c/1/{i}): суть' for i in ids)
@@ -3645,6 +3681,270 @@ def test_run_analysis_reuses_passed_topic():
          bot.get_model_generation_config, bot.split_messages_by_chars,
          bot.create_summary, bot.telegram_client,
          bot.GOOGLE_API_KEYS) = saved
+
+
+def test_reply_topic_id():
+    """reply_topic_id: id темы из заголовка ответа (General → None)."""
+    from types import SimpleNamespace as NS
+
+    msg = NS(reply_to=None)
+    check('topic-reply: нет reply_to → None', bot.reply_topic_id(msg) is None)
+    msg.reply_to = NS(forum_topic=True, reply_to_msg_id=7, reply_to_top_id=None)
+    check('topic-reply: корень темы → reply_to_msg_id',
+          bot.reply_topic_id(msg) == 7, bot.reply_topic_id(msg))
+    msg.reply_to = NS(forum_topic=True, reply_to_msg_id=9, reply_to_top_id=7)
+    check('topic-reply: ответ внутри темы → reply_to_top_id',
+          bot.reply_topic_id(msg) == 7, bot.reply_topic_id(msg))
+    msg.reply_to = NS(forum_topic=False, reply_to_msg_id=7, reply_to_top_id=None)
+    check('topic-reply: обычный ответ → None', bot.reply_topic_id(msg) is None)
+
+
+def test_topic_command_re():
+    """Без слеша в теме: sum/copy/sch/unsch/HH:MM — команда; прочее — текст."""
+    yes = ['sum', 'sum1d-', 'sum 1d+', 'copy 3h', 'Sum2d', 'sch', 'sch_list',
+           'unsch', '22:33 sum1d', '9:05 1d+', 'unsch t.me/chat']
+    no = ['/sum1d', 'summer', 'summary', 'help', '12:30 встреча',
+          'доклад 12:30', 'isch']
+    for text in yes:
+        check(f'topic-cmd: {text!r} — команда',
+              bool(bot.TOPIC_COMMAND_RE.match(text)), text)
+    for text in no:
+        check(f'topic-cmd: {text!r} — не команда',
+              bot.TOPIC_COMMAND_RE.match(text) is None, text)
+
+
+def _topic_fakes():
+    """Фейки группы результатов: форум с темами + чаты-источники в диалогах."""
+    from types import SimpleNamespace as NS
+    from telethon.tl.types import Channel, User
+
+    dest = -1000000000999
+    source = Channel(id=111, title='PairChat', photo=None, date=None)
+    user = User(id=5, first_name='Ann', last_name='Lee')
+
+    class Client:
+        async def get_entity(self, peer):
+            return NS(title='Результаты', forum=True)
+
+        async def __call__(self, request):
+            return NS(topics=[NS(id=7, title='PairChat'),
+                              NS(id=8, title='Ушедший'),
+                              NS(id=9, title='pairchat'),
+                              NS(id=10, title='Ann Lee')])
+
+        def iter_dialogs(self):
+            async def gen():
+                yield NS(entity=source)
+                yield NS(entity=user)
+                yield NS(entity=NS(title='Ушедший'))  # без id — пропускается
+            return gen()
+
+    return dest, source.id, user.id, Client()
+
+
+def test_topic_command_context():
+    """Тема группы результатов → чат по названию темы; General/другие — None."""
+    dest, _, _, client = _topic_fakes()
+    from types import SimpleNamespace as NS
+
+    saved = (bot.telegram_client, bot.RESULTS_DESTINATION)
+    bot.telegram_client = client
+    bot.RESULTS_DESTINATION = dest
+    loop = asyncio.get_event_loop()
+    try:
+        def ctx_for(topic, chat_id=dest):
+            event = NS(chat_id=chat_id, message=NS(reply_to=(
+                NS(forum_topic=True, reply_to_msg_id=topic, reply_to_top_id=None)
+                if topic else None)))
+            return event, loop.run_until_complete(
+                bot.topic_command_context(event))
+
+        event, ctx = ctx_for(7)
+        check('topic-ctx: тема → чат-источник', ctx == (-1000000000111, 'PairChat', 7), ctx)
+        check('topic-ctx: тема опознана', bot.is_results_topic_message(event) is True)
+
+        _, ctx = ctx_for(None)
+        check('topic-ctx: General → None', ctx is None, ctx)
+
+        _, ctx = ctx_for(7, chat_id=-1000000000111)
+        check('topic-ctx: другой чат → None', ctx is None, ctx)
+
+        event, ctx = ctx_for(8)
+        check('topic-ctx: тема без чата → None, но это тема',
+              ctx is None and bot.is_results_topic_message(event) is True, ctx)
+
+        _, ctx = ctx_for(9)
+        check('topic-ctx: регистр названия — запасной матч',
+              ctx == (-1000000000111, 'PairChat', 9), ctx)
+
+        _, ctx = ctx_for(10)
+        check('topic-ctx: личный чат по имени', ctx == (5, 'Ann Lee', 10), ctx)
+    finally:
+        bot.telegram_client, bot.RESULTS_DESTINATION = saved
+
+
+def test_topic_command_routing():
+    """process_chat_command из темы: анализ чата-источника, ответы в тему."""
+    from types import SimpleNamespace as NS
+
+    dest, source_id = -1000000000999, -1000000000111
+    sent, deleted, calls = [], [], []
+
+    class Event:
+        chat_id = dest
+        id = 55
+        raw_text = 'sum1d-'
+        message = NS(reply_to=NS(forum_topic=True, reply_to_msg_id=7,
+                                 reply_to_top_id=None))
+
+        async def get_chat(self):
+            return NS(title='Результаты')
+
+        async def delete(self):
+            deleted.append(self.id)
+
+    class Client:
+        async def send_message(self, dest, text, reply_to=None):
+            sent.append((dest, text, reply_to))
+
+    async def fake_run(**kw):
+        calls.append(kw)
+        return True
+
+    async def no_topic(name):
+        raise AssertionError(f'тема не должна создаваться: {name}')
+
+    saved = (bot.telegram_client, bot.run_analysis_retried,
+             bot.get_or_create_topic, bot.RESULTS_DESTINATION)
+    bot.telegram_client = Client()
+    bot.run_analysis_retried = fake_run
+    bot.get_or_create_topic = no_topic
+    bot.RESULTS_DESTINATION = dest
+    try:
+        with _quiet():
+            asyncio.get_event_loop().run_until_complete(
+                bot.process_chat_command(Event(), use_ai=True,
+                                         topic_ctx=(source_id, 'PairChat', 7)))
+    finally:
+        (bot.telegram_client, bot.run_analysis_retried,
+         bot.get_or_create_topic, bot.RESULTS_DESTINATION) = saved
+
+    kw = calls[0] if calls else {}
+    check('topic-sum: команда удалена', deleted == [55], deleted)
+    check('topic-sum: анализ исходного чата',
+          kw.get('chat_id') == source_id and kw.get('chat_name') == 'PairChat', kw)
+    check('topic-sum: тема передана в run_analysis', kw.get('topic_id') == 7, kw)
+    check('topic-sum: суффикс "-" — TG-сообщение вместо Telegraph',
+          kw.get('post_as_telegram') is True, kw)
+    check('topic-sum: ответы только в тему источника',
+          sent and all(r == 7 for _, _, r in sent), sent)
+
+
+def test_topic_schedule_helpers():
+    """Запись/снятие слота из темы: тот же SCHEDULE.txt, прежний слот заменён."""
+    path = '/tmp/opencode/test_topic_sched.txt'
+    if os.path.exists(path):
+        os.remove(path)
+    reloads = []
+    saved = (bot.SCHEDULE_FILE, bot.reload_schedule)
+    bot.SCHEDULE_FILE = path
+    bot.reload_schedule = lambda: reloads.append(1)
+    loop = asyncio.get_event_loop()
+    try:
+        with _quiet():
+            ok, msg = loop.run_until_complete(
+                bot._schedule_add_slot(-100111, 'PairChat', 22, 33, 'sum1d-'))
+        entries = bot.load_schedule(path)
+        check('topic-sch: слот записан',
+              ok and len(entries) == 1 and entries[0]['chat_id'] == -100111
+              and (entries[0]['hour'], entries[0]['minute']) == (22, 33)
+              and entries[0]['period'] == '1d'
+              and entries[0]['post_as_telegram'] is True, entries)
+        check('topic-sch: подтверждение с чатом и временем',
+              'PairChat' in msg and '22:33' in msg, msg)
+        check('topic-sch: планировщик перезагружен', reloads == [1], reloads)
+
+        with _quiet():
+            ok2, _ = loop.run_until_complete(
+                bot._schedule_add_slot(-100111, 'PairChat', 8, 0, '12h'))
+        entries = bot.load_schedule(path)
+        check('topic-sch: прежний слот этого чата заменён',
+              ok2 and len(entries) == 1
+              and (entries[0]['hour'], entries[0]['minute']) == (8, 0)
+              and entries[0]['period'] == '12h', entries)
+
+        with _quiet():
+            ok3, msg3 = loop.run_until_complete(
+                bot._schedule_add_slot(-100111, 'PairChat', 8, 0, 'cat'))
+        check('topic-sch: битый период — отказ', ok3 is False and 'период' in msg3, msg3)
+
+        with _quiet():
+            ok4, _ = loop.run_until_complete(
+                bot._schedule_remove_chat(-100222, 'Other'))
+        check('topic-sch: чужого чата в расписании нет', ok4 is False)
+
+        with _quiet():
+            ok5, msg5 = loop.run_until_complete(
+                bot._schedule_remove_chat(-100111, 'PairChat'))
+        check('topic-sch: unsch убирает чат',
+              ok5 and bot.load_schedule(path) == [], msg5)
+    finally:
+        bot.SCHEDULE_FILE, bot.reload_schedule = saved
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def test_topic_dispatch():
+    """Диспетчер без слеша: 'sum1d-' → анализ, 'sch' → расписание в тему."""
+    from types import SimpleNamespace as NS
+
+    posted, deleted, ran = [], [], []
+
+    class Event:
+        chat_id = -1000000000999
+        id = 77
+        raw_text = 'sum1d-'
+        message = NS(reply_to=NS(forum_topic=True, reply_to_msg_id=7))
+
+        async def delete(self):
+            deleted.append(self.id)
+
+    class Client:
+        async def send_message(self, dest, text, reply_to=None):
+            posted.append((text, reply_to))
+
+    async def fake_ctx(event):
+        return (-1000000000111, 'PairChat', 7)
+
+    async def fake_process(event, use_ai=True, topic_ctx=None):
+        ran.append((use_ai, topic_ctx))
+
+    async def fake_list():
+        return 'LISTING'
+
+    saved = (bot.telegram_client, bot.topic_command_context,
+             bot.process_chat_command, bot._schedule_list_text)
+    bot.telegram_client = Client()
+    bot.topic_command_context = fake_ctx
+    bot.process_chat_command = fake_process
+    bot._schedule_list_text = fake_list
+    loop = asyncio.get_event_loop()
+    try:
+        with _quiet():
+            loop.run_until_complete(bot.handle_topic_command(Event()))
+        check('topic-dispatch: sum1d- → process_chat_command с темой',
+              ran == [(True, (-1000000000111, 'PairChat', 7))], ran)
+        check('topic-dispatch: sum не удалён диспетчером', deleted == [], deleted)
+
+        event = Event()
+        event.raw_text = 'sch'
+        with _quiet():
+            loop.run_until_complete(bot.handle_topic_command(event))
+        check('topic-dispatch: sch → список в ту же тему',
+              posted == [('LISTING', 7)] and deleted == [77], (posted, deleted))
+    finally:
+        (bot.telegram_client, bot.topic_command_context, bot.process_chat_command,
+         bot._schedule_list_text) = saved
 
 
 def _now_utc():

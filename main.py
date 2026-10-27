@@ -1919,6 +1919,141 @@ async def get_or_create_topic(chat_name):
         return None
 
 
+# ──────────────────────────────────────────────
+# Команды из темы группы результатов (режим VPS)
+# ──────────────────────────────────────────────
+# В теме чата-источника команду можно писать без ведущего '/': 'sum1d-',
+# 'copy 3h', 'HH:MM sum1d', 'sch', 'unsch'. Источник — чат, чьё название
+# совпадает с названием темы (темы создаёт get_or_create_topic).
+
+def reply_topic_id(message):
+    """id темы форума из заголовка ответа или None (General/обычный чат).
+
+    У Telethon.Message нет готового поля «id темы»: корень темы лежит в
+    reply_to (forum_topic=True, reply_to_msg_id). Ответ внутри темы может
+    нести reply_to_top_id — он и есть id темы.
+    """
+    reply = getattr(message, 'reply_to', None)
+    if reply is None or not getattr(reply, 'forum_topic', False):
+        return None
+    return (getattr(reply, 'reply_to_top_id', None)
+            or getattr(reply, 'reply_to_msg_id', None))
+
+
+async def fetch_results_topic_titles():
+    """{topic_id: title} тем группы результатов (пусто, если это не форум)."""
+    if RESULTS_DESTINATION == 'me':
+        return {}
+    try:
+        channel = await telegram_client.get_entity(RESULTS_DESTINATION)
+        if not getattr(channel, 'forum', False):
+            return {}
+        from telethon.tl.functions.channels import GetForumTopicsRequest
+        result = await telegram_client(GetForumTopicsRequest(
+            channel=channel, offset_date=0, offset_id=0, offset_topic=0, limit=100))
+        return {t.id: t.title for t in getattr(result, 'topics', [])
+                if getattr(t, 'id', None) and getattr(t, 'title', None)}
+    except Exception as e:
+        print(f"⚠️ Не удалось получить темы группы результатов: {e}")
+        return {}
+
+
+async def resolve_topic_chat(topic_id):
+    """(chat_id, название) чата-источника по теме: название темы = название чата.
+
+    None — темы нет или чат с таким названием не найден. Точное совпадение
+    важнее регистронезависимого; при нескольких чатах с одним названием берём
+    первый и пишем предупреждение в лог (как inbox в run_once.py).
+    """
+    title = (await fetch_results_topic_titles()).get(topic_id)
+    if not title:
+        return None
+    from telethon.utils import get_peer_id
+    exact, loose = [], []
+    try:
+        async for dialog in telegram_client.iter_dialogs():
+            entity = getattr(dialog, 'entity', None)
+            if entity is None:
+                continue
+            name = getattr(entity, 'title', None)
+            if not name:
+                first = getattr(entity, 'first_name', None)
+                if not first:
+                    continue
+                name = first + (f" {entity.last_name}"
+                                if getattr(entity, 'last_name', None) else "")
+            if name != title and name.casefold() != title.casefold():
+                continue
+            try:
+                peer_id = get_peer_id(entity)
+            except Exception:
+                continue  # сущность без id (не должно быть в проде) — пропускаем
+            if name == title:
+                exact.append((peer_id, name))
+            else:
+                loose.append((peer_id, name))
+    except Exception as e:
+        print(f"⚠️ Не удалось прочитать список чатов для темы {topic_id}: {e}")
+        return None
+    found = exact or loose
+    if not found:
+        return None
+    if len(found) > 1:
+        print(f"⚠️ Название '{title}' есть у нескольких чатов — беру первый")
+    return found[0]
+
+
+def is_results_topic_message(event):
+    """Сообщение отправлено в тему группы результатов (не General)."""
+    if RESULTS_DESTINATION == 'me':
+        return False
+    if getattr(event, 'chat_id', None) != RESULTS_DESTINATION:
+        return False
+    topic_id = reply_topic_id(getattr(event, 'message', None))
+    return bool(topic_id) and topic_id != 1
+
+
+async def topic_command_context(event):
+    """(chat_id, chat_name, topic_id), если команда пришла из темы результатов.
+
+    None — сообщение не в теме группы результатов либо тему не удалось
+    сопоставить с чатом; вызыватель отличает эти случаи через
+    is_results_topic_message().
+    """
+    if not is_results_topic_message(event):
+        return None
+    topic_id = reply_topic_id(event.message)
+    resolved = await resolve_topic_chat(topic_id)
+    if resolved is None:
+        return None
+    chat_id, title = resolved
+    if chat_id == RESULTS_DESTINATION:
+        return None
+    return chat_id, title, topic_id
+
+
+async def command_home_topic(event, fallback_name):
+    """Куда отвечать на команду: в тему, откуда пришла, иначе — в тему
+    чата-источника. None — сообщение в General группы результатов."""
+    if (RESULTS_DESTINATION != 'me'
+            and getattr(event, 'chat_id', None) == RESULTS_DESTINATION):
+        return reply_topic_id(getattr(event, 'message', None))
+    return await get_or_create_topic(fallback_name)
+
+
+async def _drop_topic_command(event, text):
+    """Неопознанная команда из темы: удалить и объяснить в той же теме."""
+    topic_id = reply_topic_id(event.message)
+    try:
+        await event.delete()
+    except Exception as e:
+        print(f"⚠️ Не удалось удалить команду из темы: {e}")
+    try:
+        await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
+    except Exception as e:
+        print(f"⚠️ Не удалось отправить диагностику в тему: {e}")
+
+
 def is_noise_message(text):
     """
     Проверяет, является ли сообщение бессодержательным (шум/флуд)
@@ -4278,6 +4413,68 @@ async def create_telegraph_account(author_name="ChatSumBot"):
         return None
 
 
+def build_part_page_content(part_content, footer, prev_part=None, next_part=None):
+    """Markdown одной части публикации со ссылками на соседние части.
+
+    prev_part / next_part — пары (номер части, url) или None. Ссылка «назад»
+    идёт в начало страницы, «вперёд» — в конец, перед подписью бота: так
+    последовательное чтение не требует возврата к списку ссылок.
+    """
+    top = f'[← Часть {prev_part[0]}]({prev_part[1]})\n\n' if prev_part else ''
+    bottom = f'\n[Часть {next_part[0]} →]({next_part[1]})\n' if next_part else ''
+    return f'{top}{part_content}{bottom}{footer}'
+
+
+def telegraph_path(page_url):
+    """Path страницы из её адреса: в API это всё, что после домена."""
+    return (page_url or '').rstrip('/').rsplit('/', 1)[-1]
+
+
+async def edit_telegraph_page(page_url, title, content, author_name="ChatSumBot",
+                              telegraph_client=None, max_retries=3):
+    """Правит содержимое уже опубликованной страницы.
+
+    Нужно для ссылки «вперёд»: адрес следующей части появляется только после
+    её публикации. Правка доступна лишь аккаунту-автору, поэтому клиент
+    обязателен — тот же, что создавал страницу.
+
+    Returns:
+        True — страница обновлена, False — правка не удалась.
+    """
+    path = telegraph_path(page_url)
+    if not path or telegraph_client is None:
+        print(f"⚠️  Некуда/нечем править страницу: {page_url}")
+        return False
+
+    retry_count = 0
+    base_delay = 3
+    while retry_count <= max_retries:
+        try:
+            html_content = convert_markdown_to_html(content)
+            await asyncio.to_thread(
+                telegraph_client.edit_page,
+                path=path,
+                title=title,
+                html_content=html_content,
+                author_name=author_name
+            )
+            return True
+        except RetryAfterError:
+            retry_count += 1
+            if retry_count > max_retries:
+                print(f"❌ Превышено количество попыток ({max_retries}) при правке {page_url}")
+                return False
+            wait_time = base_delay * retry_count
+            print(f"⚠️  Flood control на правке. Попытка {retry_count}/{max_retries}. "
+                  f"Ожидание {wait_time} сек...")
+            await asyncio.sleep(wait_time)
+        except Exception as e:
+            print(f"⚠️  Не удалось обновить страницу {page_url}: {e}")
+            return False
+
+    return False
+
+
 async def publish_to_telegraph(title, content, author_name="Chat Filter Bot", telegraph_client=None, max_retries=3):
     """
     Публикует статью в Telegraph с обработкой ограничений частоты запросов (flood control).
@@ -5091,17 +5288,15 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                     telegraph_client = await create_telegraph_account("ChatSumBot")
                     
                     article_urls = []
+                    published_pages = []
                     for part_idx, (part_title, part_content, start_idx, end_idx) in enumerate(summary_parts, 1):
-                        # Извлекаем диапазон времени для этой части
-                        part_time_first, part_time_last = extract_summary_time_range(part_content)
-                        if part_time_first and part_time_last:
-                            time_range_line = f"\n*({part_time_first} - {part_time_last})*\n"
-                            if part_time_first == part_time_last:
-                                time_range_line = f"\n*({part_time_first})*\n"
-                        else:
-                            time_range_line = ""
-                        # Добавляем футер к каждой части
-                        part_with_footer = time_range_line + part_content + bot_footer
+                        # Ссылка «назад» известна сразу (предыдущая часть уже
+                        # опубликована); «вперёд» — только после публикации
+                        # следующей, её дописываем вторым проходом.
+                        prev_page = published_pages[-1] if published_pages else None
+                        prev_part = (prev_page['num'], prev_page['url']) if prev_page else None
+                        part_with_footer = build_part_page_content(
+                            part_content, bot_footer, prev_part=prev_part)
                         part_article_title = f"Саммари чата: {chat_name} - Часть {part_idx}"
                         
                         part_url = await publish_to_telegraph(
@@ -5112,36 +5307,64 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                         )
                         
                         if part_url:
-                            part_time_label = f"{part_time_first} - {part_time_last}" if part_time_first and part_time_last else ""
-                            article_urls.append((part_title, part_url, part_time_label))
+                            article_urls.append((part_title, part_url))
+                            published_pages.append({
+                                'num': part_idx,
+                                'url': part_url,
+                                'title': part_article_title,
+                                'body': part_content,
+                                'prev': prev_part,
+                            })
                             print(f"   ✅ Часть {part_idx}: {part_url}")
                         else:
-                            part_time_label = f"{part_time_first} - {part_time_last}" if part_time_first and part_time_last else ""
                             print(f"   ❌ Не удалось опубликовать часть {part_idx}")
-                            article_urls.append((part_title, None, part_time_label))
+                            article_urls.append((part_title, None))
                         
                         # Пауза между публикациями (кроме последней части)
                         if part_idx < len(summary_parts):
                             print(f"   ⏳ Пауза 4 секунды перед следующей публикацией...")
                             await asyncio.sleep(4)
                     
+                    # Второй проход: ссылка «вперёд» на каждой части, кроме
+                    # последней опубликованной. Правка содержимого — единственный
+                    # способ: адреса следующей части до её создания не существует.
+                    for pos, page in enumerate(published_pages[:-1]):
+                        if pos:
+                            # Та же пауза, что и между публикациями.
+                            await asyncio.sleep(4)
+                        next_page = published_pages[pos + 1]
+                        edited = await edit_telegraph_page(
+                            page['url'],
+                            page['title'],
+                            build_part_page_content(
+                                page['body'],
+                                bot_footer,
+                                prev_part=page['prev'],
+                                next_part=(next_page['num'], next_page['url'])
+                            ),
+                            telegraph_client=telegraph_client
+                        )
+                        if edited:
+                            print(f"   🔗 Часть {page['num']}: добавлена ссылка на часть {next_page['num']}")
+                        else:
+                            print(f"   ⚠️  Часть {page['num']}: ссылка на часть {next_page['num']} не добавлена")
+                    
                     # Формируем сообщение со ссылками на все части
-                    if any(url for _, url, _ in article_urls):
+                    if any(url for _, url in article_urls):
                         header = f"📄 Саммари чата: «<b>{chat_name}</b>»\n"
                         # header += f"📊 Обработано в {len(summary_parts)} частях:\n\n"
                         
-                        for part_title, part_url, part_time_label in article_urls:
-                            display_label = f"{part_title} ({part_time_label})" if part_time_label else part_title
+                        for part_title, part_url in article_urls:
                             if part_url:
-                                header += f"• <a href=\"{part_url}\"><u>{display_label}</u></a>\n\n"
+                                header += f"• <a href=\"{part_url}\"><u>{part_title}</u></a>\n\n"
                             else:
-                                header += f"• {display_label} (⚠️ ошибка публикации)\n"
+                                header += f"• {part_title} (⚠️ ошибка публикации)\n"
                         
                         header += "\n"
                         stats_message = build_summary_stats_message(stats_message, header)
 
                         # Не все части опубликованы — в исходный чат не дублируем.
-                        unpublished = sum(1 for _, url, _ in article_urls if not url)
+                        unpublished = sum(1 for _, url in article_urls if not url)
                         if post_to_source and not source_post_allowed(post_to_source, False, unpublished):
                             post_to_source = False
                             print(f"⚠️  {unpublished} из {len(article_urls)} частей не опубликованы — дублирование в исходный чат отключено")
@@ -5513,14 +5736,18 @@ def parse_chat_command_args(text):
     }
 
 
-async def process_chat_command(event, use_ai=True):
+async def process_chat_command(event, use_ai=True, topic_ctx=None):
     """
     Универсальная функция обработки команд /sum и /copy
 
     Args:
         event: Событие Telegram
         use_ai: True для /sum (с AI анализом), False для /copy (только экспорт)
+        topic_ctx: заранее разрешённая тема результатов
+            (chat_id, chat_name, topic_id) — чтобы не резолвить её дважды
     """
+    home_topic = None
+    chat_name = None
     try:
         # Парсим параметры команды (общий парсер с inbox-режимом run_once.py)
         message_text = event.raw_text
@@ -5554,7 +5781,20 @@ async def process_chat_command(event, use_ai=True):
         chat = await event.get_chat()
         chat_name_log = chat.title if hasattr(chat, 'title') else "Private"
         chat_name = chat.title if hasattr(chat, 'title') else "чата"
-        
+
+        # Команда из темы группы результатов: источник — чат, чьё название
+        # совпадает с названием темы (а не сама группа результатов).
+        ctx = topic_ctx if topic_ctx is not None else await topic_command_context(event)
+        if ctx is not None:
+            source_chat_id, chat_name, home_topic = ctx
+            chat_name_log = f"{chat_name} (тема)"
+        elif is_results_topic_message(event):
+            await _drop_topic_command(
+                event, "❌ В этой теме нет чата с таким названием — команда удалена.")
+            return
+        else:
+            source_chat_id = event.chat_id
+
         command_name = "/sum" if use_ai else "/copy"
         params = " ".join(parts[1:]) if len(parts) > 1 else "(по умолчанию 24h)"
         print(f"\n📥 Команда: {command_name} {params} | Чат: {chat_name_log}")
@@ -5562,8 +5802,8 @@ async def process_chat_command(event, use_ai=True):
         # Удаляем команду из чата (для приватности)
         await event.delete()
         
-        # Получаем или создаем тему для этого чата
-        topic_id = await get_or_create_topic(chat_name)
+        # Тема уже известна, если команда пришла из неё — не ищем заново
+        topic_id = home_topic or await get_or_create_topic(chat_name)
         
         # Формируем сообщение о начале
         action = "анализ" if use_ai else "экспорт"
@@ -5596,7 +5836,7 @@ async def process_chat_command(event, use_ai=True):
             final_note=(f"⛔ Попытки исчерпаны ({RETRY_MAX_ATTEMPTS}/"
                         f"{RETRY_MAX_ATTEMPTS}) — результат частичный"),
             progress_cb=_vps_progress,
-            chat_id=event.chat_id,
+            chat_id=source_chat_id,
             chat_name=chat_name,
             hours=hours,
             days=days,
@@ -5608,7 +5848,8 @@ async def process_chat_command(event, use_ai=True):
             use_ai=use_ai,
             post_to_source=post_to_source,
             post_as_telegram=post_as_telegram,
-            scheduled=False
+            scheduled=False,
+            topic_id=topic_id
         )
     
     except Exception as e:
@@ -5618,10 +5859,14 @@ async def process_chat_command(event, use_ai=True):
         traceback.print_exc()
         
         try:
-            chat = await event.get_chat()
-            chat_name = chat.title if hasattr(chat, 'title') else "чата"
-            topic_id = await get_or_create_topic(chat_name)
-            await telegram_client.send_message(RESULTS_DESTINATION, error_msg, reply_to=topic_id)
+            if home_topic is not None:
+                await telegram_client.send_message(
+                    RESULTS_DESTINATION, error_msg, reply_to=home_topic)
+            elif chat_name:
+                topic_id = await get_or_create_topic(chat_name)
+                await telegram_client.send_message(RESULTS_DESTINATION, error_msg, reply_to=topic_id)
+            else:
+                await telegram_client.send_message(RESULTS_DESTINATION, error_msg)
         except:
             await telegram_client.send_message(RESULTS_DESTINATION, error_msg)
 
@@ -6242,6 +6487,73 @@ async def handle_reload_config_command(event):
     await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
 
 
+# Команда из темы группы результатов без ведущего '/': 'sum1d-', 'copy 3h',
+# 'sch', 'unsch', '22:33 sum1d'. Голая строка 'sum …' в теме считается
+# командой (тема — управляющий канал, как inbox в Actions); время считается
+# командой только если дальше идёт sum/copy/период — иначе это обычный текст.
+TOPIC_COMMAND_RE = re.compile(
+    r'^(?:sum|copy)(?=[\d+\-]|\s|$)'
+    r'|^(?:sch|sch_list)$'
+    r'|^unsch(?=\s|$)'
+    r'|^\d{1,2}:\d{2}\s+(?:/?(?:sum|copy)|\d)',
+    re.IGNORECASE)
+TOPIC_SCHED_RE = re.compile(r'^(\d{1,2}):(\d{2})\s+(.+)$')
+
+
+@telegram_client.on(events.NewMessage(outgoing=True, pattern=TOPIC_COMMAND_RE))
+async def handle_topic_command(event):
+    """Команда из темы группы результатов в режиме VPS (без ведущего '/').
+
+    Работает только для сообщений в теме RESULTS_DESTINATION — в других чатах
+    и в General ничего не делает (там обычные команды со слешем). Источник
+    анализа/расписания — чат, название которого совпадает с названием темы.
+    """
+    if _is_actions_mode():
+        return
+    ctx = await topic_command_context(event)
+    if ctx is None:
+        if is_results_topic_message(event):
+            await _drop_topic_command(
+                event, "❌ В этой теме нет чата с таким названием — команда удалена.")
+        return
+    source_chat_id, source_name, home_topic = ctx
+    text = (event.raw_text or '').strip()
+    print(f"\n📥 Команда из темы: {text} | Тема: {source_name} ({source_chat_id})")
+
+    if text.lower() in ('sch', 'sch_list'):
+        await event.delete()
+        await telegram_client.send_message(
+            RESULTS_DESTINATION, await _schedule_list_text(), reply_to=home_topic)
+        return
+
+    if re.match(r'^unsch(\s|$)', text, re.IGNORECASE):
+        _, msg = await _schedule_remove_chat(source_chat_id, source_name)
+        await event.delete()
+        await telegram_client.send_message(RESULTS_DESTINATION, msg, reply_to=home_topic)
+        return
+
+    m = TOPIC_SCHED_RE.match(text)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        if hour > 23 or minute > 59:
+            await event.delete()
+            await telegram_client.send_message(
+                RESULTS_DESTINATION,
+                "⚠️ Время должно быть в диапазоне 00:00–23:59.",
+                reply_to=home_topic)
+            return
+        _, msg = await _schedule_add_slot(
+            source_chat_id, source_name, hour, minute, m.group(3).strip())
+        await event.delete()
+        await telegram_client.send_message(RESULTS_DESTINATION, msg, reply_to=home_topic)
+        return
+
+    parsed = parse_chat_command_args(text)
+    if parsed is None:
+        return
+    await process_chat_command(event, use_ai=parsed['use_ai'], topic_ctx=ctx)
+
+
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/sum'))
 async def handle_sum_command(event):
     """
@@ -6278,6 +6590,10 @@ async def handle_help_command(event):
     print(f"\n📥 Команда: /help | Чат: {chat_name}")
     help_text = """
 📖 **Справка по командам бота**
+
+**📥 Где отправлять команды:**
+• в любом чате — со слешем: `/sum 1d`
+• в теме чата в группе результатов — без слеша: `sum1d-`, `copy 3h`, `22:33 sum1d`, `sch`, `unsch` (источник — чат, чьё название совпадает с названием темы)
 
 **📊 Основные команды:**
 
@@ -6377,147 +6693,36 @@ async def handle_help_command(event):
 **Примечание:** Бот реагирует только на ваши собственные команды (исходящие сообщения).
 """
     await event.delete()
-    topic_id = await get_or_create_topic(chat_name)
+    topic_id = await command_home_topic(event, chat_name)
     
     await telegram_client.send_message(RESULTS_DESTINATION, help_text, reply_to=topic_id)
 
 
-@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/sch\s+\d'))
-async def handle_sch_command(event):
-    """Добавляет текущий чат в расписание: /sch 09:00 1d или /sch 09:00 1d+"""
-    if _is_actions_mode():
-        return  # в Actions расписание пишется инбокс-командой 'HH:MM sum...' + git push
-    chat = await event.get_chat()
-    chat_name = chat.title if hasattr(chat, 'title') else "Private"
-    chat_name_display = chat.title if hasattr(chat, 'title') else "чата"
-    print(f"\n📥 Команда: /sch | Чат: {chat_name}")
-
-    parts = event.raw_text.split()
-    if len(parts) < 3:
-        await event.delete()
-        topic_id = await get_or_create_topic(chat_name)
-        await telegram_client.send_message(
-            RESULTS_DESTINATION,
-            "⚠️ **Формат:** `/sch 09:00 1d` или `/sch 09:00 1d+` или `/sch 09:00 1d-`\n"
-            "`+` — публикация и в исходный чат\n"
-            "`-` — вместо Telegraph — сообщение в канал",
-            reply_to=topic_id
-        )
-        return
-
-    time_str = parts[1]
-    period_raw = parts[2].lower()
-
-    time_match = re.fullmatch(r'(\d{1,2}):(\d{2})', time_str)
-    if not time_match:
-        await event.delete()
-        topic_id = await get_or_create_topic(chat_name)
-        await telegram_client.send_message(
-            RESULTS_DESTINATION,
-            f"⚠️ Неверный формат времени: `{time_str}`. Используйте `HH:MM`.",
-            reply_to=topic_id
-        )
-        return
-
-    hour = int(time_match.group(1))
-    minute = int(time_match.group(2))
-    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-        await event.delete()
-        topic_id = await get_or_create_topic(chat_name)
-        await telegram_client.send_message(
-            RESULTS_DESTINATION,
-            "⚠️ Время должно быть в диапазоне 00:00–23:59.",
-            reply_to=topic_id
-        )
-        return
-
-    period, post_to_source, post_as_telegram = _parse_suffixes(period_raw)
-
-    if not re.fullmatch(r'\d+[hd]|\d+', period):
-        await event.delete()
-        topic_id = await get_or_create_topic(chat_name)
-        await telegram_client.send_message(
-            RESULTS_DESTINATION,
-            f"⚠️ Неверный формат периода: `{period_raw}`. Используйте `1d`, `12h`, `2d` или лимит `20`.\n"
-            f"`+` после периода — публикация в исходном чате.\n"
-            f"`-` после периода — вместо Telegraph — сообщение в канал.",
-            reply_to=topic_id
-        )
-        return
-
-    entries = load_schedule(SCHEDULE_FILE)
-    entries = [e for e in entries if e['chat_id'] != event.chat_id]
-    entries.append({
-        'chat_id': event.chat_id,
-        'hour': hour,
-        'minute': minute,
-        'period': period,
-        'post_to_source': post_to_source,
-        'post_as_telegram': post_as_telegram
-    })
-
-    if not save_schedule(SCHEDULE_FILE, entries):
-        await event.delete()
-        topic_id = await get_or_create_topic(chat_name)
-        await telegram_client.send_message(
-            RESULTS_DESTINATION,
-            "❌ Ошибка при сохранении расписания.",
-            reply_to=topic_id
-        )
-        return
-
-    reload_schedule()
-
-    await event.delete()
-    topic_id = await get_or_create_topic(chat_name)
-
-    period_display = f"{period}h" if period.endswith('h') else f"{period}d"
-    days = int(period[:-1]) if period.endswith('d') else 0
-    hours = int(period[:-1]) if period.endswith('h') else 0
-    if days == 1:
-        period_text = "1 день"
-    elif days in (2, 3, 4):
-        period_text = f"{days} дня"
-    elif days > 0:
-        period_text = f"{days} дней"
-    elif hours == 1:
-        period_text = "1 час"
+def _period_text(period):
+    """'1d' → '1 день', '12h' → '12 часов', '20' → 'последние 20'."""
+    if period.endswith('d'):
+        days, hours = int(period[:-1]), 0
+    elif period.endswith('h'):
+        days, hours = 0, int(period[:-1])
     else:
-        period_text = f"{hours} часов"
-
-    post_text = "да ✅" if post_to_source else "нет"
-    tg_text = "да ✅" if post_as_telegram else "нет"
-    confirm_msg = (
-        f"✅ **Расписание добавлено**\n\n"
-        f"Чат: **{chat_name_display}**\n"
-        f"Время: `{hour:02d}:{minute:02d}`\n"
-        f"Период: {period_text}\n"
-        f"Публикация в чате: {post_text}\n"
-        f"Вместо Telegraph (TG-сообщение): {tg_text}"
-    )
-    await telegram_client.send_message(RESULTS_DESTINATION, confirm_msg, reply_to=topic_id)
+        return f"последние {period} сообщений"
+    if days == 1:
+        return "1 день"
+    if days in (2, 3, 4):
+        return f"{days} дня"
+    if days > 0:
+        return f"{days} дней"
+    if hours == 1:
+        return "1 час"
+    return f"{hours} часов"
 
 
-@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/sch_list$'))
-async def handle_sch_list_command(event):
-    """Показывает текущее расписание."""
-    chat = await event.get_chat()
-    chat_name = chat.title if hasattr(chat, 'title') else "Private"
-    print(f"\n📥 Команда: /sch_list | Чат: {chat_name}")
-
+async def _schedule_list_text():
+    """Текст расписания для /sch_list и команды 'sch' из темы."""
     entries = load_schedule(SCHEDULE_FILE)
-
-    await event.delete()
-    topic_id = await get_or_create_topic(chat_name)
-
     if not entries:
-        await telegram_client.send_message(
-            RESULTS_DESTINATION,
-            "📅 **Расписание пусто**\n\nИспользуйте `/sch 09:00 1d` в нужном чате, чтобы добавить.",
-            reply_to=topic_id
-        )
-        return
-
+        return ("📅 **Расписание пусто**\n\n"
+                "Используйте `/sch 09:00 1d` в нужном чате, чтобы добавить.")
     lines = ["📅 **Текущее расписание:**\n"]
     for i, entry in enumerate(entries, 1):
         try:
@@ -6528,11 +6733,147 @@ async def handle_sch_list_command(event):
         post_suffix = " (в чат)" if entry['post_to_source'] else ""
         tg_suffix = " (TG-сообщение)" if entry.get('post_as_telegram') else ""
         lines.append(f"{i}. **{display_name}**: {entry['hour']:02d}:{entry['minute']:02d}, {entry['period']}{post_suffix}{tg_suffix}")
+    return "\n".join(lines)
 
+
+async def _schedule_add_slot(chat_id, chat_display, hour, minute, period_raw):
+    """Записать слот чата в SCHEDULE.txt (прежний слот этого чата заменяется).
+
+    period_raw: готовый период ('1d', '12h', '20', '1d+') или sum-команда
+    ('sum1d', 'sum 12h-') — как в теме группы результатов.
+    Возвращает (ok, text): text — готовое сообщение в канал (успех или причина).
+    """
+    token = (period_raw or '').strip()
+    if re.match(r'^/?(?:sum|copy)(?=[\d+\-]|\s|$)', token, re.IGNORECASE):
+        parsed = parse_chat_command_args(token)
+        normalized = schedule_period_from_parsed(parsed) if parsed else None
+        if normalized is None:
+            return False, (
+                "⚠️ В расписание ставится только sum с одиночным периодом "
+                "(sum1d, sum12h, sum20) — диапазоны и copy не поддерживаются.")
+        period, post_to_source, post_as_telegram = _parse_suffixes(normalized)
+    else:
+        period, post_to_source, post_as_telegram = _parse_suffixes(token)
+    if not re.fullmatch(r'\d+[hd]|\d+', period):
+        return False, (
+            f"⚠️ Неверный формат периода: `{token}`. Используйте `1d`, `12h`, `2d` или лимит `20`.\n"
+            f"`+` после периода — публикация в исходном чате.\n"
+            f"`-` после периода — вместо Telegraph — сообщение в канал.")
+    entries = [e for e in load_schedule(SCHEDULE_FILE) if e['chat_id'] != chat_id]
+    entries.append({
+        'chat_id': chat_id,
+        'hour': hour,
+        'minute': minute,
+        'period': period,
+        'post_to_source': post_to_source,
+        'post_as_telegram': post_as_telegram
+    })
+    if not save_schedule(SCHEDULE_FILE, entries):
+        return False, "❌ Ошибка при сохранении расписания."
+    reload_schedule()
+    post_text = "да ✅" if post_to_source else "нет"
+    tg_text = "да ✅" if post_as_telegram else "нет"
+    return True, (
+        f"✅ **Расписание добавлено**\n\n"
+        f"Чат: **{chat_display}**\n"
+        f"Время: `{hour:02d}:{minute:02d}`\n"
+        f"Период: {_period_text(period)}\n"
+        f"Публикация в чате: {post_text}\n"
+        f"Вместо Telegraph (TG-сообщение): {tg_text}"
+    )
+
+
+async def _schedule_remove_chat(chat_id, chat_display):
+    """Убрать чат из SCHEDULE.txt. Возвращает (ok, text) — сообщение в канал."""
+    entries = load_schedule(SCHEDULE_FILE)
+    remain = [e for e in entries if e['chat_id'] != chat_id]
+    if len(remain) == len(entries):
+        return False, f"❌ Чат **{chat_display}** не найден в расписании."
+    if not save_schedule(SCHEDULE_FILE, remain):
+        return False, "❌ Ошибка при сохранении расписания."
+    reload_schedule()
+    return True, f"✅ **Чат {chat_display} удален из расписания**"
+
+
+async def _command_source(event, ctx=None):
+    """Источник команды расписания: (chat_id, chat_display, chat_log, home_topic).
+
+    Приоритет — тема группы результатов (название темы = название чата),
+    иначе чат, в котором отправлена команда. home_topic None — ответ уйдёт
+    в тему чата-источника.
+    """
+    if ctx is None:
+        ctx = await topic_command_context(event)
+    if ctx is not None:
+        chat_id, display, home_topic = ctx
+        return chat_id, display, f"{display} (тема)", home_topic
+    chat = await event.get_chat()
+    title = chat.title if hasattr(chat, 'title') else None
+    return (event.chat_id, title or "чата", title or "Private", None)
+
+
+@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/sch\s+\d'))
+async def handle_sch_command(event):
+    """Добавляет текущий чат в расписание: /sch 09:00 1d или /sch 09:00 1d+"""
+    if _is_actions_mode():
+        return  # в Actions расписание пишется инбокс-командой 'HH:MM sum...' + git push
+    ctx = await topic_command_context(event)
+    if ctx is None and is_results_topic_message(event):
+        await _drop_topic_command(
+            event, "❌ В этой теме нет чата с таким названием — команда удалена.")
+        return
+    chat_id, chat_name_display, chat_name, home_topic = await _command_source(event, ctx)
+    print(f"\n📥 Команда: /sch | Чат: {chat_name}")
+
+    async def reply(text):
+        await telegram_client.send_message(
+            RESULTS_DESTINATION, text,
+            reply_to=home_topic or await get_or_create_topic(chat_name))
+
+    parts = event.raw_text.split()
+    if len(parts) < 3:
+        await event.delete()
+        await reply(
+            "⚠️ **Формат:** `/sch 09:00 1d` или `/sch 09:00 1d+` или `/sch 09:00 1d-`\n"
+            "`+` — публикация и в исходный чат\n"
+            "`-` — вместо Telegraph — сообщение в канал"
+        )
+        return
+
+    time_str = parts[1]
+    period_raw = parts[2].lower()
+
+    time_match = re.fullmatch(r'(\d{1,2}):(\d{2})', time_str)
+    if not time_match:
+        await event.delete()
+        await reply(f"⚠️ Неверный формат времени: `{time_str}`. Используйте `HH:MM`.")
+        return
+
+    hour = int(time_match.group(1))
+    minute = int(time_match.group(2))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        await event.delete()
+        await reply("⚠️ Время должно быть в диапазоне 00:00–23:59.")
+        return
+
+    await event.delete()
+    _, confirm_msg = await _schedule_add_slot(
+        chat_id, chat_name_display, hour, minute, period_raw)
+    await reply(confirm_msg)
+
+
+@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/sch_list$'))
+async def handle_sch_list_command(event):
+    """Показывает текущее расписание."""
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
+    print(f"\n📥 Команда: /sch_list | Чат: {chat_name}")
+
+    await event.delete()
     await telegram_client.send_message(
         RESULTS_DESTINATION,
-        "\n".join(lines),
-        reply_to=topic_id
+        await _schedule_list_text(),
+        reply_to=await command_home_topic(event, chat_name)
     )
 
 
@@ -6541,45 +6882,19 @@ async def handle_unsch_command(event):
     """Удаляет текущий чат из расписания."""
     if _is_actions_mode():
         return  # в Actions расписание пишется инбокс-командой 'unsch ...' + git push
-    chat = await event.get_chat()
-    chat_name = chat.title if hasattr(chat, 'title') else "Private"
-    chat_name_display = chat.title if hasattr(chat, 'title') else "чата"
+    ctx = await topic_command_context(event)
+    if ctx is None and is_results_topic_message(event):
+        await _drop_topic_command(
+            event, "❌ В этой теме нет чата с таким названием — команда удалена.")
+        return
+    chat_id, chat_name_display, chat_name, home_topic = await _command_source(event, ctx)
     print(f"\n📥 Команда: /unsch | Чат: {chat_name}")
 
-    entries = load_schedule(SCHEDULE_FILE)
-    before = len(entries)
-    entries = [e for e in entries if e['chat_id'] != event.chat_id]
-    removed = before - len(entries)
-
-    if removed == 0:
-        await event.delete()
-        topic_id = await get_or_create_topic(chat_name)
-        await telegram_client.send_message(
-            RESULTS_DESTINATION,
-            f"❌ Чат **{chat_name_display}** не найден в расписании.",
-            reply_to=topic_id
-        )
-        return
-
-    if not save_schedule(SCHEDULE_FILE, entries):
-        await event.delete()
-        topic_id = await get_or_create_topic(chat_name)
-        await telegram_client.send_message(
-            RESULTS_DESTINATION,
-            "❌ Ошибка при сохранении расписания.",
-            reply_to=topic_id
-        )
-        return
-
-    reload_schedule()
-
     await event.delete()
-    topic_id = await get_or_create_topic(chat_name)
+    _, msg = await _schedule_remove_chat(chat_id, chat_name_display)
     await telegram_client.send_message(
-        RESULTS_DESTINATION,
-        f"✅ **Чат {chat_name_display} удален из расписания**",
-        reply_to=topic_id
-    )
+        RESULTS_DESTINATION, msg,
+        reply_to=home_topic or await get_or_create_topic(chat_name))
 
 
 async def main():
@@ -6658,6 +6973,8 @@ async def main():
     print("    /unsch - удалить чат из расписания")
     print("  Справка:")
     print("    /help - полная справка по командам")
+    print("  Из темы канала результатов (без слеша):")
+    print("    sum1d / copy 3h / 22:33 sum1d / sch / unsch - чат берётся из названия темы")
     print("\n💡 Отправьте команду /sum в любом чате для анализа с AI")
     print("💡 Используйте /copy для экспорта без затрат на API")
     print("=" * 60)
