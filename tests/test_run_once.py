@@ -142,6 +142,7 @@ def main():
     test_quota_diag()
     test_server_overload_diag()
     test_api_error_diag()
+    test_payment_required_402()
     test_model_display_label()
     test_reasoning_effort_config()
     test_flat_rotation()
@@ -1968,6 +1969,90 @@ def test_api_error_diag():
     check('диагностика API: заголовки дампятся в лог по тегу',
           'HTTP 500' in buf.getvalue() and 'x-request-id=r500' in buf.getvalue(),
           repr(buf.getvalue()))
+
+
+def test_payment_required_402():
+    """402 OpenRouter: резерв под вход + потолок ответа больше баланса.
+
+    Живой замер 27.10.2026 (Qwen, чанк 47.6K символов): 'You requested up to
+    65536 tokens, but can only afford 30741'. Провайдер сам называет, сколько
+    тянет баланс, — по этому числу потолок ответа ужимается один раз.
+    """
+    import asyncio
+    import httpx
+    from openai import APIStatusError
+    from types import SimpleNamespace
+
+    msg = ('This request requires more credits, or fewer max_tokens. You '
+           'requested up to 65536 tokens, but can only afford 30741.')
+    check('402: потолок из текста вытащен',
+          bot._affordable_output_tokens(msg) == 30741,
+          bot._affordable_output_tokens(msg))
+    check('402: без числа — None',
+          bot._affordable_output_tokens('requires more credits') is None, '')
+    check('402: опознан как нехватка денег',
+          bot.is_payment_required_error(msg) is True, '')
+    check('402: квота — не нехватка денег',
+          bot.is_payment_required_error('quota exceeded') is False, '')
+    check('402: пусто — не нехватка денег',
+          bot.is_payment_required_error('') is False, '')
+    check('402: пол усечения 2000',
+          bot.MIN_AFFORDABLE_OUTPUT_TOKENS == 2000,
+          bot.MIN_AFFORDABLE_OUTPUT_TOKENS)
+
+    payload = {'error': {'code': 402, 'message': msg}}
+    req = httpx.Request('POST', 'https://openrouter.ai/api/v1/chat/completions')
+    err402 = APIStatusError(
+        message=msg, response=httpx.Response(402, json=payload, request=req),
+        body=payload)
+
+    class _FakeClient:
+        """Клиент-заглушка: первый вызов падает 402, второй отдаёт ответ."""
+
+        def __init__(self, always_fail=False):
+            self.calls = []
+            self.always_fail = always_fail
+            self.chat = SimpleNamespace(completions=self)
+
+        def with_options(self, **_kw):
+            return self
+
+        async def create(self, **params):
+            self.calls.append(params)
+            if self.always_fail or len(self.calls) == 1:
+                raise err402
+            return {'ok': True, 'cap': params.get('max_completion_tokens')}
+
+    saved = bot.get_active_llm_client
+    try:
+        fake = _FakeClient()
+        bot.get_active_llm_client = lambda: fake
+        params = {'model': 'qwen/qwen3.8-flash', 'messages': [],
+                  'max_completion_tokens': 65536}
+        out = asyncio.get_event_loop().run_until_complete(
+            bot._execute_single_key_request(params))
+        check('402: повтор с урезанным потолком (90%)',
+              len(fake.calls) == 2
+              and fake.calls[1]['max_completion_tokens'] == 27666,
+              [c.get('max_completion_tokens') for c in fake.calls])
+        check('402: dict вызывателя не испорчен',
+              params['max_completion_tokens'] == 65536, params)
+        check('402: ответ вернулся после ужима', out == {'ok': True, 'cap': 27666}, out)
+
+        # Ужим ровно один раз: второй 402 уходит наружу, а не крутит цикл.
+        fake2 = _FakeClient(always_fail=True)
+        bot.get_active_llm_client = lambda: fake2
+        raised = False
+        try:
+            asyncio.get_event_loop().run_until_complete(
+                bot._execute_single_key_request(dict(params)))
+        except APIStatusError:
+            raised = True
+        check('402: второй 402 уходит наружу (без марафона)',
+              raised and len(fake2.calls) == 2,
+              (raised, len(fake2.calls)))
+    finally:
+        bot.get_active_llm_client = saved
 
 
 def test_flat_rotation():
@@ -4056,7 +4141,8 @@ def test_model_choice_commands():
         bot.OPENROUTER_CHUNK_MAX_CHARS = ''
         qwen = bot.get_model_generation_config('qwen/qwen3.8-flash', provider='openrouter')
         check('qwen: окно 1M', qwen['context_limit_tokens'] == 1000000, qwen)
-        check('qwen: выход 65536', qwen['output_max_tokens'] == 65536, qwen)
+        check('qwen: выход 30000 (резерв 402)',
+              qwen['output_max_tokens'] == 30000, qwen)
         check('qwen: чанк 100K', qwen['chunk_max_chars'] == 100000, qwen)
         bot.OPENCODE_CHUNK_MAX_CHARS = ''
         ds = bot.get_model_generation_config('deepseek-v4.1-flash', provider='opencode')

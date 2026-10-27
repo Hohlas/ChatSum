@@ -825,12 +825,16 @@ def get_model_generation_config(model_name, provider=None):
     elif model_name in ('qwen/qwen3.8-flash', 'qwen/qwen3.8-flash:free'):
         # Qwen 3.8 Flash: контекст 1 000 000, выход до 131 072. Источники:
         # справка каталога моделей (страница модели OpenRouter лимиты не
-        # печатает, там только список полей). Ответ ограничен 65 536 — Qwen
-        # думает по умолчанию, и рассуждения идут из того же бюджета, что
-        # ответ: половина потолка оставляет место на оба.
+        # печатает, там только список полей). Ответ ограничен 30 000, а не
+        # половиной потолка: OpenRouter резервирует под запрос вход + потолок
+        # ответа по цене выхода ($0.47/1M → 65 536 ≈ $0.031) и при тощем
+        # балансе отдаёт 402 «can only afford N tokens» ещё до отправки
+        # модели. 30 000 ≈ $0.014 — влезает в резерв, а фактический ответ
+        # чанков не превышал ~25K токенов (рассуждения идут из того же
+        # бюджета). Если ответ всё же обрежется — лечится меньшим чанком.
         config.update({
             'context_limit_tokens': 1000000,
-            'output_max_tokens': 65536,
+            'output_max_tokens': 30000,
             'chunk_max_chars': 100000,
         })
         config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])
@@ -930,6 +934,46 @@ def is_quota_exceeded_error(error_message):
         or 'resource_exhausted' in error_lower
         or 'generaterequestsperdayperprojectpermodel-freetier' in error_lower
     )
+
+
+# Ниже этого потолка ответа запрос не ужимаем: ответ гарантированно
+# обрежется, и платить за обрубок смысла нет.
+MIN_AFFORDABLE_OUTPUT_TOKENS = 2000
+
+
+def _affordable_output_tokens(error_message):
+    """Сколько токенов ответа ещё тянет баланс — из текста 402 OpenRouter.
+
+    'You requested up to 65536 tokens, but can only afford 30741' → 30741.
+    Не нашлось — None. Чистая логика, исключений не бросает.
+    """
+    if not error_message:
+        return None
+    m = re.search(r'can only afford\s+([\d,]+)', str(error_message), re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return int(m.group(1).replace(',', ''))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_payment_required_error(error_message):
+    """Нехватка денег у провайдера (402), а не квота и не сбой сервера.
+
+    OpenRouter резервирует под запрос вход + потолок ответа и отвечает 402,
+    когда баланс резерв не покрывает: «This request requires more credits, or
+    fewer max_tokens...». Повтор того же запроса при этом не помогает
+    (док. OpenRouter, «Handling 402 errors»): лечится деньгами или меньшим
+    потолком ответа. Чистая логика, исключений не бросает.
+    """
+    if not error_message:
+        return False
+    low = str(error_message).lower()
+    return ('requires more credits' in low
+            or 'can only afford' in low
+            or 'insufficient credits' in low
+            or 'payment_required' in low)
 
 
 def _retry_to_seconds(raw):
@@ -1342,9 +1386,14 @@ async def _execute_single_key_request(request_params, notify=None):
         client = get_active_llm_client().with_options(timeout=600.0)
     except Exception:
         client = get_active_llm_client()
+    # Копия параметров: при 402 «can only afford N» потолок ответа ужимается
+    # здесь, а dict вызывателя (он переиспользует его для повтора с усиленным
+    # промптом) должен остаться нетронутым.
+    params = dict(request_params)
+    cap_clamped = False
     for retry in range(max_retries):
         try:
-            return await client.chat.completions.create(**request_params)
+            return await client.chat.completions.create(**params)
         except Exception as e:
             last_error = e
             error_str = str(e)
@@ -1360,6 +1409,29 @@ async def _execute_single_key_request(request_params, notify=None):
                     f"дальше добой/повтор")
                 await asyncio.sleep(SERVER_OVERLOAD_PAUSE_SEC)
                 raise
+            # 402: баланс не покрывает резерв под вход + потолок ответа.
+            # Провайдер сам говорит, сколько токенов ответа ещё тянет —
+            # ужимаем потолок до этого числа и пробуем ещё раз (один раз:
+            # ниже пола не режем, а повтор с тем же потолком бесполезен).
+            affordable = _affordable_output_tokens(
+                extract_api_error_message(e))
+            current_cap = params.get('max_completion_tokens')
+            if (getattr(e, 'status_code', None) == 402 and affordable
+                    and not cap_clamped and current_cap):
+                new_cap = max(MIN_AFFORDABLE_OUTPUT_TOKENS,
+                              int(affordable * 0.9))
+                if new_cap < current_cap:
+                    print(f"   💸 402: баланса хватает на {affordable:,} "
+                          f"токенов ответа — ужимаю потолок "
+                          f"{current_cap:,} → {new_cap:,} и повторяю")
+                    await _safe_notify(
+                        notify,
+                        f"💸 {provider_display_name()}: баланса хватает на "
+                        f"{affordable:,} токенов ответа — ужимаю потолок "
+                        f"до {new_cap:,}")
+                    params['max_completion_tokens'] = new_cap
+                    cap_clamped = True
+                    continue
             is_retryable = any(
                 code in error_str for code in ('503', '429', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED')
             ) or _is_timeout_text(error_str) or _is_connection_error(e)
@@ -3413,6 +3485,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
         errors_count = 0
         stop_due_to_quota = False
         stop_due_to_overload = False
+        stop_due_to_payment = False
         # Досчёт: удачные чанки прошлой попытки той же команды (по отпечатку
         # message_id; сдвинувшиеся не совпадут и посчитаются заново).
         resumed = resume_cache_lookup(resume_key, chunks)
@@ -3434,12 +3507,19 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
                     PROGRESS_HOOK()
                 except Exception:
                     pass
-            if stop_due_to_quota or stop_due_to_overload:
-                reason = ("исчерпания квоты API" if stop_due_to_quota
-                          else f"затяжной перегрузки сервера ({provider_label}, "
-                               f"{_format_pause_sec(SERVER_OVERLOAD_PAUSE_SEC)} ожидания не помогли)")
-                reason_short = ("квота API" if stop_due_to_quota
-                                else "перегрузка сервера")
+            if stop_due_to_quota or stop_due_to_overload or stop_due_to_payment:
+                if stop_due_to_payment:
+                    reason = (f"нехватки денег на {provider_label}: резерв под "
+                              f"потолок ответа не покрыт балансом")
+                    reason_short = "нет денег на API"
+                elif stop_due_to_quota:
+                    reason = "исчерпания квоты API"
+                    reason_short = "квота API"
+                else:
+                    reason = (f"затяжной перегрузки сервера ({provider_label}, "
+                              f"{_format_pause_sec(SERVER_OVERLOAD_PAUSE_SEC)} "
+                              f"ожидания не помогли)")
+                    reason_short = "перегрузка сервера"
                 skipped_msg = f"⚠️ Чанк пропущен: обработка остановлена после {reason}"
                 chunk_summaries.append((start_idx, end_idx, skipped_msg, True))
                 errors_count += 1
@@ -3624,7 +3704,13 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
             except APIStatusError as e:
                 status_code = getattr(e, 'status_code', 'неизвестен')
                 api_message = extract_api_error_message(e)
-                if status_code == 429:
+                if is_payment_required_error(api_message) or status_code == 402:
+                    text = format_api_error_diagnostic(e, 'HTTP 402')
+                    error_msg = (f"❌ Баланс {provider_label} не покрывает резерв "
+                                 f"под ответ: {text}" if text
+                                 else f"❌ Баланс {provider_label} не покрывает "
+                                      f"резерв под ответ (HTTP 402).")
+                elif status_code == 429:
                     diag = format_quota_diagnostic(e)
                     error_msg = (f"❌ Ошибка API ({diag})" if diag
                                  else f"❌ Ошибка API (HTTP {status_code}): {api_message}")
@@ -3643,7 +3729,11 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
                 total_usage['errors'].append(error_msg)
                 errors_count += 1
 
-                if is_quota_exceeded_error(api_message):
+                if status_code == 402 or is_payment_required_error(api_message):
+                    stop_due_to_payment = True
+                    print("   ⛔ Обработка следующих чанков остановлена: баланс "
+                          "провайдера не покрывает резерв под ответ")
+                elif is_quota_exceeded_error(api_message):
                     stop_due_to_quota = True
                     print("   ⛔ Обработка следующих чанков остановлена: исчерпана квота API")
                 elif is_server_overloaded(api_message):
@@ -3674,13 +3764,14 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
         # Каждый чанк добивается отдельно однопроходным режимом (рекурсия
         # всегда в 1 чанк, повтора внутри повтора нет). Добиваем только
         # genuine-ошибки API (текст с ❌; пропуски после стоп-флагов не трогаем)
-        # и только без стоп-флагов: квоту и затяжной шторм паузой не лечат,
-        # а каждый 503 жжёт дневной лимит.
+        # и только без стоп-флагов: квоту, нехватку денег и затяжной шторм
+        # паузой не лечат, а каждый 503 жжёт дневной лимит.
         failed_for_redrive = [
             i for i, (_, _, text, is_err) in enumerate(chunk_summaries)
             if is_err and isinstance(text, str) and text.startswith('❌')
         ]
-        if failed_for_redrive and not stop_due_to_quota and not stop_due_to_overload:
+        if (failed_for_redrive and not stop_due_to_quota
+                and not stop_due_to_overload and not stop_due_to_payment):
             print(f"\n🔁 Добой {len(failed_for_redrive)} битых чанков "
                   f"(пауза {CHUNK_REDRIVE_PAUSE_SEC}с, по одному)...")
             await _safe_notify(
@@ -3923,7 +4014,13 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
         if status_code == 401:
             error_msg = "❌ Ошибка доступа к Google AI Studio: ключ недействителен или доступ ограничен."
         elif status_code == 402:
-            error_msg = "❌ Ошибка оплаты или лимитов Google AI Studio."
+            # OpenRouter: резерв под вход + потолок ответа больше баланса.
+            # Шаблон «оплата Google» тут врал: провайдер может быть любой.
+            text = format_api_error_diagnostic(e, 'HTTP 402')
+            error_msg = (f"❌ Баланс {provider_label} не покрывает резерв "
+                         f"под ответ: {text}" if text
+                         else f"❌ Баланс {provider_label} не покрывает "
+                              f"резерв под ответ (HTTP 402).")
         else:
             code_text = status_code if status_code is not None else "неизвестен"
             if status_code == 429:
