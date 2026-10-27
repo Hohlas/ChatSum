@@ -179,6 +179,7 @@ esac
 
 echo "--- Secrets (LLM-провайдеры; private.txt хранит только ключи) ---"
 gh_set_secret OPENROUTER_API_KEY "$(get_var OPENROUTER_API_KEY)" 0
+gh_set_secret OPENCODE_GO_API_KEY "$(get_var OPENCODE_GO_API_KEY)" 0
 gh_set_secret NVIDIA_API_KEY "$(get_var NVIDIA_API_KEY)" 0
 
 echo "--- Variables (публичные; секретные значения кладите в Secrets) ---"
@@ -192,7 +193,7 @@ gh_set_var GEMINI_MODEL "$MODEL"
 gh_set_var GEMINI_TEMPERATURE "$TEMP"
 gh_set_var GEMINI_REASONING_EFFORT "$EFFORT"
 gh_set_var GEMINI_CHUNK_MAX_CHARS "$CHUNK"
-OR_MODEL="$(get_var OPENROUTER_MODEL)";            [ -n "$OR_MODEL" ] || OR_MODEL="nvidia/nemotron-3-ultra-550b-a55b:free"
+OR_MODEL="$(get_var OPENROUTER_MODEL)";            [ -n "$OR_MODEL" ] || OR_MODEL="qwen/qwen3.8-flash"
 OR_TEMP="$(get_var OPENROUTER_TEMPERATURE)";       [ -n "$OR_TEMP" ] || OR_TEMP="0"
 OR_EFFORT="$(get_var OPENROUTER_REASONING_EFFORT)"; [ -n "$OR_EFFORT" ] || OR_EFFORT="none"
 OR_CHUNK="$(get_var OPENROUTER_CHUNK_MAX_CHARS)";  [ -n "$OR_CHUNK" ] || OR_CHUNK="60000"
@@ -200,6 +201,14 @@ gh_set_var OPENROUTER_MODEL "$OR_MODEL"
 gh_set_var OPENROUTER_TEMPERATURE "$OR_TEMP"
 gh_set_var OPENROUTER_REASONING_EFFORT "$OR_EFFORT"
 gh_set_var OPENROUTER_CHUNK_MAX_CHARS "$OR_CHUNK"
+OC_MODEL="$(get_var OPENCODE_MODEL)";            [ -n "$OC_MODEL" ] || OC_MODEL="deepseek-v4.1-flash"
+OC_TEMP="$(get_var OPENCODE_TEMPERATURE)";       [ -n "$OC_TEMP" ] || OC_TEMP="0"
+OC_EFFORT="$(get_var OPENCODE_REASONING_EFFORT)"; [ -n "$OC_EFFORT" ] || OC_EFFORT="none"
+OC_CHUNK="$(get_var OPENCODE_CHUNK_MAX_CHARS)";  [ -n "$OC_CHUNK" ] || OC_CHUNK="40000"
+gh_set_var OPENCODE_MODEL "$OC_MODEL"
+gh_set_var OPENCODE_TEMPERATURE "$OC_TEMP"
+gh_set_var OPENCODE_REASONING_EFFORT "$OC_EFFORT"
+gh_set_var OPENCODE_CHUNK_MAX_CHARS "$OC_CHUNK"
 NV_MODEL="$(get_var NVIDIA_MODEL)";            [ -n "$NV_MODEL" ] || NV_MODEL="deepseek-ai/deepseek-v4.1-flash"
 NV_TEMP="$(get_var NVIDIA_TEMPERATURE)";       [ -n "$NV_TEMP" ] || NV_TEMP="0"
 NV_EFFORT="$(get_var NVIDIA_REASONING_EFFORT)"; [ -n "$NV_EFFORT" ] || NV_EFFORT="none"

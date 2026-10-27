@@ -1,26 +1,40 @@
 # Model settings, tracked in git. One push to main updates VPS and Actions, no Secrets/Variables change.
 # File wins over env; env is fallback only.
-# private.txt holds ONLY keys (TELEGRAM_*, GOOGLE_API_KEY*, OPENROUTER_API_KEY, NVIDIA_API_KEY).
+# private.txt holds ONLY keys (TELEGRAM_*, GOOGLE_API_KEY*, OPENROUTER_API_KEY*, OPENCODE_GO_API_KEY).
 # All MODEL / TEMPERATURE / REASONING_EFFORT / CHUNK_MAX_CHARS live here, per provider.
 # REASONING_EFFORT: none low medium high.
-# LLM_PROVIDER: google | openrouter | nvidia (default google).
+# LLM_PROVIDER: google | openrouter | opencode | nvidia (default google).
+# Выбор по номерам — команда /model в боте (пишет сюда же).
 
-LLM_PROVIDER=google  # google | openrouter | nvidia
 
 GEMINI_MODEL=gemini-3.8-flash
 GEMINI_TEMPERATURE=0               # 0 = детерминированный (рекомендуется), 0.3 = вариативный
 GEMINI_REASONING_EFFORT=high     # none low medium high (none — детерминизм, medium — глубже анализ но нестабилен)
 GEMINI_CHUNK_MAX_CHARS=40000      # CHUNK/2 токенов  для русского чата
 
-# Кандидаты на переключение (активна только строка без '#'; остальные держать в комментарии):
-OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free   # контекст 1M, выход 65K, чанк-профиль 100K
-# OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free    # контекст 262K, выход 235K, чанк-профиль 100K; жив 2026-10-09
+# OpenRouter. Активная строка — Qwen (та же модель, что предлагает /model).
+# Кандидаты на переключение (активна только строка без '#'):
+# OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free   # контекст 1M, выход 65K, чанк-профиль 100K
+# OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free    # контекст 262K, выход 235K, чанк-профиль 100K
 # OPENROUTER_MODEL=google/gemma-4-31b-it:free      # контекст 262K, выход 32K (tight), чанк-профиль 60K; slug строго с '-it'
 OPENROUTER_TEMPERATURE=0
 OPENROUTER_REASONING_EFFORT=medium  # 
 OPENROUTER_CHUNK_MAX_CHARS=80000   # ~42K токенов входа, ~30K токенов выхода: запас большой до лимита 235929
 
+# OpenCode Go (подписка opencode.ai), ключ OPENCODE_GO_API_KEY. DeepSeek думает
+# по умолчанию; шлюз принимает reasoning_effort (как OpenAI), но в доках его нет.
+OPENCODE_TEMPERATURE=0
+OPENCODE_REASONING_EFFORT=low
+OPENCODE_CHUNK_MAX_CHARS=40000
+
 NVIDIA_MODEL=deepseek-ai/deepseek-v4.1-flash
 NVIDIA_TEMPERATURE=0
 NVIDIA_REASONING_EFFORT=low
 NVIDIA_CHUNK_MAX_CHARS=40000
+
+
+OPENROUTER_MODEL=qwen/qwen3.8-flash
+
+LLM_PROVIDER=opencode
+
+OPENCODE_MODEL=deepseek-v4.1-flash

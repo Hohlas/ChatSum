@@ -173,6 +173,8 @@ def main():
     test_topic_command_routing()
     test_topic_schedule_helpers()
     test_topic_dispatch()
+    test_model_choice_commands()
+    test_model_command_flow()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILED: {FAILURES}")
@@ -2820,13 +2822,15 @@ def test_telegraph_part_nav():
     check('nav: единственная часть — без ссылок', b(body, footer) == body + footer,
           repr(b(body, footer)))
     only_prev = b(body, footer, prev_part=(2, 'https://telegra.ph/P2'))
-    check('nav: назад сверху', only_prev.startswith('[← Часть 2](https://telegra.ph/P2)\n\n'), only_prev)
+    check('nav: назад сверху, жирным заглавными',
+          only_prev.startswith('**[← ЧАСТЬ 2](https://telegra.ph/P2)**\n\n'), only_prev)
     check('nav: без следующей — внизу пусто', '→' not in only_prev, only_prev)
     both = b(body, footer, prev_part=(2, 'https://telegra.ph/P2'),
              next_part=(4, 'https://telegra.ph/P4'))
-    check('nav: вперёд внизу', '\n[Часть 4 →](https://telegra.ph/P4)\n' in both, both)
+    check('nav: вперёд внизу отдельным абзацем',
+          '\n\n**[ЧАСТЬ 4 →](https://telegra.ph/P4)**\n' in both, both)
     check('nav: порядок назад-тело-вперёд-подпись',
-          both.index('Часть 2') < both.index('💡') < both.index('Часть 4') < both.index('created by'),
+          both.index('ЧАСТЬ 2') < both.index('💡') < both.index('ЧАСТЬ 4') < both.index('created by'),
           both)
 
     check('path: из адреса страницы', bot.telegraph_path('https://telegra.ph/CHast-1-10-27')
@@ -2837,7 +2841,12 @@ def test_telegraph_part_nav():
     check('nav: обе ссылки выжили санитарку',
           html.count('href="https://telegra.ph/') == 2, html)
     check('nav: ссылки до и после тела',
-          html.index('← Часть 2') < html.index('<h3') < html.index('Часть 4 →'), html)
+          html.index('ЧАСТЬ 2') < html.index('<h3') < html.index('ЧАСТЬ 4'), html)
+    check('nav: на странице ссылки жирные и отдельными абзацами',
+          html.count('<b><a href="https://telegra.ph/') == 2
+          and '<p><b><a href="https://telegra.ph/P2">← ЧАСТЬ 2</a></b></p>' in html
+          and '<p><b><a href="https://telegra.ph/P4">ЧАСТЬ 4 →</a></b></p>' in html,
+          html)
 
 
 def test_html_report_spoilers():
@@ -3986,6 +3995,265 @@ def test_topic_dispatch():
     finally:
         (bot.telegram_client, bot.topic_command_context, bot.process_chat_command,
          bot._schedule_list_text) = saved
+
+
+def test_model_choice_commands():
+    """Команда /model: список с номерами, разбор номера и применение выбора.
+
+    Проверяет и подпись списка, и настоящую запись в MODEL_CONFIG.txt на
+    временном файле (боевой файл не трогаем).
+    """
+    # 1. Каталог выбора: три модели владельца, порядок = номера.
+    check('model: три позиции в списке', len(bot.MODEL_CHOICES) == 3, bot.MODEL_CHOICES)
+    check('model: №1 — Qwen через OpenRouter',
+          bot.MODEL_CHOICES[0][:2] == ('openrouter', 'qwen/qwen3.8-flash'),
+          bot.MODEL_CHOICES[0])
+    check('model: №2 — DeepSeek через OpenCode Go',
+          bot.MODEL_CHOICES[1][:2] == ('opencode', 'deepseek-v4.1-flash'),
+          bot.MODEL_CHOICES[1])
+    check('model: №3 — Gemini',
+          bot.MODEL_CHOICES[2][:2] == ('google', 'gemini-3.8-flash'),
+          bot.MODEL_CHOICES[2])
+
+    # 2. Текст списка: номера, провайдеры и отметка текущей модели.
+    menu = bot.format_model_menu('openrouter', 'qwen/qwen3.8-flash')
+    check('model: в списке есть «1. Qwen 3.8 Flash — OpenRouter»',
+          '1. Qwen 3.8 Flash — OpenRouter ✅' in menu, menu)
+    check('model: в списке есть DeepSeek через OpenCode Go',
+          '2. DeepSeek V4.1 Flash — OpenCode Go' in menu, menu)
+    check('model: в списке есть Gemini',
+          '3. Gemini 3.8 Flash — Google Gemini' in menu, menu)
+    check('model: подсказка про срок ожидания',
+          '5 минут' in menu, menu)
+    check('model: текущая модель названа', '`qwen/qwen3.8-flash`' in menu, menu)
+    other = bot.format_model_menu('google', 'gemini-3.8-flash')
+    check('model: отметка переезжает на выбранную строку',
+          '✅' in other.split('\n')[4] and '✅' not in other.split('\n')[2], other)
+
+    # 3. Разбор номера.
+    check('model: «1» → 1', bot.parse_model_choice('1') == 1, bot.parse_model_choice('1'))
+    check('model: « 3 » → 3', bot.parse_model_choice(' 3 ') == 3)
+    check('model: «4» вне списка → None', bot.parse_model_choice('4') is None)
+    check('model: «0» → None', bot.parse_model_choice('0') is None)
+    check('model: «1a» → None', bot.parse_model_choice('1a') is None)
+    check('model: пусто → None', bot.parse_model_choice('') is None)
+
+    # 4. Ожидание номера: только свой чат и только до дедлайна.
+    pending = {'chat_id': -100, 'expires_at': 100.0}
+    check('model: свой чат в срок — ждём', bot.model_choice_is_active(pending, -100, now=50.0))
+    check('model: чужой чат — не ждём', not bot.model_choice_is_active(pending, -200, now=50.0))
+    check('model: срок вышел — не ждём', not bot.model_choice_is_active(pending, -100, now=101.0))
+    check('model: пустое ожидание — не ждём', not bot.model_choice_is_active(None, -100, now=0))
+    check('model: ожидание не задано — не ждём',
+          not bot.model_choice_is_active(bot._MODEL_CHOICE_PENDING, -100))
+
+    # 5. Профиль Qwen и модели OpenCode в get_model_generation_config.
+    #    Чанк из MODEL_CONFIG.txt (OPENROUTER_/OPENCODE_CHUNK_MAX_CHARS) важнее
+    #    профиля, поэтому здесь эти переопределения временно очищены.
+    saved_provider = bot.LLM_PROVIDER
+    saved_chunks = (bot.OPENROUTER_CHUNK_MAX_CHARS, bot.OPENCODE_CHUNK_MAX_CHARS)
+    try:
+        bot.OPENROUTER_CHUNK_MAX_CHARS = ''
+        qwen = bot.get_model_generation_config('qwen/qwen3.8-flash', provider='openrouter')
+        check('qwen: окно 1M', qwen['context_limit_tokens'] == 1000000, qwen)
+        check('qwen: выход 65536', qwen['output_max_tokens'] == 65536, qwen)
+        check('qwen: чанк 100K', qwen['chunk_max_chars'] == 100000, qwen)
+        bot.OPENCODE_CHUNK_MAX_CHARS = ''
+        ds = bot.get_model_generation_config('deepseek-v4.1-flash', provider='opencode')
+        check('deepseek: чанк 60K из профиля', ds['chunk_max_chars'] == 60000, ds)
+        check('deepseek: выход 16384', ds['output_max_tokens'] == 16384, ds)
+    finally:
+        bot.LLM_PROVIDER = saved_provider
+        bot.OPENROUTER_CHUNK_MAX_CHARS, bot.OPENCODE_CHUNK_MAX_CHARS = saved_chunks
+
+    # 6. Настоящий путь /model на временном конфиге: провайдер + модель в файл,
+    #    глобалы перечитаны.
+    path = '/tmp/opencode/test_model_choice_cfg.txt'
+    keys = ('LLM_PROVIDER', 'CURRENT_MODEL', 'USE_REASONING', 'USE_HTML_EXPORT',
+            'MODEL_CONFIG_FILE', 'GEMINI_DEFAULT_MODEL', 'OPENROUTER_DEFAULT_MODEL',
+            'NVIDIA_DEFAULT_MODEL', 'OPENCODE_DEFAULT_MODEL')
+    snap = {k: getattr(bot, k) for k in keys}
+    gkeys = ('GEMINI_TEMPERATURE', 'OPENROUTER_TEMPERATURE', 'OPENCODE_TEMPERATURE')
+    gsnap = {k: getattr(bot, k) for k in gkeys}
+    try:
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write('LLM_PROVIDER=google\n'
+                     'GEMINI_MODEL=gemini-3.8-flash\n'
+                     'OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free\n'
+                     'OPENCODE_MODEL=\n'
+                     'OPENCODE_REASONING_EFFORT=low\n'
+                     'OPENCODE_CHUNK_MAX_CHARS=40000\n')
+        bot.MODEL_CONFIG_FILE = path
+        new_model = bot.apply_model_selection('opencode', 'deepseek-v4.1-flash')
+        text = open(path, encoding='utf-8').read()
+        check('model: выбор применён — активная модель DeepSeek',
+              new_model == 'deepseek-v4.1-flash' and bot.CURRENT_MODEL == new_model,
+              (new_model, bot.CURRENT_MODEL))
+        check('model: провайдер переключён', bot.LLM_PROVIDER == 'opencode',
+              bot.LLM_PROVIDER)
+        check('model: OPENCODE_MODEL записан',
+              'OPENCODE_MODEL=deepseek-v4.1-flash' in text, text)
+        check('model: чужой провайдер не тронут',
+              'OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free' in text, text)
+        check('model: ровно одна строка LLM_PROVIDER',
+              text.count('LLM_PROVIDER=') == 1, text)
+
+        # Повторный выбор другой модели: строки не плодятся.
+        bot.apply_model_selection('google', 'gemini-3.8-flash')
+        text2 = open(path, encoding='utf-8').read()
+        check('model: повторный выбор — одна строка LLM_PROVIDER',
+              text2.count('LLM_PROVIDER=') == 1, text2)
+        check('model: повторный выбор — Gemini активен',
+              bot.LLM_PROVIDER == 'google' and bot.CURRENT_MODEL == 'gemini-3.8-flash',
+              (bot.LLM_PROVIDER, bot.CURRENT_MODEL))
+        check('model: правка не съела OPENCODE_MODEL',
+              'OPENCODE_MODEL=deepseek-v4.1-flash' in text2, text2)
+
+        # OPENCODE_* из файла доходят до глобалов.
+        check('opencode: effort из файла', bot.OPENCODE_REASONING_EFFORT == 'low',
+              bot.OPENCODE_REASONING_EFFORT)
+        check('opencode: чанк из файла', bot.OPENCODE_CHUNK_MAX_CHARS == '40000',
+              bot.OPENCODE_CHUNK_MAX_CHARS)
+    finally:
+        for k, v in snap.items():
+            setattr(bot, k, v)
+        for k, v in gsnap.items():
+            setattr(bot, k, v)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    # 7. Клиент OpenCode Go: без x-opencode-session шлюз отвечает 400
+    #    MissingSessionID (проверено живым запросом 27.10), поэтому заголовок
+    #    обязан быть в клиенте, а не только в документации.
+    headers = dict(bot.opencode_client.default_headers or {})
+    check('opencode: в клиенте есть x-opencode-session',
+          bool(headers.get('x-opencode-session')), headers)
+    check('opencode: клиент называет себя своим user-agent',
+          str(headers.get('user-agent', '')).startswith('ChatSumBot/'), headers)
+    check('opencode: адрес шлюза — Go-инференс',
+          str(bot.opencode_client.base_url).startswith(
+              'https://opencode.ai/inference/go/openai/v1'),
+          bot.opencode_client.base_url)
+
+
+def test_model_command_flow():
+    """Сценарий /model: список → номер в том же чате → переключение.
+
+    Файл конфигурации — временный; Telegram-клиент подменён, сети нет.
+    """
+    from types import SimpleNamespace as NS
+
+    posted, deleted = [], []
+
+    class Event:
+        def __init__(self, text, number=None, chat_id=-1000000000123):
+            self.raw_text = text
+            self.chat_id = chat_id
+            self.id = 5
+            self.reply_to = None
+            self._number = number
+            self.pattern_match = NS(group=lambda i: self._number)
+
+        async def get_chat(self):
+            return NS(title='Проверка')
+
+        async def delete(self):
+            deleted.append(self.raw_text)
+
+    class Client:
+        async def send_message(self, dest, text, reply_to=None):
+            posted.append((dest, text))
+
+    path = '/tmp/opencode/test_model_flow_cfg.txt'
+    keys = ('LLM_PROVIDER', 'CURRENT_MODEL', 'MODEL_CONFIG_FILE',
+            'GEMINI_DEFAULT_MODEL', 'OPENROUTER_DEFAULT_MODEL',
+            'OPENCODE_DEFAULT_MODEL', 'NVIDIA_DEFAULT_MODEL')
+    snap = {k: getattr(bot, k) for k in keys}
+    # Провайдер на входе — из живого MODEL_CONFIG.txt: он может быть любым
+    # (бот пишет туда выбор командой /model), привязываться к 'google' нельзя.
+    initial_provider = bot.LLM_PROVIDER
+    saved = (bot.telegram_client, bot._MODEL_CHOICE_PENDING)
+    loop = asyncio.get_event_loop()
+    chat_id = -1000000000123
+    try:
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write('LLM_PROVIDER=google\n'
+                     'GEMINI_MODEL=gemini-3.8-flash\n'
+                     'OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free\n'
+                     'OPENCODE_MODEL=\n')
+        bot.MODEL_CONFIG_FILE = path
+        bot.telegram_client = Client()
+        bot._MODEL_CHOICE_PENDING = {'chat_id': None, 'expires_at': 0.0}
+
+        # 1. /model без номера: список ушёл в тот же чат, ожидание включено.
+        with _quiet():
+            loop.run_until_complete(bot.handle_model_command(Event('/model')))
+        check('flow: список отправлен в чат команды',
+              bool(posted) and posted[0][0] == chat_id, posted)
+        check('flow: в списке все три модели',
+              all(x in posted[0][1] for x in ('1. Qwen 3.8 Flash', '2. DeepSeek',
+                                              '3. Gemini 3.8 Flash')), posted[0][1])
+        check('flow: команда /model удалена', deleted == ['/model'], deleted)
+        check('flow: ожидание номера включено',
+              bot._MODEL_CHOICE_PENDING['chat_id'] == chat_id,
+              bot._MODEL_CHOICE_PENDING)
+
+        # 2. Цифра в чужом чате ничего не меняет.
+        posted.clear()
+        with _quiet():
+            loop.run_until_complete(
+                bot.handle_model_choice_number(Event('2', chat_id=-1000000000999)))
+        check('flow: цифра в чужом чате — тишина', posted == [] and deleted == ['/model'],
+              (posted, deleted))
+        check('flow: провайдер не сменился', bot.LLM_PROVIDER == initial_provider,
+              (bot.LLM_PROVIDER, initial_provider))
+
+        # 3. Цифра в том же чате: переключение и подтверждение.
+        with _quiet():
+            loop.run_until_complete(bot.handle_model_choice_number(Event('2')))
+        check('flow: №2 — провайдер opencode', bot.LLM_PROVIDER == 'opencode',
+              bot.LLM_PROVIDER)
+        check('flow: №2 — модель DeepSeek', bot.CURRENT_MODEL == 'deepseek-v4.1-flash',
+              bot.CURRENT_MODEL)
+        check('flow: подтверждение с названием модели',
+              bool(posted) and 'DeepSeek V4.1 Flash' in posted[0][1], posted)
+        check('flow: цифра удалена', deleted == ['/model', '2'], deleted)
+        check('flow: ожидание сброшено',
+              bot._MODEL_CHOICE_PENDING['chat_id'] is None, bot._MODEL_CHOICE_PENDING)
+        text = open(path, encoding='utf-8').read()
+        check('flow: запись в файл — провайдер и модель',
+              'LLM_PROVIDER=opencode' in text and 'OPENCODE_MODEL=deepseek-v4.1-flash' in text,
+              text)
+
+        # 4. /model 1 выбирает сразу, без ожидания.
+        posted.clear()
+        with _quiet():
+            loop.run_until_complete(bot.handle_model_command(Event('/model 1', number='1')))
+        check('flow: /model 1 — Qwen без ожидания',
+              bot.LLM_PROVIDER == 'openrouter' and bot.CURRENT_MODEL == 'qwen/qwen3.8-flash',
+              (bot.LLM_PROVIDER, bot.CURRENT_MODEL))
+        check('flow: /model 1 — подтверждение', bool(posted) and 'Qwen 3.8 Flash' in posted[0][1],
+              posted)
+        check('flow: /model 1 не включает ожидание',
+              bot._MODEL_CHOICE_PENDING['chat_id'] is None, bot._MODEL_CHOICE_PENDING)
+
+        # 5. Номер вне диапазона — предупреждение, без переключения.
+        posted.clear()
+        with _quiet():
+            loop.run_until_complete(bot.handle_model_command(Event('/model 9', number='9')))
+        check('flow: №9 — предупреждение', bool(posted) and 'от 1 до 3' in posted[0][1], posted)
+        check('flow: №9 — провайдер прежний', bot.LLM_PROVIDER == 'openrouter',
+              bot.LLM_PROVIDER)
+    finally:
+        (bot.telegram_client, bot._MODEL_CHOICE_PENDING) = saved
+        for k, v in snap.items():
+            setattr(bot, k, v)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def _now_utc():

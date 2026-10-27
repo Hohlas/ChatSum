@@ -11,6 +11,7 @@ from telethon.sessions import StringSession
 from openai import AsyncOpenAI, AuthenticationError, APIConnectionError, APIStatusError
 from dotenv import load_dotenv
 import json
+import uuid
 from datetime import datetime, timedelta, timezone
 import httpx
 from telegraph import Telegraph
@@ -77,10 +78,12 @@ def validate_config():
     ]
     openrouter_key = os.getenv('OPENROUTER_API_KEY', '').strip()
     nvidia_key = os.getenv('NVIDIA_API_KEY', '').strip()
+    opencode_key = os.getenv('OPENCODE_GO_API_KEY', '').strip()
     llm_model = (
         os.getenv('GEMINI_MODEL', '').strip()
         or os.getenv('OPENROUTER_MODEL', '').strip()
         or os.getenv('NVIDIA_MODEL', '').strip()
+        or os.getenv('OPENCODE_MODEL', '').strip()
         or os.getenv('MODEL', '').strip()
     )
     if not llm_model:
@@ -100,7 +103,8 @@ def validate_config():
                         continue
                     k, v = s.split('=', 1)
                     if k.strip().upper() in ('MODEL', 'GEMINI_MODEL',
-                                             'OPENROUTER_MODEL', 'NVIDIA_MODEL'):
+                                             'OPENROUTER_MODEL', 'NVIDIA_MODEL',
+                                             'OPENCODE_MODEL'):
                         v = v.split('#', 1)[0].strip()
                         if v:
                             llm_model = v
@@ -136,17 +140,18 @@ def validate_config():
     elif not phone.startswith('+'):
         errors.append("TELEGRAM_PHONE должен начинаться с '+' (например, +79001234567)")
     
-    # Проверка LLM-ключей: годится любой провайдер (google / openrouter / nvidia).
+    # Проверка LLM-ключей: годится любой провайдер (google / openrouter / nvidia / opencode).
     # private.txt хранит только ключи; параметры модели — в MODEL_CONFIG.txt.
     valid_google_keys = [k for k in ([google_key] + extra_google_keys + bundle_google_keys) if k and k not in placeholders]
     has_llm_key = bool(valid_google_keys or (openrouter_key and openrouter_key not in placeholders)
-                       or (nvidia_key and nvidia_key not in placeholders))
+                       or (nvidia_key and nvidia_key not in placeholders)
+                       or (opencode_key and opencode_key not in placeholders))
     if not has_llm_key:
-        errors.append("Не найден ни один валидный ключ: GOOGLE_API_KEY(N/KEYS) / OPENROUTER_API_KEY / NVIDIA_API_KEY")
+        errors.append("Не найден ни один валидный ключ: GOOGLE_API_KEY(N/KEYS) / OPENROUTER_API_KEY / NVIDIA_API_KEY / OPENCODE_GO_API_KEY")
     
     # Проверка модели (любой провайдер)
     if not llm_model or llm_model in placeholders:
-        errors.append("Модель не задана: нужен GEMINI_MODEL / OPENROUTER_MODEL / NVIDIA_MODEL (в MODEL_CONFIG.txt)")
+        errors.append("Модель не задана: нужен GEMINI_MODEL / OPENROUTER_MODEL / NVIDIA_MODEL / OPENCODE_MODEL (в MODEL_CONFIG.txt)")
     
     return errors
 
@@ -256,12 +261,17 @@ def load_env_config():
 def _check_llm_key_chars():
     """Проверяет ASCII у ключей активного провайдера (иначе exit).
 
-    Google: все ключи круга. OpenRouter/NVIDIA: одиночный ключ.
+    Google: все ключи круга. OpenRouter/NVIDIA/OpenCode: одиночный ключ.
     Имя историческое-обёртка _check_google_key_chars оставлена ниже.
     """
-    if LLM_PROVIDER in ('openrouter', 'nvidia'):
+    single_keys = {
+        'openrouter': OPENROUTER_API_KEY,
+        'nvidia': NVIDIA_API_KEY,
+        'opencode': OPENCODE_API_KEY,
+    }
+    if LLM_PROVIDER in single_keys:
         label = provider_display_name()
-        key = OPENROUTER_API_KEY if LLM_PROVIDER == 'openrouter' else NVIDIA_API_KEY
+        key = single_keys[LLM_PROVIDER]
         print(f"🔑 Проверка ключа {label}: {mask_api_key(key)} (длина {len(key)} символов)")
         try:
             (key or '').encode('ascii')
@@ -321,7 +331,10 @@ if RESULTS_DESTINATION != 'me':
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '').strip()
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '').strip()
 NVIDIA_API_KEY = os.getenv('NVIDIA_API_KEY', '').strip()
-ALLOWED_LLM_PROVIDERS = ('google', 'openrouter', 'nvidia')
+# OpenCode Go — подписка opencode.ai (Console → API key). Ключ называется
+# OPENCODE_GO_API_KEY и живёт в private.txt рядом с остальными.
+OPENCODE_API_KEY = os.getenv('OPENCODE_GO_API_KEY', '').strip()
+ALLOWED_LLM_PROVIDERS = ('google', 'openrouter', 'nvidia', 'opencode')
 LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'google').strip().lower() or 'google'
 if LLM_PROVIDER not in ALLOWED_LLM_PROVIDERS:
     print(f"⚠️ Неверное значение LLM_PROVIDER={LLM_PROVIDER}, использую google")
@@ -330,15 +343,22 @@ PROVIDER_BASE_URL = {
     'google': 'https://generativelanguage.googleapis.com/v1beta/openai/',
     'openrouter': 'https://openrouter.ai/api/v1',
     'nvidia': 'https://integrate.api.nvidia.com/v1',
+    'opencode': 'https://opencode.ai/inference/go/openai/v1',
 }
 PROVIDER_DISPLAY = {
     'google': 'Google Gemini',
     'openrouter': 'OpenRouter',
     'nvidia': 'NVIDIA',
+    'opencode': 'OpenCode Go',
 }
+# OpenCode Go требует заголовок x-opencode-session на каждом запросе: без него
+# шлюз отвечает 400 MissingSessionID (проверено живым запросом 27.10). Один
+# идентификатор на процесс — это и есть «одна беседа» в их терминах.
+OPENCODE_SESSION_ID = str(uuid.uuid4())
 GEMINI_DEFAULT_MODEL = os.getenv('GEMINI_MODEL', '').strip()
 OPENROUTER_DEFAULT_MODEL = os.getenv('OPENROUTER_MODEL', '').strip()
 NVIDIA_DEFAULT_MODEL = os.getenv('NVIDIA_MODEL', '').strip()
+OPENCODE_DEFAULT_MODEL = os.getenv('OPENCODE_MODEL', '').strip()
 if not GEMINI_DEFAULT_MODEL:
     _fallback_model = os.getenv('MODEL', '').strip()
     if _fallback_model:
@@ -352,6 +372,9 @@ OPENROUTER_TEMPERATURE_STR = os.getenv('OPENROUTER_TEMPERATURE', '0').strip()
 NVIDIA_REASONING_EFFORT = os.getenv('NVIDIA_REASONING_EFFORT', '').strip().lower()
 NVIDIA_CHUNK_MAX_CHARS = os.getenv('NVIDIA_CHUNK_MAX_CHARS', '').strip()
 NVIDIA_TEMPERATURE_STR = os.getenv('NVIDIA_TEMPERATURE', '0').strip()
+OPENCODE_REASONING_EFFORT = os.getenv('OPENCODE_REASONING_EFFORT', '').strip().lower()
+OPENCODE_CHUNK_MAX_CHARS = os.getenv('OPENCODE_CHUNK_MAX_CHARS', '').strip()
+OPENCODE_TEMPERATURE_STR = os.getenv('OPENCODE_TEMPERATURE', '0').strip()
 try:
     GEMINI_TEMPERATURE = float(GEMINI_TEMPERATURE_STR)
 except ValueError:
@@ -367,6 +390,11 @@ try:
 except ValueError:
     print(f"⚠️ Неверное значение NVIDIA_TEMPERATURE={NVIDIA_TEMPERATURE_STR}, использую 0")
     NVIDIA_TEMPERATURE = 0.0
+try:
+    OPENCODE_TEMPERATURE = float(OPENCODE_TEMPERATURE_STR)
+except ValueError:
+    print(f"⚠️ Неверное значение OPENCODE_TEMPERATURE={OPENCODE_TEMPERATURE_STR}, использую 0")
+    OPENCODE_TEMPERATURE = 0.0
 
 ALLOWED_REASONING_EFFORTS = {'none', 'low', 'medium', 'high'}
 
@@ -387,6 +415,8 @@ def provider_temperature(provider=None):
         return OPENROUTER_TEMPERATURE
     if p == 'nvidia':
         return NVIDIA_TEMPERATURE
+    if p == 'opencode':
+        return OPENCODE_TEMPERATURE
     return GEMINI_TEMPERATURE
 
 
@@ -394,8 +424,99 @@ def provider_display_name(provider=None):
     """Человекочитаемое имя провайдера для логов/TG. Чистая."""
     return PROVIDER_DISPLAY.get(provider or LLM_PROVIDER, str(provider or LLM_PROVIDER))
 
-if not load_google_api_keys() and not OPENROUTER_API_KEY and not NVIDIA_API_KEY:
-    print("⚠️  ВНИМАНИЕ: Не найден ни один LLM-ключ (GOOGLE_API_KEY* / OPENROUTER_API_KEY / NVIDIA_API_KEY)!")
+
+# Выбор модели для команды /model: (провайдер, модель, подпись). Порядок —
+# это порядок цифр в сообщении. Верхние три — рабочий набор владельца: Qwen
+# через подписку OpenRouter, DeepSeek через подписку OpenCode Go, Gemini.
+# Остальные модели провайдеров остаются доступны через /set_model.
+MODEL_CHOICES = (
+    ('openrouter', 'qwen/qwen3.8-flash', 'Qwen 3.8 Flash'),
+    ('opencode', 'deepseek-v4.1-flash', 'DeepSeek V4.1 Flash'),
+    ('google', 'gemini-3.8-flash', 'Gemini 3.8 Flash'),
+)
+
+# Сколько ждём номер после списка /model. Ожидание живёт в памяти процесса:
+# перезапуск его сбрасывает, ничего страшного.
+MODEL_CHOICE_TTL_SEC = 300
+
+
+def format_model_menu(current_provider=None, current_model=None):
+    """Нумерованный список моделей для /model. Чистая (читает два глобала)."""
+    cp = current_provider or LLM_PROVIDER
+    cm = CURRENT_MODEL if current_model is None else current_model
+    lines = ['🤖 **Выберите модель для анализа**', '']
+    for number, (provider, model, label) in enumerate(MODEL_CHOICES, 1):
+        mark = ' ✅' if provider == cp and model == cm else ''
+        lines.append(f'{number}. {label} — {provider_display_name(provider)}{mark}')
+    lines += [
+        '',
+        f'Отправьте номер (1–{len(MODEL_CHOICES)}) в этот чат '
+        f'в течение {MODEL_CHOICE_TTL_SEC // 60} минут.',
+        f'Сейчас: `{cm or "не задана"}` ({provider_display_name(cp)}).',
+    ]
+    return '\n'.join(lines)
+
+
+def parse_model_choice(text):
+    """'2' → номер из MODEL_CHOICES; иначе None. Чистая."""
+    s = str(text or '').strip()
+    if not s.isdigit():
+        return None
+    number = int(s)
+    return number if 1 <= number <= len(MODEL_CHOICES) else None
+
+
+def model_choice_is_active(pending, chat_id, now=None):
+    """Ждёт ли бот номер именно в этом чате и не истекло ли ожидание. Чистая."""
+    if not pending or pending.get('chat_id') is None:
+        return False
+    if now is None:
+        now = time.monotonic()
+    return chat_id == pending['chat_id'] and now <= pending['expires_at']
+
+
+def _persist_llm_provider(filename, provider):
+    """Пишет строку LLM_PROVIDER=<provider> в MODEL_CONFIG.txt, остальное не трогает."""
+    try:
+        lines = []
+        if os.path.exists(filename):
+            with open(filename, 'r', encoding='utf-8') as fh:
+                lines = fh.read().splitlines()
+        kept = [
+            line for line in lines
+            if not (line.strip() and not line.strip().startswith('#') and '=' in line
+                    and line.strip().split('=', 1)[0].strip().upper()
+                    in ('LLM_PROVIDER', 'PROVIDER', 'ACTIVE_PROVIDER'))
+        ]
+        if kept and kept[-1].strip() != '':
+            kept.append('')
+        kept.append(f'LLM_PROVIDER={provider}')
+        with open(filename, 'w', encoding='utf-8') as fh:
+            fh.write('\n'.join(kept) + '\n')
+        return True
+    except Exception as e:
+        print(f"⚠️ Не удалось записать LLM_PROVIDER в {filename}: {e}")
+        return False
+
+
+def apply_model_selection(provider, model=None):
+    """Ставит провайдера (и при желании его модель), сохраняет в MODEL_CONFIG.txt.
+
+    Вызывать под config_lock. Возвращает модель, которая стала активной.
+    """
+    global LLM_PROVIDER, CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT
+    _persist_llm_provider(MODEL_CONFIG_FILE, provider)
+    LLM_PROVIDER = provider
+    if model:
+        save_model_config(MODEL_CONFIG_FILE, model, USE_REASONING, USE_HTML_EXPORT,
+                          provider=provider)
+    CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT = load_model_config(MODEL_CONFIG_FILE)
+    return CURRENT_MODEL
+
+if (not load_google_api_keys() and not OPENROUTER_API_KEY
+        and not NVIDIA_API_KEY and not OPENCODE_API_KEY):
+    print("⚠️  ВНИМАНИЕ: Не найден ни один LLM-ключ (GOOGLE_API_KEY* / OPENROUTER_API_KEY / "
+          "NVIDIA_API_KEY / OPENCODE_GO_API_KEY)!")
 
 # Конфигурация фильтрации сообщений
 MIN_MESSAGE_LENGTH = 3  # Минимальная длина сообщения (символов)
@@ -701,6 +822,18 @@ def get_model_generation_config(model_name, provider=None):
             'chunk_max_chars': 60000,
         })
         config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])
+    elif model_name in ('qwen/qwen3.8-flash', 'qwen/qwen3.8-flash:free'):
+        # Qwen 3.8 Flash: контекст 1 000 000, выход до 131 072. Источники:
+        # справка каталога моделей (страница модели OpenRouter лимиты не
+        # печатает, там только список полей). Ответ ограничен 65 536 — Qwen
+        # думает по умолчанию, и рассуждения идут из того же бюджета, что
+        # ответ: половина потолка оставляет место на оба.
+        config.update({
+            'context_limit_tokens': 1000000,
+            'output_max_tokens': 65536,
+            'chunk_max_chars': 100000,
+        })
+        config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])
     elif model_name in ('deepseek-ai/deepseek-v4.1-flash', 'deepseek-v4.1-flash'):
         config.update({
             'context_limit_tokens': 128000,
@@ -719,6 +852,8 @@ def get_model_generation_config(model_name, provider=None):
         _effort, _chunk, _prefix = OPENROUTER_REASONING_EFFORT, OPENROUTER_CHUNK_MAX_CHARS, 'OPENROUTER'
     elif active_provider == 'nvidia':
         _effort, _chunk, _prefix = NVIDIA_REASONING_EFFORT, NVIDIA_CHUNK_MAX_CHARS, 'NVIDIA'
+    elif active_provider == 'opencode':
+        _effort, _chunk, _prefix = OPENCODE_REASONING_EFFORT, OPENCODE_CHUNK_MAX_CHARS, 'OPENCODE'
     else:
         _effort, _chunk, _prefix = GEMINI_REASONING_EFFORT, GEMINI_CHUNK_MAX_CHARS, 'GEMINI'
     if _effort in ALLOWED_REASONING_EFFORTS:
@@ -1091,12 +1226,12 @@ async def execute_gemini_request(request_params, notify=None):
     Выполняет запрос к LLM активного провайдера (имя историческое: тесты
     и вызыватели используют execute_gemini_request).
     google: retry при временных сбоях + ротация ключей при квоте/доступе.
-    openrouter/nvidia: один ключ — та же обработка 503/пауз/ретраев, но без
-    обхода ключей (attempts=1, rotate не вызывается).
+    openrouter/nvidia/opencode: один ключ — та же обработка 503/пауз/ретраев,
+    но без обхода ключей (attempts=1, rotate не вызывается).
     notify: async fn(text) — краткая диагностика в канал (503-сон,
     проигрыш круга). None — тишина.
     """
-    if LLM_PROVIDER in ('openrouter', 'nvidia'):
+    if LLM_PROVIDER in ('openrouter', 'nvidia', 'opencode'):
         return await _execute_single_key_request(request_params)
     last_error = None
     attempts = max(1, len(GOOGLE_API_KEYS))
@@ -1189,7 +1324,7 @@ async def execute_gemini_request(request_params, notify=None):
 
 
 async def _execute_single_key_request(request_params, notify=None):
-    """Запрос для openrouter/nvidia: один ключ, без ротации.
+    """Запрос для openrouter/nvidia/opencode: один ключ, без ротации.
 
     503/UNAVAILABLE — пауза SERVER_OVERLOAD_PAUSE_SEC и выход наружу
     (повтор делает внешний цикл). 429-квота — сразу наружу без сна (сухой
@@ -1401,10 +1536,12 @@ def load_model_config(filename):
         OPENROUTER_CHUNK_MAX_CHARS — параметры OpenRouter
       NVIDIA_MODEL / NVIDIA_TEMPERATURE / NVIDIA_REASONING_EFFORT /
         NVIDIA_CHUNK_MAX_CHARS — параметры NVIDIA
+      OPENCODE_MODEL / OPENCODE_TEMPERATURE / OPENCODE_REASONING_EFFORT /
+        OPENCODE_CHUNK_MAX_CHARS — параметры OpenCode Go
       MODEL / TEMPERATURE / REASONING_EFFORT / CHUNK_MAX_CHARS — общее
         переопределение для активного провайдера (обратная совместимость).
       USE_REASONING / USE_HTML_EXPORT — наследие, kept.
-    private.txt хранит только ключи (GOOGLE*/OPENROUTER/NVIDIA + Telegram).
+    private.txt хранит только ключи (GOOGLE*/OPENROUTER/NVIDIA/OPENCODE_GO + Telegram).
 
     Args:
         filename: Путь к файлу с конфигурацией модели
@@ -1419,11 +1556,14 @@ def load_model_config(filename):
     global OPENROUTER_TEMPERATURE, OPENROUTER_TEMPERATURE_STR
     global NVIDIA_DEFAULT_MODEL, NVIDIA_REASONING_EFFORT, NVIDIA_CHUNK_MAX_CHARS
     global NVIDIA_TEMPERATURE, NVIDIA_TEMPERATURE_STR
+    global OPENCODE_DEFAULT_MODEL, OPENCODE_REASONING_EFFORT, OPENCODE_CHUNK_MAX_CHARS
+    global OPENCODE_TEMPERATURE, OPENCODE_TEMPERATURE_STR
     # Активная модель = модель активного провайдера (фолбэк — env).
     _active_model_fallback = {
         'google': GEMINI_DEFAULT_MODEL,
         'openrouter': OPENROUTER_DEFAULT_MODEL,
         'nvidia': NVIDIA_DEFAULT_MODEL,
+        'opencode': OPENCODE_DEFAULT_MODEL,
     }.get(LLM_PROVIDER, GEMINI_DEFAULT_MODEL)
     default_model = _active_model_fallback
     default_reasoning = False
@@ -1431,7 +1571,8 @@ def load_model_config(filename):
 
     if not os.path.exists(filename):
         # Не выводим предупреждение, если модель уже задана в private.txt
-        if not (GEMINI_DEFAULT_MODEL or OPENROUTER_DEFAULT_MODEL or NVIDIA_DEFAULT_MODEL):
+        if not (GEMINI_DEFAULT_MODEL or OPENROUTER_DEFAULT_MODEL
+                or NVIDIA_DEFAULT_MODEL or OPENCODE_DEFAULT_MODEL):
             print(f"⚠️  Файл {filename} не найден и модель не задана")
         return default_model, default_reasoning, default_html_export
 
@@ -1467,12 +1608,15 @@ def load_model_config(filename):
                 if key in ('LLM_PROVIDER', 'PROVIDER', 'ACTIVE_PROVIDER'):
                     if value:
                         file_provider = value.strip().lower()
-                elif key in ('MODEL', 'GEMINI_MODEL', 'OPENROUTER_MODEL', 'NVIDIA_MODEL',
+                elif key in ('MODEL', 'GEMINI_MODEL', 'OPENROUTER_MODEL', 'NVIDIA_MODEL', 'OPENCODE_MODEL',
                              'TEMPERATURE', 'GEMINI_TEMPERATURE', 'OPENROUTER_TEMPERATURE', 'NVIDIA_TEMPERATURE',
+                             'OPENCODE_TEMPERATURE',
                              'REASONING_EFFORT', 'GEMINI_REASONING_EFFORT',
                              'OPENROUTER_REASONING_EFFORT', 'NVIDIA_REASONING_EFFORT',
+                             'OPENCODE_REASONING_EFFORT',
                              'CHUNK_MAX_CHARS', 'GEMINI_CHUNK_MAX_CHARS',
-                             'OPENROUTER_CHUNK_MAX_CHARS', 'NVIDIA_CHUNK_MAX_CHARS'):
+                             'OPENROUTER_CHUNK_MAX_CHARS', 'NVIDIA_CHUNK_MAX_CHARS',
+                             'OPENCODE_CHUNK_MAX_CHARS'):
                     if value:
                         vals[key] = value.strip() if 'REASONING' not in key and 'PROVIDER' not in key else value.strip().lower() if 'REASONING' in key else value.strip()
                         if key == 'REASONING_EFFORT':
@@ -1490,6 +1634,7 @@ def load_model_config(filename):
             global GEMINI_TEMPERATURE, GEMINI_TEMPERATURE_STR
             global OPENROUTER_TEMPERATURE, OPENROUTER_TEMPERATURE_STR
             global NVIDIA_TEMPERATURE, NVIDIA_TEMPERATURE_STR
+            global OPENCODE_TEMPERATURE, OPENCODE_TEMPERATURE_STR
             try:
                 parsed = float(raw)
             except (TypeError, ValueError):
@@ -1507,6 +1652,9 @@ def load_model_config(filename):
             elif prefix == 'NVIDIA':
                 NVIDIA_TEMPERATURE_STR = raw
                 NVIDIA_TEMPERATURE = parsed
+            elif prefix == 'OPENCODE':
+                OPENCODE_TEMPERATURE_STR = raw
+                OPENCODE_TEMPERATURE = parsed
 
         # Провайдер: файл важнее env.
         if file_provider:
@@ -1525,6 +1673,8 @@ def load_model_config(filename):
             OPENROUTER_DEFAULT_MODEL = vals['OPENROUTER_MODEL']
         if vals.get('NVIDIA_MODEL'):
             NVIDIA_DEFAULT_MODEL = vals['NVIDIA_MODEL']
+        if vals.get('OPENCODE_MODEL'):
+            OPENCODE_DEFAULT_MODEL = vals['OPENCODE_MODEL']
         # Параметры по провайдерам.
         # Effort — по присутствию ключа: пустое значение сбрасывает в ''
         # (дефолт модели, параметр не отправляем). Остальные — по значению.
@@ -1546,12 +1696,20 @@ def load_model_config(filename):
             NVIDIA_CHUNK_MAX_CHARS = vals['NVIDIA_CHUNK_MAX_CHARS']
         if vals.get('NVIDIA_TEMPERATURE'):
             _apply_temp(vals['NVIDIA_TEMPERATURE'], 'NVIDIA')
+        if 'OPENCODE_REASONING_EFFORT' in seen_keys:
+            OPENCODE_REASONING_EFFORT = vals.get('OPENCODE_REASONING_EFFORT', '')
+        if vals.get('OPENCODE_CHUNK_MAX_CHARS'):
+            OPENCODE_CHUNK_MAX_CHARS = vals['OPENCODE_CHUNK_MAX_CHARS']
+        if vals.get('OPENCODE_TEMPERATURE'):
+            _apply_temp(vals['OPENCODE_TEMPERATURE'], 'OPENCODE')
         # Общее переопределение для активного провайдера (обратная совместимость).
         if vals.get('MODEL'):
             if LLM_PROVIDER == 'openrouter':
                 OPENROUTER_DEFAULT_MODEL = vals['MODEL']
             elif LLM_PROVIDER == 'nvidia':
                 NVIDIA_DEFAULT_MODEL = vals['MODEL']
+            elif LLM_PROVIDER == 'opencode':
+                OPENCODE_DEFAULT_MODEL = vals['MODEL']
             else:
                 GEMINI_DEFAULT_MODEL = vals['MODEL']
         if file_effort_generic:
@@ -1559,6 +1717,8 @@ def load_model_config(filename):
                 OPENROUTER_REASONING_EFFORT = file_effort_generic
             elif LLM_PROVIDER == 'nvidia':
                 NVIDIA_REASONING_EFFORT = file_effort_generic
+            elif LLM_PROVIDER == 'opencode':
+                OPENCODE_REASONING_EFFORT = file_effort_generic
             else:
                 GEMINI_REASONING_EFFORT = file_effort_generic
         if file_chunk_generic:
@@ -1566,22 +1726,27 @@ def load_model_config(filename):
                 OPENROUTER_CHUNK_MAX_CHARS = file_chunk_generic
             elif LLM_PROVIDER == 'nvidia':
                 NVIDIA_CHUNK_MAX_CHARS = file_chunk_generic
+            elif LLM_PROVIDER == 'opencode':
+                OPENCODE_CHUNK_MAX_CHARS = file_chunk_generic
             else:
                 GEMINI_CHUNK_MAX_CHARS = file_chunk_generic
         if file_temp_generic is not None:
-            _apply_temp(file_temp_generic, {'google': 'GEMINI', 'openrouter': 'OPENROUTER', 'nvidia': 'NVIDIA'}[LLM_PROVIDER])
+            _apply_temp(file_temp_generic, {'google': 'GEMINI', 'openrouter': 'OPENROUTER',
+                                            'nvidia': 'NVIDIA', 'opencode': 'OPENCODE'}[LLM_PROVIDER])
 
         # Активная модель + флаг reasoning активного провайдера.
         _active_models = {
             'google': GEMINI_DEFAULT_MODEL,
             'openrouter': OPENROUTER_DEFAULT_MODEL,
             'nvidia': NVIDIA_DEFAULT_MODEL,
+            'opencode': OPENCODE_DEFAULT_MODEL,
         }
         default_model = _active_models.get(LLM_PROVIDER, GEMINI_DEFAULT_MODEL)
         _active_effort = {
             'google': GEMINI_REASONING_EFFORT,
             'openrouter': OPENROUTER_REASONING_EFFORT,
             'nvidia': NVIDIA_REASONING_EFFORT,
+            'opencode': OPENCODE_REASONING_EFFORT,
         }.get(LLM_PROVIDER, '')
         if _active_effort in ALLOWED_REASONING_EFFORTS or _active_effort == 'none':
             if _active_effort:
@@ -1619,7 +1784,7 @@ def save_model_config(filename, model, use_reasoning, use_html_export=True, prov
     if active_provider not in ALLOWED_LLM_PROVIDERS:
         active_provider = 'google'
     model_key = {'google': 'GEMINI_MODEL', 'openrouter': 'OPENROUTER_MODEL',
-                 'nvidia': 'NVIDIA_MODEL'}[active_provider]
+                 'nvidia': 'NVIDIA_MODEL', 'opencode': 'OPENCODE_MODEL'}[active_provider]
     try:
         existing = []
         if os.path.exists(filename):
@@ -1641,11 +1806,13 @@ def save_model_config(filename, model, use_reasoning, use_html_export=True, prov
         with open(filename, 'w', encoding='utf-8') as f:
             f.write('\n'.join(kept) + '\n')
         # Обновляем runtime-глобалы активного провайдера.
-        global GEMINI_DEFAULT_MODEL, OPENROUTER_DEFAULT_MODEL, NVIDIA_DEFAULT_MODEL, CURRENT_MODEL
+        global GEMINI_DEFAULT_MODEL, OPENROUTER_DEFAULT_MODEL, NVIDIA_DEFAULT_MODEL, OPENCODE_DEFAULT_MODEL, CURRENT_MODEL
         if active_provider == 'openrouter':
             OPENROUTER_DEFAULT_MODEL = model
         elif active_provider == 'nvidia':
             NVIDIA_DEFAULT_MODEL = model
+        elif active_provider == 'opencode':
+            OPENCODE_DEFAULT_MODEL = model
         else:
             GEMINI_DEFAULT_MODEL = model
         CURRENT_MODEL = model
@@ -1724,12 +1891,23 @@ def create_llm_client(provider, api_key):
     повторяет только наш код (паузы 10/20с, смена ключа) и внешний цикл
     (inbox «Попытка N/5» / due «провал N»). Иначе слои умножались: до 12
     наших вызовов × 3 попытки библиотеки.
+
+    OpenCode Go дополнительно требует x-opencode-session (иначе 400
+    MissingSessionID) и просит клиента называть себя своим user-agent —
+    оба заголовка шлём через default_headers.
     """
+    default_headers = None
+    if provider == 'opencode':
+        default_headers = {
+            'x-opencode-session': OPENCODE_SESSION_ID,
+            'user-agent': 'ChatSumBot/1.0 (+https://github.com/Hohlas/ChatSum)',
+        }
     return AsyncOpenAI(
         api_key=api_key or 'missing-key',
         base_url=PROVIDER_BASE_URL.get(provider, PROVIDER_BASE_URL['google']),
         http_client=http_client,
-        max_retries=0
+        max_retries=0,
+        default_headers=default_headers,
     )
 
 
@@ -1741,12 +1919,17 @@ def create_nvidia_client(api_key=None):
     return create_llm_client('nvidia', api_key or NVIDIA_API_KEY)
 
 
+def create_opencode_client(api_key=None):
+    return create_llm_client('opencode', api_key or OPENCODE_API_KEY)
+
+
 def _rebuild_llm_clients():
     """Пересоздать клиентов под текущие ключи/провайдер (после reload config)."""
-    global google_client, openrouter_client, nvidia_client
+    global google_client, openrouter_client, nvidia_client, opencode_client
     google_client = create_google_client(get_current_google_api_key())
     openrouter_client = create_openrouter_client()
     nvidia_client = create_nvidia_client()
+    opencode_client = create_opencode_client()
 
 
 def get_current_google_api_key():
@@ -1758,6 +1941,7 @@ def get_current_google_api_key():
 google_client = create_google_client(get_current_google_api_key())
 openrouter_client = create_openrouter_client()
 nvidia_client = create_nvidia_client()
+opencode_client = create_opencode_client()
 # MODEL_CONFIG.txt уже прочитан выше (до создания http_client rebuild
 # молча пропускался) — доводим CURRENT_MODEL/клиентов до файла.
 try:
@@ -1774,6 +1958,8 @@ def get_active_llm_client():
         return openrouter_client
     if LLM_PROVIDER == 'nvidia':
         return nvidia_client
+    if LLM_PROVIDER == 'opencode':
+        return opencode_client
     return google_client
 
 
@@ -1783,6 +1969,8 @@ def get_active_llm_key_masked():
         return mask_api_key(OPENROUTER_API_KEY)
     if LLM_PROVIDER == 'nvidia':
         return mask_api_key(NVIDIA_API_KEY)
+    if LLM_PROVIDER == 'opencode':
+        return mask_api_key(OPENCODE_API_KEY)
     return mask_api_key(get_current_google_api_key())
 
 
@@ -4418,10 +4606,12 @@ def build_part_page_content(part_content, footer, prev_part=None, next_part=None
 
     prev_part / next_part — пары (номер части, url) или None. Ссылка «назад»
     идёт в начало страницы, «вперёд» — в конец, перед подписью бота: так
-    последовательное чтение не требует возврата к списку ссылок.
+    последовательное чтение не требует возврата к списку ссылок. Ссылки —
+    жирным заглавными и отдельным абзацем (пустая строка с обеих сторон),
+    иначе теряются в тексте.
     """
-    top = f'[← Часть {prev_part[0]}]({prev_part[1]})\n\n' if prev_part else ''
-    bottom = f'\n[Часть {next_part[0]} →]({next_part[1]})\n' if next_part else ''
+    top = f'**[← ЧАСТЬ {prev_part[0]}]({prev_part[1]})**\n\n' if prev_part else ''
+    bottom = f'\n\n**[ЧАСТЬ {next_part[0]} →]({next_part[1]})**\n' if next_part else ''
     return f'{top}{part_content}{bottom}{footer}'
 
 
@@ -4915,7 +5105,8 @@ def model_display_label(model=None, effort=None):
     name = str(name).strip()
     if effort is None:
         effort = {'google': GEMINI_REASONING_EFFORT, 'openrouter': OPENROUTER_REASONING_EFFORT,
-                  'nvidia': NVIDIA_REASONING_EFFORT}.get(LLM_PROVIDER, '')
+                  'nvidia': NVIDIA_REASONING_EFFORT,
+                  'opencode': OPENCODE_REASONING_EFFORT}.get(LLM_PROVIDER, '')
     eff = (effort or '')
     eff = str(eff).strip().lower()
     if eff:
@@ -6256,7 +6447,8 @@ async def handle_config_command(event):
 `/add_priority username` - добавить в приоритетные
 `/remove_priority username` - убрать из приоритетных
 `/set_model model_name` - сменить модель AI (активного провайдера)
-`/set_provider google|openrouter|nvidia` - сменить провайдера
+`/set_provider google|openrouter|nvidia|opencode` - сменить провайдера
+`/model` - выбрать модель по номеру из списка
 
 **Обновление:**
 `/reload_config` - перезагрузить конфигурацию из файлов
@@ -6429,13 +6621,13 @@ async def handle_show_model_command(event):
     print(f"\n📥 Команда: /show_model | Чат: {chat_name}")
     export_mode = "HTML файлы 📄" if USE_HTML_EXPORT else "Telegraph 🌐"
     _efforts = {'google': GEMINI_REASONING_EFFORT, 'openrouter': OPENROUTER_REASONING_EFFORT,
-                'nvidia': NVIDIA_REASONING_EFFORT}
+                'nvidia': NVIDIA_REASONING_EFFORT, 'opencode': OPENCODE_REASONING_EFFORT}
     _temps = {'google': GEMINI_TEMPERATURE_STR, 'openrouter': OPENROUTER_TEMPERATURE_STR,
-              'nvidia': NVIDIA_TEMPERATURE_STR}
+              'nvidia': NVIDIA_TEMPERATURE_STR, 'opencode': OPENCODE_TEMPERATURE_STR}
     _chunks = {'google': GEMINI_CHUNK_MAX_CHARS, 'openrouter': OPENROUTER_CHUNK_MAX_CHARS,
-               'nvidia': NVIDIA_CHUNK_MAX_CHARS}
+               'nvidia': NVIDIA_CHUNK_MAX_CHARS, 'opencode': OPENCODE_CHUNK_MAX_CHARS}
     _models = {'google': GEMINI_DEFAULT_MODEL, 'openrouter': OPENROUTER_DEFAULT_MODEL,
-               'nvidia': NVIDIA_DEFAULT_MODEL}
+               'nvidia': NVIDIA_DEFAULT_MODEL, 'opencode': OPENCODE_DEFAULT_MODEL}
     text = f"""
 🤖 **Текущая модель для анализа**
 
@@ -6453,7 +6645,8 @@ async def handle_show_model_command(event):
 • google: `{_models['google'] or 'не задана'}`
 • openrouter: `{_models['openrouter'] or 'не задана'}`
 • nvidia: `{_models['nvidia'] or 'не задана'}`
-Переключение: `/set_provider google|openrouter|nvidia`, модель: `/set_model имя`.
+• opencode: `{_models['opencode'] or 'не задана'}`
+Выбор по номеру: `/model`. Точечно: `/set_provider {'|'.join(ALLOWED_LLM_PROVIDERS)}`, модель: `/set_model имя`.
 Параметры (MODEL/TEMPERATURE/REASONING_EFFORT/CHUNK_MAX_CHARS) — только в {MODEL_CONFIG_FILE}, ключи — только в private.txt.
 """
     
@@ -6494,7 +6687,7 @@ async def handle_set_model_command(event):
 
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/set_provider\s+(.+)'))
 async def handle_set_provider_command(event):
-    """Переключает LLM-провайдера: /set_provider google|openrouter|nvidia"""
+    """Переключает LLM-провайдера: /set_provider google|openrouter|nvidia|opencode"""
     global LLM_PROVIDER, CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT
     chat = await event.get_chat()
     chat_name = chat.title if hasattr(chat, 'title') else "Private"
@@ -6503,30 +6696,12 @@ async def handle_set_provider_command(event):
     norm = normalize_llm_provider(provider)
     if not norm:
         text = (f"⚠️ Неизвестный провайдер `{provider}`.\n\n"
-                f"Допустимые: `google`, `openrouter`, `nvidia`.\n"
+                f"Допустимые: {', '.join(f'`{p}`' for p in ALLOWED_LLM_PROVIDERS)}.\n"
                 f"Пример: `/set_provider openrouter`")
     else:
         async with config_lock:
             old = LLM_PROVIDER
-            LLM_PROVIDER = norm
-            # Дописываем LLM_PROVIDER в MODEL_CONFIG.txt, остальное не трогаем.
-            try:
-                _lines = []
-                if os.path.exists(MODEL_CONFIG_FILE):
-                    with open(MODEL_CONFIG_FILE, 'r', encoding='utf-8') as fh:
-                        _lines = fh.read().splitlines()
-                _kept = [ln for ln in _lines
-                         if ln.strip().split('=', 1)[0].strip().upper()
-                         not in ('LLM_PROVIDER', 'PROVIDER', 'ACTIVE_PROVIDER')
-                         or not ln.strip() or ln.strip().startswith('#') or '=' not in ln]
-                if _kept and _kept[-1].strip() != '':
-                    _kept.append('')
-                _kept.append(f"LLM_PROVIDER={norm}")
-                with open(MODEL_CONFIG_FILE, 'w', encoding='utf-8') as fh:
-                    fh.write('\n'.join(_kept) + '\n')
-            except Exception as e:
-                print(f"⚠️ Не удалось записать LLM_PROVIDER в {MODEL_CONFIG_FILE}: {e}")
-            CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT = load_model_config(MODEL_CONFIG_FILE)
+            apply_model_selection(norm)
             text = (f"✅ Провайдер изменён: **{old}** → **{norm}** ({provider_display_name()})\n\n"
                     f"Модель: `{CURRENT_MODEL}`\n"
                     f"Ключ: {get_active_llm_key_masked()}\n"
@@ -6535,6 +6710,92 @@ async def handle_set_provider_command(event):
     await event.delete()
     topic_id = await get_or_create_topic(chat_name)
     await telegram_client.send_message(RESULTS_DESTINATION, text, reply_to=topic_id)
+
+
+# Ожидание номера после /model: чат, куда его ждём, и монотонный дедлайн.
+# In-memory: перезапуск бота просто сбрасывает ожидание.
+_MODEL_CHOICE_PENDING = {'chat_id': None, 'expires_at': 0.0}
+
+
+async def _model_choice_reply(chat_id, text, reply_to=None):
+    await telegram_client.send_message(chat_id, text, reply_to=reply_to)
+
+
+async def apply_model_choice_by_number(number, chat_id, reply_to=None):
+    """Применяет выбор из MODEL_CHOICES и отвечает в тот же чат.
+
+    Возвращает True, если выбор применён: вызыватель решает, удалять ли
+    сообщение с номером.
+    """
+    global LLM_PROVIDER, CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT
+    provider, model, label = MODEL_CHOICES[number - 1]
+    async with config_lock:
+        old_provider, old_model = LLM_PROVIDER, CURRENT_MODEL
+        new_model = apply_model_selection(provider, model)
+    text = (
+        f'✅ Модель изменена: **{label}** ({provider_display_name(provider)})\n\n'
+        f'Было: `{old_model}` ({provider_display_name(old_provider)})\n'
+        f'Стало: `{new_model}`\n'
+        f'Ключ: {get_active_llm_key_masked()}\n\n'
+        f'Изменения вступят в силу для следующего анализа.'
+    )
+    await _model_choice_reply(chat_id, text, reply_to=reply_to)
+    return True
+
+
+@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/model(?:\s+(\d+))?\s*$'))
+async def handle_model_command(event):
+    """Список моделей с номерами; номер ждём следующим сообщением в этом чате.
+
+    `/model 2` выбирает сразу, без ожидания. Ответ идёт в тот же чат, где
+    отправлена команда (в отличие от /show_model, который пишет в канал
+    результатов): номер должен быть рядом со списком.
+    """
+    global _MODEL_CHOICE_PENDING
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
+    raw_number = (event.pattern_match.group(1) or '').strip()
+    print(f"\n📥 Команда: /model {raw_number} | Чат: {chat_name}")
+    # Отвечаем там же, где спросили: в теме форума — в эту тему, иначе в чат.
+    topic = reply_topic_id(event)
+    await event.delete()
+
+    if raw_number:
+        number = parse_model_choice(raw_number)
+        if number is None:
+            await _model_choice_reply(
+                event.chat_id,
+                f'⚠️ Номер должен быть от 1 до {len(MODEL_CHOICES)}. '
+                f'Список — командой `/model`.',
+                reply_to=topic)
+            return
+        _MODEL_CHOICE_PENDING = {'chat_id': None, 'expires_at': 0.0}
+        await apply_model_choice_by_number(number, event.chat_id, reply_to=topic)
+        return
+
+    _MODEL_CHOICE_PENDING = {
+        'chat_id': event.chat_id,
+        'expires_at': time.monotonic() + MODEL_CHOICE_TTL_SEC,
+    }
+    await _model_choice_reply(event.chat_id, format_model_menu(), reply_to=topic)
+
+
+@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^\s*(\d{1,2})\s*$'))
+async def handle_model_choice_number(event):
+    """Номер из списка /model. Любые другие цифры бот не трогает."""
+    global _MODEL_CHOICE_PENDING
+    if not model_choice_is_active(_MODEL_CHOICE_PENDING, event.chat_id):
+        return
+    number = parse_model_choice(event.raw_text)
+    if number is None:
+        return
+    chat = await event.get_chat()
+    chat_name = chat.title if hasattr(chat, 'title') else "Private"
+    print(f"\n📥 Выбор модели по номеру: {number} | Чат: {chat_name}")
+    topic = reply_topic_id(event)
+    _MODEL_CHOICE_PENDING = {'chat_id': None, 'expires_at': 0.0}
+    await apply_model_choice_by_number(number, event.chat_id, reply_to=topic)
+    await event.delete()
 
 
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/reload_config'))
@@ -6563,13 +6824,16 @@ async def handle_reload_config_command(event):
             GEMINI_DEFAULT_MODEL = _gm
         OPENROUTER_DEFAULT_MODEL = os.getenv('OPENROUTER_MODEL', OPENROUTER_DEFAULT_MODEL).strip() or OPENROUTER_DEFAULT_MODEL
         NVIDIA_DEFAULT_MODEL = os.getenv('NVIDIA_MODEL', NVIDIA_DEFAULT_MODEL).strip() or NVIDIA_DEFAULT_MODEL
+        OPENCODE_DEFAULT_MODEL = os.getenv('OPENCODE_MODEL', OPENCODE_DEFAULT_MODEL).strip() or OPENCODE_DEFAULT_MODEL
         GEMINI_REASONING_EFFORT = os.getenv('GEMINI_REASONING_EFFORT', GEMINI_REASONING_EFFORT).strip().lower() or GEMINI_REASONING_EFFORT
         OPENROUTER_REASONING_EFFORT = os.getenv('OPENROUTER_REASONING_EFFORT', OPENROUTER_REASONING_EFFORT).strip().lower() or OPENROUTER_REASONING_EFFORT
         NVIDIA_REASONING_EFFORT = os.getenv('NVIDIA_REASONING_EFFORT', NVIDIA_REASONING_EFFORT).strip().lower() or NVIDIA_REASONING_EFFORT
+        OPENCODE_REASONING_EFFORT = os.getenv('OPENCODE_REASONING_EFFORT', OPENCODE_REASONING_EFFORT).strip().lower() or OPENCODE_REASONING_EFFORT
         GEMINI_CHUNK_MAX_CHARS = os.getenv('GEMINI_CHUNK_MAX_CHARS', GEMINI_CHUNK_MAX_CHARS).strip() or GEMINI_CHUNK_MAX_CHARS
         OPENROUTER_CHUNK_MAX_CHARS = os.getenv('OPENROUTER_CHUNK_MAX_CHARS', OPENROUTER_CHUNK_MAX_CHARS).strip() or OPENROUTER_CHUNK_MAX_CHARS
         NVIDIA_CHUNK_MAX_CHARS = os.getenv('NVIDIA_CHUNK_MAX_CHARS', NVIDIA_CHUNK_MAX_CHARS).strip() or NVIDIA_CHUNK_MAX_CHARS
-        for _prefix in ('GEMINI', 'OPENROUTER', 'NVIDIA'):
+        OPENCODE_CHUNK_MAX_CHARS = os.getenv('OPENCODE_CHUNK_MAX_CHARS', OPENCODE_CHUNK_MAX_CHARS).strip() or OPENCODE_CHUNK_MAX_CHARS
+        for _prefix in ('GEMINI', 'OPENROUTER', 'NVIDIA', 'OPENCODE'):
             _raw = os.getenv(f'{_prefix}_TEMPERATURE', '').strip()
             if _raw:
                 try:
@@ -6581,6 +6845,7 @@ async def handle_reload_config_command(event):
                     globals()[f'{_prefix}_TEMPERATURE'] = _val
         OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', OPENROUTER_API_KEY).strip() or OPENROUTER_API_KEY
         NVIDIA_API_KEY = os.getenv('NVIDIA_API_KEY', NVIDIA_API_KEY).strip() or NVIDIA_API_KEY
+        OPENCODE_API_KEY = os.getenv('OPENCODE_GO_API_KEY', OPENCODE_API_KEY).strip() or OPENCODE_API_KEY
         GOOGLE_API_KEYS = load_google_api_keys()
         google_analysis_counter = 0
         if GOOGLE_API_KEYS:
@@ -6756,7 +7021,8 @@ async def handle_help_command(event):
 `/add_priority username` - добавить в приоритетные
 `/remove_priority username` - убрать из приоритетных
 `/set_model model_name` - сменить модель AI (активного провайдера)
-`/set_provider google|openrouter|nvidia` - сменить провайдера
+`/set_provider google|openrouter|nvidia|opencode` - сменить провайдера
+`/model` - выбрать модель по номеру из списка
 
 `/reload_config` - перезагрузить из файлов
 
@@ -7054,11 +7320,13 @@ async def main():
     # Показываем текущую LLM-конфигурацию (ключи — private.txt, параметры — MODEL_CONFIG.txt)
     print(f"\n🤖 Конфигурация LLM (провайдер {LLM_PROVIDER}, {provider_display_name()}):")
     print(f"   • CURRENT_MODEL={CURRENT_MODEL or 'не задан'}")
-    print(f"   • GEMINI_MODEL={GEMINI_DEFAULT_MODEL or 'не задана'} / OPENROUTER_MODEL={OPENROUTER_DEFAULT_MODEL or 'не задана'} / NVIDIA_MODEL={NVIDIA_DEFAULT_MODEL or 'не задана'}")
-    _eff = {'google': GEMINI_REASONING_EFFORT, 'openrouter': OPENROUTER_REASONING_EFFORT, 'nvidia': NVIDIA_REASONING_EFFORT}[LLM_PROVIDER]
-    _chk = {'google': GEMINI_CHUNK_MAX_CHARS, 'openrouter': OPENROUTER_CHUNK_MAX_CHARS, 'nvidia': NVIDIA_CHUNK_MAX_CHARS}[LLM_PROVIDER]
+    print(f"   • GEMINI_MODEL={GEMINI_DEFAULT_MODEL or 'не задана'} / OPENROUTER_MODEL={OPENROUTER_DEFAULT_MODEL or 'не задана'} / NVIDIA_MODEL={NVIDIA_DEFAULT_MODEL or 'не задана'} / OPENCODE_MODEL={OPENCODE_DEFAULT_MODEL or 'не задана'}")
+    _eff = {'google': GEMINI_REASONING_EFFORT, 'openrouter': OPENROUTER_REASONING_EFFORT,
+            'nvidia': NVIDIA_REASONING_EFFORT, 'opencode': OPENCODE_REASONING_EFFORT}[LLM_PROVIDER]
+    _chk = {'google': GEMINI_CHUNK_MAX_CHARS, 'openrouter': OPENROUTER_CHUNK_MAX_CHARS,
+            'nvidia': NVIDIA_CHUNK_MAX_CHARS, 'opencode': OPENCODE_CHUNK_MAX_CHARS}[LLM_PROVIDER]
     print(f"   • REASONING_EFFORT={_eff or 'не задан'} / CHUNK_MAX_CHARS={_chk or 'не задан'} / TEMPERATURE={provider_temperature()}")
-    print(f"   • Ключи: Google {len(GOOGLE_API_KEYS)}, OpenRouter {'да' if OPENROUTER_API_KEY else 'нет'}, NVIDIA {'да' if NVIDIA_API_KEY else 'нет'}")
+    print(f"   • Ключи: Google {len(GOOGLE_API_KEYS)}, OpenRouter {'да' if OPENROUTER_API_KEY else 'нет'}, NVIDIA {'да' if NVIDIA_API_KEY else 'нет'}, OpenCode Go {'да' if OPENCODE_API_KEY else 'нет'}")
     print(f"   • Экспорт результатов: {'HTML файлы 📄' if USE_HTML_EXPORT else 'Telegraph 🌐'}")
     
     # Показываем настройки фильтрации

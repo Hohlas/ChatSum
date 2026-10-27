@@ -127,7 +127,8 @@ iLYA Boytsov: предположил, что платные тарифы сиг�
 /add_excluded НИК /remove_excluded НИК
 /add_priority НИК /remove_priority НИК
 /set_model НАЗВАНИЕ
-/set_provider google|openrouter|nvidia
+/set_provider google|openrouter|nvidia|opencode
+/model           — список моделей с номерами; следующим сообщением — номер
 /reload_config
 /sch 09:00 1d    — дайджест каждый день в 09:00 МСК
 /sch 21:30 12h   — то же на 21:30 с охватом 12 часов
@@ -229,9 +230,12 @@ Python-библиотеки в отдельную папку `venv` внутри
 Учти: на бесплатном уровне содержимое могут использовать для улучшения продуктов.
 
 Там же в `MODEL_CONFIG.txt` можно переключить бота на другие сервисы
-(OpenRouter, NVIDIA) — строкой `LLM_PROVIDER` и ключами `OPENROUTER_API_KEY` /
-`NVIDIA_API_KEY` в `private.txt`; по умолчанию выбран Gemini, и ничего менять
-не нужно.
+(OpenRouter, OpenCode Go, NVIDIA) — строкой `LLM_PROVIDER` и ключами
+`OPENROUTER_API_KEY` / `OPENCODE_GO_API_KEY` / `NVIDIA_API_KEY` в `private.txt`;
+по умолчанию выбран Gemini, и ничего менять не нужно. Проще всего — команда
+`/model`: она печатает нумерованный список (1 — Qwen 3.8 Flash через
+OpenRouter, 2 — DeepSeek V4.1 Flash через OpenCode Go, 3 — Gemini 3.8 Flash) и
+применяет выбор по номеру, записывая его в `MODEL_CONFIG.txt`.
 
 </details>
 

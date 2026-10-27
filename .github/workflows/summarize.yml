@@ -85,6 +85,7 @@ jobs:
           GOOGLE_API_KEY3:   ${{ secrets.GOOGLE_API_KEY3 }}
           GOOGLE_API_KEYS:   ${{ secrets.GOOGLE_API_KEYS }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
           NVIDIA_API_KEY:   ${{ secrets.NVIDIA_API_KEY }}
           LLM_PROVIDER:     ${{ vars.LLM_PROVIDER }}
           GEMINI_MODEL:      ${{ vars.GEMINI_MODEL }}
@@ -95,6 +96,10 @@ jobs:
           OPENROUTER_TEMPERATURE:      ${{ vars.OPENROUTER_TEMPERATURE }}
           OPENROUTER_REASONING_EFFORT: ${{ vars.OPENROUTER_REASONING_EFFORT }}
           OPENROUTER_CHUNK_MAX_CHARS:  ${{ vars.OPENROUTER_CHUNK_MAX_CHARS }}
+          OPENCODE_MODEL:      ${{ vars.OPENCODE_MODEL }}
+          OPENCODE_TEMPERATURE:      ${{ vars.OPENCODE_TEMPERATURE }}
+          OPENCODE_REASONING_EFFORT: ${{ vars.OPENCODE_REASONING_EFFORT }}
+          OPENCODE_CHUNK_MAX_CHARS:  ${{ vars.OPENCODE_CHUNK_MAX_CHARS }}
           NVIDIA_MODEL:      ${{ vars.NVIDIA_MODEL }}
           NVIDIA_TEMPERATURE:      ${{ vars.NVIDIA_TEMPERATURE }}
           NVIDIA_REASONING_EFFORT: ${{ vars.NVIDIA_REASONING_EFFORT }}
