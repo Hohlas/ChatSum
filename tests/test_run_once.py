@@ -156,6 +156,7 @@ def main():
     test_telegraph_toc()
     test_telegraph_link_stars()
     test_telegraph_part_nav()
+    test_html_report_spoilers()
     test_dedupe_topics()
     test_rank_topics_by_importance()
     test_chunk_rebalance()
@@ -2837,6 +2838,46 @@ def test_telegraph_part_nav():
           html.count('href="https://telegra.ph/') == 2, html)
     check('nav: ссылки до и после тела',
           html.index('← Часть 2') < html.index('<h3') < html.index('Часть 4 →'), html)
+
+
+def test_html_report_spoilers():
+    # Локальный HTML-отчёт: список тем заменён спойлерами под заголовками.
+    content = (
+        '*(26.10 04:33 - 27.10 04:06)*\n\n'
+        '💡 **Тема один**\n*Идея.*\n\n- *26.10 17:00* -\n'
+        '[U](https://t.me/c/1/1): текст один\n\n---\n\n'
+        '💡 **Тема два**\n*Идея два.*\n\n- *27.10 00:20* -\n'
+        '[U](https://t.me/c/1/2): текст два\n'
+        '\n---\ncreated by [ChatSumBot](https://github.com/Hohlas/ChatSum) \n'
+    )
+    b = bot.build_html_report_body
+
+    body = b(content)
+    check('spoiler: заголовок блока тем один', body.count('<h4>Темы по популярности</h4>') == 1, body)
+    check('spoiler: список-оглавление убран', '<ol>' not in body and '<li>' not in body, body[:200])
+    check('spoiler: по спойлеру на тему', body.count('<details>') == 2
+          and body.count('</details>') == 2, body)
+    check('spoiler: заголовок темы в строке спойлера',
+          '<summary><b>Тема один</b> - 17:00</summary>' in body, body)
+    check('spoiler: текст темы спрятан', body.index('текст один') > body.index('<summary><b>Тема один'),
+          body)
+    check('spoiler: метка времени не дублируется в теле',
+          '— 26.10 17:00 —' not in body, body)
+    check('spoiler: вводная строка периода вне спойлеров',
+          body.index('27.10 04:06') < body.index('<details>'), body[:200])
+    check('spoiler: подпись бота после спойлеров',
+          body.index('created by') > body.index('</details>'), body[-200:])
+    check('spoiler: разделитель тем не стал <hr> внутри спойлера',
+          body.count('<hr>') == 0, body)
+    check('spoiler: заголовок темы не остался в теле', '<h3' not in body, body)
+
+    one = b('💡 **Единственная**\n*Идея.*\n\n[U](https://t.me/c/1/7): текст\n')
+    check('spoiler: одна тема — без заголовка блока',
+          '<h4>' not in one and '<details>' in one, one)
+    tricky = b('💡 **Слеш & <проверка>**\n*Идея.*\n')
+    check('spoiler: заголовок экранирован',
+          '<b>Слеш &amp; &lt;проверка&gt;</b>' in tricky, tricky)
+    check('spoiler: пустой ввод — пусто', b('') == '', repr(b('')))
 
 
 def test_dedupe_topics():

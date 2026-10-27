@@ -4546,6 +4546,71 @@ async def publish_to_telegraph(title, content, author_name="Chat Filter Bot", te
     return None
 
 
+def _escape_html_text(value):
+    """Текст для вставки в HTML (без кавычек-атрибутов)."""
+    return (value.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+
+
+# Заголовок блока тем в локальном HTML-отчёте: под ним не список-оглавление,
+# а спойлеры с текстом тем (см. build_html_report_body).
+HTML_REPORT_TOPICS_HEADER = '<h4>Темы по популярности</h4>'
+
+
+def build_html_report_body(markdown_content):
+    """Тело локального HTML-отчёта: каждая тема свёрнута под своим заголовком.
+
+    В отличие от страницы telegra.ph (там спойлеров нет — в белом списке
+    тегов API нет details/summary), файл отдаётся браузеру целиком, поэтому
+    список тем заменён на <details>: на странице видны только заголовки,
+    текст темы раскрывается кликом. Время первой цитаты темы переезжает из
+    тела в строку заголовка, чтобы не дублироваться.
+
+    Текст вне тем (вводная строка периода, подпись бота) остаётся обычной
+    вёрсткой: до и после спойлеров соответственно.
+    """
+    blocks = (markdown_content or '').split('\n---\n')
+    items = []  # ('text', markdown) | ('topic', markdown темы)
+    for block in blocks:
+        if not block.strip():
+            continue
+        if '💡' not in block:
+            items.append(('text', block))
+            continue
+        pieces = re.split(r'^💡', block, flags=re.MULTILINE)
+        if pieces[0].strip():
+            items.append(('text', pieces[0]))
+        for piece in pieces[1:]:
+            items.append(('topic', '💡' + piece))
+
+    topics_total = sum(1 for kind, _ in items if kind == 'topic')
+    header_pending = topics_total >= 2  # одна тема — заголовок не нужен
+    out = []
+    for kind, markdown in items:
+        if kind == 'text':
+            html = convert_markdown_to_html(markdown.strip())
+            if html.strip():
+                out.append(html)
+            continue
+
+        entries = extract_toc_entries(markdown)
+        title, when = entries[0] if entries else (_strip_topic_title(markdown.split('\n')[0].strip()), None)
+        if header_pending:
+            out.append(HTML_REPORT_TOPICS_HEADER)
+            header_pending = False
+
+        body_lines = markdown.split('\n')[1:]
+        kept = [line for line in body_lines if not TOPIC_TIME_RE.match(line.strip())]
+        summary = f'<b>{_escape_html_text(title)}</b>'
+        if when:
+            summary += f' - {when}'
+        out.append(
+            f'<details><summary>{summary}</summary>'
+            f'<div class="spoiler-body">{convert_markdown_to_html(chr(10).join(kept).strip())}</div>'
+            f'</details>'
+        )
+    return ''.join(out)
+
+
 def create_html_report(title, content, author_name="Chat Filter Bot"):
     """
     Создает локальный HTML отчет со стилями в духе Telegraph
@@ -4565,8 +4630,9 @@ def create_html_report(title, content, author_name="Chat Filter Bot"):
             os.makedirs(reports_dir)
             print(f"📁 Создана папка {reports_dir}/")
         
-        # Конвертируем Markdown в HTML (используем общую функцию)
-        html_body = convert_markdown_to_html(content)
+        # Тело отчёта: темы свёрнуты под спойлерами, обычная вёрстка — для
+        # текста вне тем (вводная строка периода, подпись бота).
+        html_body = build_html_report_body(content)
         
         # Создаем полноценный HTML документ со стилями в стиле Telegraph
         html_template = f'''<!DOCTYPE html>
@@ -4613,6 +4679,54 @@ def create_html_report(title, content, author_name="Chat Filter Bot"):
             margin-top: 30px;
             margin-bottom: 15px;
             line-height: 1.3;
+        }}
+        
+        h4 {{
+            font-size: 20px;
+            font-weight: bold;
+            margin-top: 30px;
+            margin-bottom: 15px;
+            line-height: 1.3;
+        }}
+        
+        /* Спойлер темы: виден только заголовок, текст раскрывается кликом */
+        details {{
+            border-bottom: 1px solid #eee;
+        }}
+        
+        details:first-of-type {{
+            border-top: 1px solid #eee;
+        }}
+        
+        summary {{
+            cursor: pointer;
+            padding: 12px 0;
+            font-size: 20px;
+            line-height: 1.3;
+            list-style: none;
+        }}
+        
+        summary::-webkit-details-marker {{
+            display: none;
+        }}
+        
+        summary::before {{
+            content: '▸';
+            display: inline-block;
+            width: 22px;
+            color: #999;
+        }}
+        
+        details[open] summary::before {{
+            content: '▾';
+        }}
+        
+        summary:hover {{
+            color: #3390ec;
+        }}
+        
+        .spoiler-body {{
+            padding: 0 0 15px 22px;
         }}
         
         p {{
@@ -4700,6 +4814,14 @@ def create_html_report(title, content, author_name="Chat Filter Bot"):
             
             hr {{
                 border-top: 1px solid #444;
+            }}
+            
+            details, details:first-of-type {{
+                border-color: #3a3a3a;
+            }}
+            
+            summary::before {{
+                color: #777;
             }}
             
             .footer {{
