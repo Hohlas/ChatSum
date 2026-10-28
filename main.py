@@ -839,9 +839,16 @@ def get_model_generation_config(model_name, provider=None):
         })
         config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])
     elif model_name in ('deepseek-ai/deepseek-v4.1-flash', 'deepseek-v4.1-flash'):
+        # DeepSeek V4.1 Flash через два шлюза: подписку OpenCode Go и NVIDIA NIM.
+        # Скрытые рассуждения идут из того же потолка ответа, что и текст.
+        # На подписке потолок 32 768: замер 28.10 на чанке 100 тыс. знаков дал
+        # 2 114 токена ответа при 1 422 рассуждений, а на счётных задачах
+        # рассуждения доходили до 20 685 — при 16 384 ответ обрезался бы
+        # (finish_reason=length, пустой текст). У NVIDIA свой шлюз и живого
+        # замера рассуждений нет — там остаются осторожные 16 384.
         config.update({
             'context_limit_tokens': 128000,
-            'output_max_tokens': 16384,
+            'output_max_tokens': 32768 if active_provider == 'opencode' else 16384,
             'chunk_max_chars': 60000,
         })
         config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])

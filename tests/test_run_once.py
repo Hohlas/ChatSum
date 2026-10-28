@@ -4147,7 +4147,14 @@ def test_model_choice_commands():
         bot.OPENCODE_CHUNK_MAX_CHARS = ''
         ds = bot.get_model_generation_config('deepseek-v4.1-flash', provider='opencode')
         check('deepseek: чанк 60K из профиля', ds['chunk_max_chars'] == 60000, ds)
-        check('deepseek: выход 16384', ds['output_max_tokens'] == 16384, ds)
+        # OpenCode Go: потолок 32 768 — рассуждения идут из него же, на счётных
+        # задачах доходили до 20 685 токенов (замер 28.10), 16 384 обрезало бы.
+        check('deepseek OpenCode: выход 32768',
+              ds['output_max_tokens'] == 32768, ds)
+        ds_nv = bot.get_model_generation_config('deepseek-ai/deepseek-v4.1-flash',
+                                                provider='nvidia')
+        check('deepseek NVIDIA: выход 16384 (как было)',
+              ds_nv['output_max_tokens'] == 16384, ds_nv)
     finally:
         bot.LLM_PROVIDER = saved_provider
         bot.OPENROUTER_CHUNK_MAX_CHARS, bot.OPENCODE_CHUNK_MAX_CHARS = saved_chunks

@@ -6,31 +6,73 @@
 # LLM_PROVIDER: google | openrouter | opencode | nvidia (default google).
 # Выбор по номерам — команда /model в боте (пишет сюда же).
 
+# ═══ СПРАВОЧНИК МОДЕЛЕЙ ═════════════════════════════════════════════════════
+# Все варианты, которые знает код, — у каждой модели свой чанк-профиль.
+# Только для чтения: строки закомментированы, потому что при /model бот удаляет
+# живую строку <ПРОВАЙДЕР>_MODEL= и дописывает её в конец файла. Живые
+# параметры — в блоках провайдеров ниже, активная модель — в конце файла.
+# Формат: модель, рядом её CHUNK_MAX_CHARS, в комментарии — контекст / потолок ответа.
+# Чанк — в символах русского текста; в JSON-запросе ~2.6 знака на токен.
+#
+# Google / Gemini (провайдер google, ключи GOOGLE_API_KEY*):
+#   GEMINI_MODEL=gemini-3.8-flash       GEMINI_CHUNK_MAX_CHARS=100000   # 1 048 576 / 65 536
+#   GEMINI_MODEL=gemini-3.6-flash       GEMINI_CHUNK_MAX_CHARS=100000   # 1 048 576 / 65 536
+#   GEMINI_MODEL=gemini-3.5-flash-lite  GEMINI_CHUNK_MAX_CHARS=100000   # 1 048 576 / 65 536
+#   GEMINI_MODEL=gemini-2.5-flash       GEMINI_CHUNK_MAX_CHARS=60000    # 1 048 576 / 65 536
+#   GEMINI_MODEL=gemini-2.0-flash       GEMINI_CHUNK_MAX_CHARS=60000    # 1 048 576 / 10 000 (дефолт кода)
+#   GEMINI_MODEL=gemini-2.0-flash-lite  GEMINI_CHUNK_MAX_CHARS=60000    # 1 048 576 / 10 000 (дефолт кода)
+#   GEMINI_MODEL=gemini-1.5-flash       GEMINI_CHUNK_MAX_CHARS=60000    # 128 000 / 10 000 (дефолт кода)
+#   GEMINI_MODEL=gemini-1.5-pro         GEMINI_CHUNK_MAX_CHARS=60000    # 2 000 000 / 10 000 (дефолт кода)
+#
+# OpenRouter (провайдер openrouter, ключи OPENROUTER_API_KEY*):
+#   OPENROUTER_MODEL=qwen/qwen3.8-flash                      OPENROUTER_CHUNK_MAX_CHARS=80000    # 1 000 000 / 30 000
+#   OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free  OPENROUTER_CHUNK_MAX_CHARS=100000   # 1 000 000 / 65 536
+#   OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free  OPENROUTER_CHUNK_MAX_CHARS=100000   # 262 144 / 235 929
+#   OPENROUTER_MODEL=google/gemma-4-31b-it:free              OPENROUTER_CHUNK_MAX_CHARS=60000    # 262 144 / 32 768 (slug строго с '-it')
+#   OPENROUTER_MODEL=deepseek/deepseek-v4.1-flash            OPENROUTER_CHUNK_MAX_CHARS=60000    # 1 048 576 / 131 072; в коде профиль-дефолт 128 000 / 16 384
+#
+# OpenCode Go (провайдер opencode, подписка opencode.ai, ключ OPENCODE_GO_API_KEY):
+#   OPENCODE_MODEL=deepseek-v4.1-flash   OPENCODE_CHUNK_MAX_CHARS=100000   # 1 048 576 / 131 072; замер 28.10: 405 тыс. знаков = 152 776 токенов входа
+#
+# NVIDIA (провайдер nvidia, ключ NVIDIA_API_KEY):
+#   NVIDIA_MODEL=deepseek-ai/deepseek-v4.1-flash  NVIDIA_CHUNK_MAX_CHARS=60000   # 128 000 / 16 384 (профиль кода)
 
-GEMINI_MODEL=gemini-3.8-flash
+# ═══ GOOGLE / GEMINI ════════════════════════════════════════════════════════
 GEMINI_TEMPERATURE=0               # 0 = детерминированный (рекомендуется), 0.3 = вариативный
 GEMINI_REASONING_EFFORT=high     # none low medium high (none — детерминизм, medium — глубже анализ но нестабилен)
-GEMINI_CHUNK_MAX_CHARS=40000      # CHUNK/2 токенов  для русского чата
+GEMINI_CHUNK_MAX_CHARS=40000      # ~15K токенов входа (в JSON ~2.6 знака на токен)
 
-# OpenRouter. Активная строка — Qwen (та же модель, что предлагает /model).
-# Кандидаты на переключение (активна только строка без '#'):
-# OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free   # контекст 1M, выход 65K, чанк-профиль 100K
-# OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free    # контекст 262K, выход 235K, чанк-профиль 100K
-# OPENROUTER_MODEL=google/gemma-4-31b-it:free      # контекст 262K, выход 32K (tight), чанк-профиль 60K; slug строго с '-it'
+# ═══ OPENROUTER ═════════════════════════════════════════════════════════════
+# Потолок ответа Qwen в коде — 30 000 токенов: OpenRouter резервирует под запрос
+# потолок ответа по цене выхода ($0.47/1M → 65 536 ≈ $0.031) и при тощем балансе
+# отдаёт 402 «can only afford N tokens» ещё до отправки модели.
 OPENROUTER_TEMPERATURE=0
 OPENROUTER_REASONING_EFFORT=medium  # 
-OPENROUTER_CHUNK_MAX_CHARS=80000   # ~42K токенов входа, ~30K токенов выхода: запас большой до лимита 235929
+OPENROUTER_CHUNK_MAX_CHARS=80000   # ~30K токенов входа; потолок ответа в коде 30 000 (см. справочник)
 
+# ═══ OPENCODE GO ════════════════════════════════════════════════════════════
 # OpenCode Go (подписка opencode.ai), ключ OPENCODE_GO_API_KEY. DeepSeek думает
 # по умолчанию; шлюз принимает reasoning_effort (как OpenAI), но в доках его нет.
+# Контекст DeepSeek V4.1 Flash — 1 048 576 токенов (каталог модели; шлюз принял
+# 320 799 токенов входа живьём). 100 000 знаков JSON = ~38 000 токенов входа;
+# живой замер 28.10: ответ 2 114 токенов (рассуждения 1 422), finish=stop, 23 с.
+# Часы пик по Москве (UTC+3, только пн–пт):
+# 04:00–07:00 МСК
+# 09:00–13:00 МСК
+
 OPENCODE_TEMPERATURE=0
 OPENCODE_REASONING_EFFORT=low
-OPENCODE_CHUNK_MAX_CHARS=40000
+OPENCODE_CHUNK_MAX_CHARS=100000
 
-NVIDIA_MODEL=deepseek-ai/deepseek-v4.1-flash
+# ═══ NVIDIA ═════════════════════════════════════════════════════════════════
 NVIDIA_TEMPERATURE=0
 NVIDIA_REASONING_EFFORT=low
 NVIDIA_CHUNK_MAX_CHARS=40000
+
+# ═══ АКТИВНАЯ МОДЕЛЬ (строку пишет бот командой /model) ═════════════════════
+
+
+GEMINI_MODEL=gemini-3.8-flash
 
 
 OPENROUTER_MODEL=qwen/qwen3.8-flash
