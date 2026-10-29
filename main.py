@@ -5385,6 +5385,45 @@ async def send_summary_message(telegram_client, text, topic_id, post_to_source=F
             print(f"⚠️  Не удалось отправить результат в исходный чат: {e}")
 
 
+# Имя ключа effort в MODEL_CONFIG.txt на провайдера — для подписей в TG:
+# владелец видит не только значение, но и где его править.
+REASONING_EFFORT_KEYS = {
+    'google': 'GEMINI_REASONING_EFFORT',
+    'openrouter': 'OPENROUTER_REASONING_EFFORT',
+    'nvidia': 'NVIDIA_REASONING_EFFORT',
+    'opencode': 'OPENCODE_REASONING_EFFORT',
+}
+
+
+def provider_reasoning_effort(provider=None):
+    """reasoning_effort провайдера из конфига ('' — не задан). Чистая.
+
+    Значения читаются в момент вызова: после /reload_config и смены модели
+    глобалы уже новые, поэтому подпись всегда показывает текущее состояние.
+    """
+    prov = provider or LLM_PROVIDER
+    return {
+        'google': GEMINI_REASONING_EFFORT,
+        'openrouter': OPENROUTER_REASONING_EFFORT,
+        'nvidia': NVIDIA_REASONING_EFFORT,
+        'opencode': OPENCODE_REASONING_EFFORT,
+    }.get(prov, '')
+
+
+def reasoning_display(provider=None):
+    """Текущий reasoning для подписи в TG: 'low (OPENCODE_REASONING_EFFORT)'.
+
+    Параметр не задан → 'не задан → дефолт модели' (тогда шлюз решает сам).
+    Чистая.
+    """
+    prov = provider or LLM_PROVIDER
+    effort = str(provider_reasoning_effort(prov) or '').strip().lower()
+    if not effort:
+        return 'не задан → дефолт модели'
+    key = REASONING_EFFORT_KEYS.get(prov)
+    return f'{effort} ({key})' if key else effort
+
+
 def model_display_label(model=None, effort=None):
     """'model effort' для подписи в TG; пусто → показываем только модель.
 
@@ -5394,9 +5433,7 @@ def model_display_label(model=None, effort=None):
     name = (model if model is not None else CURRENT_MODEL) or ''
     name = str(name).strip()
     if effort is None:
-        effort = {'google': GEMINI_REASONING_EFFORT, 'openrouter': OPENROUTER_REASONING_EFFORT,
-                  'nvidia': NVIDIA_REASONING_EFFORT,
-                  'opencode': OPENCODE_REASONING_EFFORT}.get(LLM_PROVIDER, '')
+        effort = provider_reasoning_effort()
     eff = (effort or '')
     eff = str(eff).strip().lower()
     if eff:
@@ -6964,6 +7001,7 @@ async def handle_set_model_command(event):
 
             if save_model_config(MODEL_CONFIG_FILE, model, USE_REASONING, USE_HTML_EXPORT):
                 text = f"✅ Модель изменена ({LLM_PROVIDER}): **{old_model}** → **{model}**\n\n"
+                text += f"Reasoning: {reasoning_display()}\n"
                 text += "Изменения вступят в силу для следующего анализа.\n"
                 text += f"Модель сохранена в `{MODEL_CONFIG_FILE}`.\n"
                 text += "Используйте `/show_model` для просмотра деталей."
@@ -6994,6 +7032,7 @@ async def handle_set_provider_command(event):
             apply_model_selection(norm)
             text = (f"✅ Провайдер изменён: **{old}** → **{norm}** ({provider_display_name()})\n\n"
                     f"Модель: `{CURRENT_MODEL}`\n"
+                    f"Reasoning: {reasoning_display()}\n"
                     f"Ключ: {get_active_llm_key_masked()}\n"
                     f"Используйте `/show_model` для просмотра деталей.")
 
@@ -7025,7 +7064,8 @@ async def apply_model_choice_by_number(number, chat_id, reply_to=None):
     text = (
         f'✅ Модель изменена: **{label}** ({provider_display_name(provider)})\n\n'
         f'Было: `{old_model}` ({provider_display_name(old_provider)})\n'
-        f'Стало: `{new_model}`\n'
+        f'Стало: `{new_model}` ({provider_display_name()})\n'
+        f'Reasoning: {reasoning_display()}\n'
         f'Ключ: {get_active_llm_key_masked()}\n\n'
         f'Изменения вступят в силу для следующего анализа.'
     )

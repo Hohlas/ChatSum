@@ -50,9 +50,9 @@ OPENROUTER_CHUNK_MAX_CHARS=80000   # ~30K токенов входа; потол�
 # Часы пик по Москве (UTC+3, только пн–пт):
 # 04:00–07:00 МСК
 # 09:00–13:00 МСК
-OPENCODE_MODEL=deepseek-v4.1-flash
+OPENCODE_MODEL=glm-5.3-flash
 OPENCODE_TEMPERATURE=0
-OPENCODE_REASONING_EFFORT=low
+OPENCODE_REASONING_EFFORT=medium
 OPENCODE_CHUNK_MAX_CHARS=100000
 
 # ═══ NVIDIA ═════════════════════════════════════════════════════════════════
@@ -71,4 +71,4 @@ NVIDIA_CHUNK_MAX_CHARS=40000
 
 LLM_PROVIDER=opencode
 
-OPENCODE_MODEL=deepseek-v4.1-flash
+OPENCODE_MODEL=glm-5.3-flash

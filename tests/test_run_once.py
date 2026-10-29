@@ -4269,6 +4269,31 @@ def test_model_choice_commands():
         check('glm: окно 1M', glm['context_limit_tokens'] == 1000000, glm)
         check('glm: выход 32768', glm['output_max_tokens'] == 32768, glm)
         check('glm: чанк 100K из профиля', glm['chunk_max_chars'] == 100000, glm)
+
+        # 5b. Подпись reasoning для сообщений о смене модели: значение из
+        #     конфига + имя ключа, чтобы владелец видел, где это править.
+        saved_effort = (bot.GEMINI_REASONING_EFFORT, bot.OPENROUTER_REASONING_EFFORT,
+                        bot.NVIDIA_REASONING_EFFORT, bot.OPENCODE_REASONING_EFFORT)
+        try:
+            bot.OPENCODE_REASONING_EFFORT = 'medium'
+            check('reasoning: opencode — значение и имя ключа',
+                  bot.reasoning_display('opencode') == 'medium (OPENCODE_REASONING_EFFORT)',
+                  bot.reasoning_display('opencode'))
+            bot.GEMINI_REASONING_EFFORT = 'high'
+            check('reasoning: google — свой ключ',
+                  bot.reasoning_display('google') == 'high (GEMINI_REASONING_EFFORT)',
+                  bot.reasoning_display('google'))
+            bot.NVIDIA_REASONING_EFFORT = ''
+            check('reasoning: пусто → дефолт модели',
+                  bot.reasoning_display('nvidia') == 'не задан → дефолт модели',
+                  bot.reasoning_display('nvidia'))
+            check('reasoning: неизвестный провайдер → дефолт модели',
+                  bot.reasoning_display('nope') == 'не задан → дефолт модели')
+            check('reasoning: провайдер по умолчанию — активный',
+                  bot.reasoning_display() == bot.reasoning_display(bot.LLM_PROVIDER))
+        finally:
+            (bot.GEMINI_REASONING_EFFORT, bot.OPENROUTER_REASONING_EFFORT,
+             bot.NVIDIA_REASONING_EFFORT, bot.OPENCODE_REASONING_EFFORT) = saved_effort
         ds_nv = bot.get_model_generation_config('deepseek-ai/deepseek-v4.1-flash',
                                                 provider='nvidia')
         check('deepseek NVIDIA: выход 16384 (как было)',
@@ -4476,6 +4501,9 @@ def test_model_command_flow():
               bot.CURRENT_MODEL)
         check('flow: подтверждение с названием модели',
               bool(posted) and 'DeepSeek V4.1 Flash' in posted[0][1], posted)
+        check('flow: в подтверждении текущий reasoning',
+              bool(posted) and f'Reasoning: {bot.reasoning_display()}' in posted[0][1],
+              posted)
         check('flow: цифра удалена', deleted == ['/model', '2'], deleted)
         check('flow: ожидание сброшено',
               bot._MODEL_CHOICE_PENDING['chat_id'] is None, bot._MODEL_CHOICE_PENDING)
