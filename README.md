@@ -99,6 +99,8 @@ iLYA Boytsov: предположил, что платные тарифы сиг�
 Есть и второй способ: писать команды прямо в теме нужного чата в канале
 результатов — без слеша: `sum1d`, `sum 1d-`, `copy 3h`, `22:33 sum1d`, `sch`,
 `unsch`. Источник берётся по названию темы, ответ приходит в ту же тему.
+`model` (выбор модели) можно писать без слеша в любой теме канала результатов,
+включая General: он не привязан к чату-источнику.
 
 <details>
 <summary>Расширенный список команд</summary>
@@ -129,6 +131,7 @@ iLYA Boytsov: предположил, что платные тарифы сиг�
 /set_model НАЗВАНИЕ
 /set_provider google|openrouter|nvidia|opencode
 /model           — список моделей с номерами; следующим сообщением — номер
+/models          — то же самое (псевдоним; в теме канала результатов — без слеша)
 /reload_config
 /sch 09:00 1d    — дайджест каждый день в 09:00 МСК
 /sch 21:30 12h   — то же на 21:30 с охватом 12 часов
@@ -234,8 +237,9 @@ Python-библиотеки в отдельную папку `venv` внутри
 `OPENROUTER_API_KEY` / `OPENCODE_GO_API_KEY` / `NVIDIA_API_KEY` в `private.txt`;
 по умолчанию выбран Gemini, и ничего менять не нужно. Проще всего — команда
 `/model`: она печатает нумерованный список (1 — Qwen 3.8 Flash через
-OpenRouter, 2 — DeepSeek V4.1 Flash через OpenCode Go, 3 — Gemini 3.8 Flash) и
-применяет выбор по номеру, записывая его в `MODEL_CONFIG.txt`.
+OpenRouter, 2 — DeepSeek V4.1 Flash через OpenCode Go, 3 — Gemini 3.8 Flash,
+4 — GLM-5.3-Flash через OpenCode Go) и применяет выбор по номеру, записывая его
+в `MODEL_CONFIG.txt`.
 
 </details>
 

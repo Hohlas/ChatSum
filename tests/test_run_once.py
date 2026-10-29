@@ -174,6 +174,7 @@ def main():
     test_topic_command_routing()
     test_topic_schedule_helpers()
     test_topic_dispatch()
+    test_topic_model_command()
     test_model_choice_commands()
     test_model_command_flow()
 
@@ -3837,9 +3838,10 @@ def test_reply_topic_id():
 def test_topic_command_re():
     """Без слеша в теме: sum/copy/sch/unsch/HH:MM — команда; прочее — текст."""
     yes = ['sum', 'sum1d-', 'sum 1d+', 'copy 3h', 'Sum2d', 'sch', 'sch_list',
-           'unsch', '22:33 sum1d', '9:05 1d+', 'unsch t.me/chat']
+           'unsch', '22:33 sum1d', '9:05 1d+', 'unsch t.me/chat',
+           'model', 'models', 'model 2', 'Models 3']
     no = ['/sum1d', 'summer', 'summary', 'help', '12:30 встреча',
-          'доклад 12:30', 'isch']
+          'доклад 12:30', 'isch', 'model2', 'modeling', 'models x']
     for text in yes:
         check(f'topic-cmd: {text!r} — команда',
               bool(bot.TOPIC_COMMAND_RE.match(text)), text)
@@ -4082,14 +4084,101 @@ def test_topic_dispatch():
          bot._schedule_list_text) = saved
 
 
+def test_topic_model_command():
+    """Голая 'model'/'models' в группе результатов: список в ту же тему.
+
+    Команда модели не зависит от чата-источника, поэтому работает в любой
+    теме группы результатов, включая General, и не зовёт topic_command_context.
+    """
+    from types import SimpleNamespace as NS
+
+    dest = -1000000000999
+    posted, deleted, ctx_calls = [], [], []
+
+    class Event:
+        def __init__(self, text, chat_id=dest, topic=7):
+            self.chat_id = chat_id
+            self.id = 91
+            self.raw_text = text
+            self.reply_to = (
+                None if topic is None
+                else NS(forum_topic=True, reply_to_msg_id=topic))
+            self.message = NS(reply_to=self.reply_to)
+
+        async def get_chat(self):
+            return NS(title='Результаты')
+
+        async def delete(self):
+            deleted.append(self.raw_text)
+
+    class Client:
+        async def send_message(self, d, text, reply_to=None):
+            posted.append((d, text, reply_to))
+
+    async def fake_ctx(event):
+        ctx_calls.append(event.raw_text)
+        return None
+
+    saved = (bot.telegram_client, bot.topic_command_context,
+             bot.RESULTS_DESTINATION, bot._MODEL_CHOICE_PENDING)
+    bot.telegram_client = Client()
+    bot.topic_command_context = fake_ctx
+    bot.RESULTS_DESTINATION = dest
+    bot._MODEL_CHOICE_PENDING = {'chat_id': None, 'expires_at': 0.0}
+    loop = asyncio.get_event_loop()
+    try:
+        with _quiet():
+            loop.run_until_complete(bot.handle_topic_command(Event('model')))
+        check('topic-model: список ушёл в ту же тему',
+              bool(posted) and posted[0][0] == dest and posted[0][2] == 7, posted)
+        check('topic-model: в списке четыре модели',
+              bool(posted) and '4. GLM-5.3-Flash' in posted[0][1], posted)
+        check('topic-model: команда удалена', deleted == ['model'], deleted)
+        check('topic-model: ожидание номера в этом чате',
+              bot._MODEL_CHOICE_PENDING['chat_id'] == dest, bot._MODEL_CHOICE_PENDING)
+        check('topic-model: чат-источник не нужен', ctx_calls == [], ctx_calls)
+
+        # General: reply_to нет вовсе — ответ уходит в группу.
+        posted.clear()
+        deleted.clear()
+        bot._MODEL_CHOICE_PENDING = {'chat_id': None, 'expires_at': 0.0}
+        with _quiet():
+            loop.run_until_complete(
+                bot.handle_topic_command(Event('models', topic=None)))
+        check('topic-model: «models» в General — список без темы',
+              bool(posted) and posted[0][2] is None and 'GLM-5.3-Flash' in posted[0][1],
+              posted)
+
+        # Номер вне диапазона — предупреждение, файл конфигурации не трогаем.
+        posted.clear()
+        with _quiet():
+            loop.run_until_complete(bot.handle_topic_command(Event('model 9')))
+        check('topic-model: «model 9» — предупреждение о диапазоне',
+              bool(posted) and 'от 1 до 4' in posted[0][1], posted)
+
+        # Чужой чат: голая 'model' — обычный текст, диспетчер не срабатывает.
+        posted.clear()
+        deleted.clear()
+        ctx_calls.clear()
+        with _quiet():
+            loop.run_until_complete(bot.handle_topic_command(
+                Event('model', chat_id=-1000000000777)))
+        check('topic-model: в чужом чате — тишина',
+              posted == [] and deleted == [] and ctx_calls == ['model'],
+              (posted, deleted, ctx_calls))
+    finally:
+        (bot.telegram_client, bot.topic_command_context,
+         bot.RESULTS_DESTINATION, bot._MODEL_CHOICE_PENDING) = saved
+
+
 def test_model_choice_commands():
-    """Команда /model: список с номерами, разбор номера и применение выбора.
+    """Команда /model (и псевдоним /models): список, разбор номера, запись.
 
     Проверяет и подпись списка, и настоящую запись в MODEL_CONFIG.txt на
     временном файле (боевой файл не трогаем).
     """
-    # 1. Каталог выбора: три модели владельца, порядок = номера.
-    check('model: три позиции в списке', len(bot.MODEL_CHOICES) == 3, bot.MODEL_CHOICES)
+    # 1. Каталог выбора: четыре модели владельца, порядок = номера.
+    check('model: четыре позиции в списке', len(bot.MODEL_CHOICES) == 4, bot.MODEL_CHOICES)
     check('model: №1 — Qwen через OpenRouter',
           bot.MODEL_CHOICES[0][:2] == ('openrouter', 'qwen/qwen3.8-flash'),
           bot.MODEL_CHOICES[0])
@@ -4099,6 +4188,9 @@ def test_model_choice_commands():
     check('model: №3 — Gemini',
           bot.MODEL_CHOICES[2][:2] == ('google', 'gemini-3.8-flash'),
           bot.MODEL_CHOICES[2])
+    check('model: No4 — GLM-5.3-Flash через OpenCode Go',
+          bot.MODEL_CHOICES[3][:2] == ('opencode', 'glm-5.3-flash'),
+          bot.MODEL_CHOICES[3])
 
     # 2. Текст списка: номера, провайдеры и отметка текущей модели.
     menu = bot.format_model_menu('openrouter', 'qwen/qwen3.8-flash')
@@ -4108,6 +4200,8 @@ def test_model_choice_commands():
           '2. DeepSeek V4.1 Flash — OpenCode Go' in menu, menu)
     check('model: в списке есть Gemini',
           '3. Gemini 3.8 Flash — Google Gemini' in menu, menu)
+    check('model: в списке есть GLM-5.3-Flash через OpenCode Go',
+          '4. GLM-5.3-Flash — OpenCode Go' in menu, menu)
     check('model: подсказка про срок ожидания',
           '5 минут' in menu, menu)
     check('model: текущая модель названа', '`qwen/qwen3.8-flash`' in menu, menu)
@@ -4118,10 +4212,28 @@ def test_model_choice_commands():
     # 3. Разбор номера.
     check('model: «1» → 1', bot.parse_model_choice('1') == 1, bot.parse_model_choice('1'))
     check('model: « 3 » → 3', bot.parse_model_choice(' 3 ') == 3)
-    check('model: «4» вне списка → None', bot.parse_model_choice('4') is None)
+    check('model: «4» → 4', bot.parse_model_choice('4') == 4)
+    check('model: «5» вне списка → None', bot.parse_model_choice('5') is None)
     check('model: «0» → None', bot.parse_model_choice('0') is None)
     check('model: «1a» → None', bot.parse_model_choice('1a') is None)
     check('model: пусто → None', bot.parse_model_choice('') is None)
+
+    # 3b. Разбор самой команды: /model, псевдоним /models, голая форма.
+    check('model-cmd: «/model» — команда без номера',
+          bot.parse_model_command('/model') == {'number': None},
+          bot.parse_model_command('/model'))
+    check('model-cmd: «/models» — тот же разбор',
+          bot.parse_model_command('/models') == {'number': None})
+    check('model-cmd: «model 2» → номер 2',
+          bot.parse_model_command('model 2') == {'number': 2})
+    check('model-cmd: « Models 3 » → номер 3',
+          bot.parse_model_command(' Models 3 ') == {'number': 3})
+    check('model-cmd: «modeling» — не команда',
+          bot.parse_model_command('modeling') is None)
+    check('model-cmd: «model2» — не команда',
+          bot.parse_model_command('model2') is None)
+    check('model-cmd: «sum 1d» — не команда',
+          bot.parse_model_command('sum 1d') is None)
 
     # 4. Ожидание номера: только свой чат и только до дедлайна.
     pending = {'chat_id': -100, 'expires_at': 100.0}
@@ -4151,6 +4263,12 @@ def test_model_choice_commands():
         # задачах доходили до 20 685 токенов (замер 28.10), 16 384 обрезало бы.
         check('deepseek OpenCode: выход 32768',
               ds['output_max_tokens'] == 32768, ds)
+        # GLM-5.3-Flash — та же подписка OpenCode Go: окно 1M, выход в
+        # каталоге до 131 072, в запросе режем 32 768 (рассуждения из него же).
+        glm = bot.get_model_generation_config('glm-5.3-flash', provider='opencode')
+        check('glm: окно 1M', glm['context_limit_tokens'] == 1000000, glm)
+        check('glm: выход 32768', glm['output_max_tokens'] == 32768, glm)
+        check('glm: чанк 100K из профиля', glm['chunk_max_chars'] == 100000, glm)
         ds_nv = bot.get_model_generation_config('deepseek-ai/deepseek-v4.1-flash',
                                                 provider='nvidia')
         check('deepseek NVIDIA: выход 16384 (как было)',
@@ -4330,9 +4448,10 @@ def test_model_command_flow():
             loop.run_until_complete(bot.handle_model_command(Event('/model')))
         check('flow: список отправлен в чат команды',
               bool(posted) and posted[0][0] == chat_id, posted)
-        check('flow: в списке все три модели',
+        check('flow: в списке все четыре модели',
               all(x in posted[0][1] for x in ('1. Qwen 3.8 Flash', '2. DeepSeek',
-                                              '3. Gemini 3.8 Flash')), posted[0][1])
+                                              '3. Gemini 3.8 Flash',
+                                              '4. GLM-5.3-Flash')), posted[0][1])
         check('flow: команда /model удалена', deleted == ['/model'], deleted)
         check('flow: ожидание номера включено',
               bot._MODEL_CHOICE_PENDING['chat_id'] == chat_id,
@@ -4377,11 +4496,23 @@ def test_model_command_flow():
         check('flow: /model 1 не включает ожидание',
               bot._MODEL_CHOICE_PENDING['chat_id'] is None, bot._MODEL_CHOICE_PENDING)
 
+        # 4b. Псевдоним /models: тот же список и то же ожидание номера.
+        posted.clear()
+        deleted.clear()
+        with _quiet():
+            loop.run_until_complete(bot.handle_model_command(Event('/models')))
+        check('flow: /models — тот же список',
+              bool(posted) and '4. GLM-5.3-Flash' in posted[0][1], posted)
+        check('flow: /models удалён', deleted == ['/models'], deleted)
+        check('flow: /models включает ожидание',
+              bot._MODEL_CHOICE_PENDING['chat_id'] == chat_id, bot._MODEL_CHOICE_PENDING)
+        bot._MODEL_CHOICE_PENDING = {'chat_id': None, 'expires_at': 0.0}
+
         # 5. Номер вне диапазона — предупреждение, без переключения.
         posted.clear()
         with _quiet():
             loop.run_until_complete(bot.handle_model_command(Event('/model 9', number='9')))
-        check('flow: №9 — предупреждение', bool(posted) and 'от 1 до 3' in posted[0][1], posted)
+        check('flow: №9 — предупреждение', bool(posted) and 'от 1 до 4' in posted[0][1], posted)
         check('flow: №9 — провайдер прежний', bot.LLM_PROVIDER == 'openrouter',
               bot.LLM_PROVIDER)
     finally:

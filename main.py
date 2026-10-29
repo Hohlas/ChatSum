@@ -428,11 +428,14 @@ def provider_display_name(provider=None):
 # Выбор модели для команды /model: (провайдер, модель, подпись). Порядок —
 # это порядок цифр в сообщении. Верхние три — рабочий набор владельца: Qwen
 # через подписку OpenRouter, DeepSeek через подписку OpenCode Go, Gemini.
-# Остальные модели провайдеров остаются доступны через /set_model.
+# Четвёртая — GLM-5.3-Flash на той же подписке OpenCode Go (тот же ключ и
+# тот же шлюз, меняется только имя модели). Остальные модели провайдеров
+# остаются доступны через /set_model.
 MODEL_CHOICES = (
     ('openrouter', 'qwen/qwen3.8-flash', 'Qwen 3.8 Flash'),
     ('opencode', 'deepseek-v4.1-flash', 'DeepSeek V4.1 Flash'),
     ('google', 'gemini-3.8-flash', 'Gemini 3.8 Flash'),
+    ('opencode', 'glm-5.3-flash', 'GLM-5.3-Flash'),
 )
 
 # Сколько ждём номер после списка /model. Ожидание живёт в памяти процесса:
@@ -464,6 +467,25 @@ def parse_model_choice(text):
         return None
     number = int(s)
     return number if 1 <= number <= len(MODEL_CHOICES) else None
+
+
+# Команда выбора модели: '/model', псевдоним '/models' и их голые формы в теме
+# результатов. Необязательное число после слова — номер из списка.
+MODEL_COMMAND_RE = re.compile(r'^/?(?:model|models)(?:\s+(\d+))?\s*$', re.IGNORECASE)
+
+
+def parse_model_command(text):
+    """'model' / '/models' / 'model 2' → {'number': None|int}; иначе None.
+
+    Чистая. Диапазон номера здесь не проверяется — это делает
+    parse_model_choice, чтобы предупреждение о неверном номере жило в одном
+    месте. 'model2' и 'modelsx' командой не считаются.
+    """
+    m = MODEL_COMMAND_RE.match(str(text or '').strip())
+    if not m:
+        return None
+    raw = m.group(1)
+    return {'number': int(raw) if raw is not None else None}
 
 
 def model_choice_is_active(pending, chat_id, now=None):
@@ -981,6 +1003,21 @@ def get_model_generation_config(model_name, provider=None):
             'context_limit_tokens': 128000,
             'output_max_tokens': 32768 if active_provider == 'opencode' else 16384,
             'chunk_max_chars': 60000,
+        })
+        config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])
+    elif model_name in ('glm-5.3-flash', 'glm-5.3'):
+        # GLM-5.3-Flash / GLM-5.3 через подписку OpenCode Go: контекст
+        # 1 000 000, выход до 131 072 (каталог моделей OpenCode). Потолок
+        # ответа в запросе — 32 768, как у DeepSeek на том же шлюзе: скрытые
+        # рассуждения идут из него же. Живой замер 29.10 (GLM-5.3-Flash,
+        # reasoning_effort=low): чанк 12 438 знаков = 3 546 токенов входа →
+        # 212 токенов ответа, рассуждений 0, 2,4 с. Без reasoning_effort
+        # модель думает всегда: на запросе с потолком 32 токена весь потолок
+        # ушёл в рассуждения и текст не вернулся (finish_reason=length).
+        config.update({
+            'context_limit_tokens': 1000000,
+            'output_max_tokens': 32768,
+            'chunk_max_chars': 100000,
         })
         config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])
     elif isinstance(model_name, str) and '/' in model_name:
@@ -6701,7 +6738,7 @@ async def handle_config_command(event):
 `/remove_priority username` - убрать из приоритетных
 `/set_model model_name` - сменить модель AI (активного провайдера)
 `/set_provider google|openrouter|nvidia|opencode` - сменить провайдера
-`/model` - выбрать модель по номеру из списка
+`/model` или `/models` - выбрать модель по номеру из списка
 
 **Обновление:**
 `/reload_config` - перезагрузить конфигурацию из файлов
@@ -6996,18 +7033,16 @@ async def apply_model_choice_by_number(number, chat_id, reply_to=None):
     return True
 
 
-@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/model(?:\s+(\d+))?\s*$'))
-async def handle_model_command(event):
-    """Список моделей с номерами; номер ждём следующим сообщением в этом чате.
+async def _run_model_command(event, raw_number=''):
+    """Общий путь команды выбора модели: `/model(s) [N]` и голая форма в теме.
 
-    `/model 2` выбирает сразу, без ожидания. Ответ идёт в тот же чат, где
-    отправлена команда (в отличие от /show_model, который пишет в канал
-    результатов): номер должен быть рядом со списком.
+    Список уходит туда же, где спросили (в тему форума — в эту тему), номер
+    ждём следующим сообщением в том же чате. `raw_number` — уже разобранный
+    текст номера ('' — номера нет).
     """
     global _MODEL_CHOICE_PENDING
     chat = await event.get_chat()
     chat_name = chat.title if hasattr(chat, 'title') else "Private"
-    raw_number = (event.pattern_match.group(1) or '').strip()
     print(f"\n📥 Команда: /model {raw_number} | Чат: {chat_name}")
     # Отвечаем там же, где спросили: в теме форума — в эту тему, иначе в чат.
     topic = reply_topic_id(event)
@@ -7031,6 +7066,16 @@ async def handle_model_command(event):
         'expires_at': time.monotonic() + MODEL_CHOICE_TTL_SEC,
     }
     await _model_choice_reply(event.chat_id, format_model_menu(), reply_to=topic)
+
+
+@telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/models?(?:\s+(\d+))?\s*$'))
+async def handle_model_command(event):
+    """`/model` и его псевдоним `/models`: список моделей с номерами.
+
+    `/model 2` (и `/models 2`) выбирает сразу, без ожидания. Номер ждём
+    следующим сообщением в том же чате: он должен быть рядом со списком.
+    """
+    await _run_model_command(event, (event.pattern_match.group(1) or '').strip())
 
 
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^\s*(\d{1,2})\s*$'))
@@ -7133,6 +7178,7 @@ async def handle_reload_config_command(event):
 # командой только если дальше идёт sum/copy/период — иначе это обычный текст.
 TOPIC_COMMAND_RE = re.compile(
     r'^(?:sum|copy)(?=[\d+\-]|\s|$)'
+    r'|^models?(?=\s+\d+\s*$|$)'
     r'|^(?:sch|sch_list)$'
     r'|^unsch(?=\s|$)'
     r'|^\d{1,2}:\d{2}\s+(?:/?(?:sum|copy)|\d)',
@@ -7144,12 +7190,24 @@ TOPIC_SCHED_RE = re.compile(r'^(\d{1,2}):(\d{2})\s+(.+)$')
 async def handle_topic_command(event):
     """Команда из темы группы результатов в режиме VPS (без ведущего '/').
 
-    Работает только для сообщений в теме RESULTS_DESTINATION — в других чатах
-    и в General ничего не делает (там обычные команды со слешем). Источник
-    анализа/расписания — чат, название которого совпадает с названием темы.
+    Срабатывает только на сообщения в группе результатов; в остальных чатах
+    команды пишутся со слешем. Источник анализа/расписания — чат, название
+    которого совпадает с названием темы. Исключение — `model`/`models`:
+    выбор модели не зависит от чата-источника, поэтому работает в любой теме
+    группы результатов, включая General.
     """
     if _is_actions_mode():
         return
+    # Голая команда модели: до сопоставления темы с чатом — иначе General и
+    # темы без чата отвечали бы «нет чата с таким названием».
+    if (RESULTS_DESTINATION != 'me'
+            and getattr(event, 'chat_id', None) == RESULTS_DESTINATION):
+        parsed_model = parse_model_command(event.raw_text)
+        if parsed_model is not None:
+            number = parsed_model['number']
+            await _run_model_command(
+                event, '' if number is None else str(number))
+            return
     ctx = await topic_command_context(event)
     if ctx is None:
         if is_results_topic_message(event):
@@ -7233,7 +7291,7 @@ async def handle_help_command(event):
 
 **📥 Где отправлять команды:**
 • в любом чате — со слешем: `/sum 1d`
-• в теме чата в группе результатов — без слеша: `sum1d-`, `copy 3h`, `22:33 sum1d`, `sch`, `unsch` (источник — чат, чьё название совпадает с названием темы)
+• в теме чата в группе результатов — без слеша: `sum1d-`, `copy 3h`, `22:33 sum1d`, `sch`, `unsch`, `model` (источник — чат, чьё название совпадает с названием темы; `model` работает в любой теме группы, включая General)
 
 **📊 Основные команды:**
 
@@ -7275,7 +7333,7 @@ async def handle_help_command(event):
 `/remove_priority username` - убрать из приоритетных
 `/set_model model_name` - сменить модель AI (активного провайдера)
 `/set_provider google|openrouter|nvidia|opencode` - сменить провайдера
-`/model` - выбрать модель по номеру из списка
+`/model` или `/models` - выбрать модель по номеру из списка
 
 `/reload_config` - перезагрузить из файлов
 
@@ -7607,6 +7665,7 @@ async def main():
     print("    /show_model - показать настройки модели AI")
     print("    /set_model - сменить модель AI (активного провайдера)")
     print("    /set_provider - сменить провайдера (google|openrouter|nvidia)")
+    print("    /model, /models - список моделей с номерами и выбор по номеру")
     print("    /add_excluded, /remove_excluded - управление исключенными")
     print("    /add_priority, /remove_priority - управление приоритетными")
     print("    /reload_config - перезагрузить из файлов")
@@ -7618,6 +7677,7 @@ async def main():
     print("    /help - полная справка по командам")
     print("  Из темы канала результатов (без слеша):")
     print("    sum1d / copy 3h / 22:33 sum1d / sch / unsch - чат берётся из названия темы")
+    print("    model [2] - модели: список и выбор по номеру (любая тема группы, вкл. General)")
     print("\n💡 Отправьте команду /sum в любом чате для анализа с AI")
     print("💡 Используйте /copy для экспорта без затрат на API")
     print("=" * 60)
