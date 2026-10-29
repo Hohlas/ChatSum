@@ -475,24 +475,155 @@ def model_choice_is_active(pending, chat_id, now=None):
     return chat_id == pending['chat_id'] and now <= pending['expires_at']
 
 
+# --- MODEL_CONFIG.txt: где что лежит -------------------------------------
+# Строка модели активного провайдера живёт в файле дважды: в блоке своего
+# провайдера (какая модель у него вообще) и в хвостовом разделе «АКТИВНАЯ
+# МОДЕЛЬ» (что выбрано сейчас; читается последней, поэтому она и решает).
+# Обе копии пишет один код ниже и держит их одинаковыми. Блоки ищутся по
+# заголовкам, а не по номерам строк: номера меняются от любой правки руками.
+PROVIDER_BLOCK_HEADERS = {
+    'google': '═══ GOOGLE',
+    'openrouter': '═══ OPENROUTER',
+    'opencode': '═══ OPENCODE',
+    'nvidia': '═══ NVIDIA',
+}
+ACTIVE_SECTION_HEADER = '═══ АКТИВНАЯ МОДЕЛЬ'
+ACTIVE_SECTION_TITLE = '# ═══ АКТИВНАЯ МОДЕЛЬ (строки пишет бот командой /model) ═══'
+MODEL_KEYS = {'google': 'GEMINI_MODEL', 'openrouter': 'OPENROUTER_MODEL',
+              'nvidia': 'NVIDIA_MODEL', 'opencode': 'OPENCODE_MODEL'}
+
+
+def _live_key(line):
+    """Имя ключа у живой строки ('KEY=значение' → 'KEY'); иначе None.
+
+    Живая = непустая и не комментарий. Чистая.
+    """
+    s = line.strip()
+    if not s or s.startswith('#') or '=' not in s:
+        return None
+    return s.split('=', 1)[0].strip().upper()
+
+
+def _model_from_lines(lines, provider):
+    """Значение <ПРЕФИКС>_MODEL= из строк файла (первое вхождение) или ''.
+
+    Первое вхождение — это копия в блоке: она всегда выше хвостовой. Чистая.
+    """
+    key = MODEL_KEYS.get(provider)
+    if key is None:
+        return ''
+    for line in lines:
+        if _live_key(line) == key:
+            return line.split('=', 1)[1].split('#', 1)[0].strip()
+    return ''
+
+
+def _provider_runtime_model(provider):
+    """Модель провайдера из рантайм-глобалов (запасной вариант). Чистая."""
+    return {
+        'google': GEMINI_DEFAULT_MODEL,
+        'openrouter': OPENROUTER_DEFAULT_MODEL,
+        'nvidia': NVIDIA_DEFAULT_MODEL,
+        'opencode': OPENCODE_DEFAULT_MODEL,
+    }.get(provider, '')
+
+
+def _insert_into_provider_block(lines, provider, model_line):
+    """Вставляет строку модели первой живой строкой блока провайдера.
+
+    Блок ищется по заголовку из PROVIDER_BLOCK_HEADERS. Возвращает False,
+    если заголовка нет: тогда вызыватель дописывает строку в конец файла
+    (поведение до этой правки). Меняет lines на месте; файл не читает.
+    """
+    anchor = PROVIDER_BLOCK_HEADERS.get(provider)
+    if anchor is None:
+        return False
+    header_idx = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith('#') and anchor in s:
+            header_idx = i
+            break
+    if header_idx is None:
+        return False
+    for i in range(header_idx + 1, len(lines)):
+        s = lines[i].strip()
+        if not s:
+            continue
+        if s.startswith('#'):
+            if '═══' in s:
+                # Дошли до следующего блока: у этого живых строк нет.
+                lines.insert(i, model_line)
+                return True
+            continue
+        lines.insert(i, model_line)
+        return True
+    lines.append(model_line)
+    return True
+
+
+def _write_active_section(lines, provider, model):
+    """Переписывает хвостовой раздел «АКТИВНАЯ МОДЕЛЬ» целиком.
+
+    Внутри остаются ровно две живые строки: LLM_PROVIDER=<provider> и
+    <ПРЕФИКС>_MODEL=<model>. Живые строки прежнего содержимого (в том числе
+    копия модели прошлого провайдера) удаляются, а комментарии-пояснения
+    раздела сохраняются: они документация, а не данные. Строка LLM_PROVIDER
+    должна остаться в файле одна, поэтому чистится по всему файлу, а не
+    только внутри раздела (PROVIDER / ACTIVE_PROVIDER — наследие). Заголовка
+    раздела нет — дописываем его, файл самолечится. Меняет lines на месте;
+    файл не читает.
+    """
+    legacy = ('LLM_PROVIDER', 'PROVIDER', 'ACTIVE_PROVIDER')
+    lines[:] = [l for l in lines if _live_key(l) not in legacy]
+    start = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith('#') and ACTIVE_SECTION_HEADER in s:
+            start = i
+            break
+    if start is None:
+        while lines and lines[-1].strip() == '':
+            lines.pop()
+        if lines:
+            lines.append('')
+        lines.append(ACTIVE_SECTION_TITLE)
+        start = len(lines) - 1
+    tail = lines[start + 1:]
+    if any(l.strip().startswith('#') and '═══' in l for l in tail):
+        # Внутри раздела оказался чужой блок (правка руками). Не рискуем его
+        # потерей: пару пишем в самый конец файла, раздел не трогаем.
+        while lines and lines[-1].strip() == '':
+            lines.pop()
+    else:
+        kept_tail = [l for l in tail if _live_key(l) is None]
+        while kept_tail and kept_tail[-1].strip() == '':
+            kept_tail.pop()
+        lines[start + 1:] = kept_tail
+    lines.append('')
+    lines.append(f'LLM_PROVIDER={provider}')
+    lines.append('')
+    lines.append(f'{MODEL_KEYS[provider]}={model}')
+
+
 def _persist_llm_provider(filename, provider):
-    """Пишет строку LLM_PROVIDER=<provider> в MODEL_CONFIG.txt, остальное не трогает."""
+    """Пишет активного провайдера и повтор его модели в хвост MODEL_CONFIG.txt.
+
+    Модель берётся из блока провайдера (там источник правды по провайдеру),
+    а если там пусто — из рантайм-глобала. Остальной файл не трогается.
+    """
+    if provider not in MODEL_KEYS:
+        print(f"⚠️ Неизвестный провайдер {provider!r} — LLM_PROVIDER не записан")
+        return False
     try:
         lines = []
         if os.path.exists(filename):
             with open(filename, 'r', encoding='utf-8') as fh:
                 lines = fh.read().splitlines()
-        kept = [
-            line for line in lines
-            if not (line.strip() and not line.strip().startswith('#') and '=' in line
-                    and line.strip().split('=', 1)[0].strip().upper()
-                    in ('LLM_PROVIDER', 'PROVIDER', 'ACTIVE_PROVIDER'))
-        ]
-        if kept and kept[-1].strip() != '':
-            kept.append('')
-        kept.append(f'LLM_PROVIDER={provider}')
+        model = _model_from_lines(lines, provider) or _provider_runtime_model(provider)
+        _write_active_section(lines, provider, model)
         with open(filename, 'w', encoding='utf-8') as fh:
-            fh.write('\n'.join(kept) + '\n')
+            fh.write('\n'.join(lines) + '\n')
         return True
     except Exception as e:
         print(f"⚠️ Не удалось записать LLM_PROVIDER в {filename}: {e}")
@@ -1668,6 +1799,10 @@ def load_model_config(filename):
         # очистку и в долгоживущем процессе, и в кроне через env. Отслеживаем
         # присутствие ключа отдельно от непустого значения (только effort).
         seen_keys = set()
+        # Значения по ключам для предупреждения о дублях: живая строка модели
+        # намеренно лежит в файле дважды (блок + хвост), и если копии
+        # разъехались, «последняя побеждает» сработает молча. Не молчим.
+        seen_values = {}
         file_effort_generic = None
         file_chunk_generic = None
         file_temp_generic = None
@@ -1697,7 +1832,15 @@ def load_model_config(filename):
                              'OPENROUTER_CHUNK_MAX_CHARS', 'NVIDIA_CHUNK_MAX_CHARS',
                              'OPENCODE_CHUNK_MAX_CHARS'):
                     if value:
-                        vals[key] = value.strip() if 'REASONING' not in key and 'PROVIDER' not in key else value.strip().lower() if 'REASONING' in key else value.strip()
+                        new_value = (value.strip().lower() if 'REASONING' in key
+                                     else value.strip())
+                        prev_value = seen_values.get(key)
+                        if prev_value is not None and prev_value != new_value:
+                            print(f"⚠️  Дубликат ключа {key} в {filename}: "
+                                  f"'{prev_value}' перекрыт '{new_value}' — "
+                                  f"действует последняя строка")
+                        seen_values[key] = new_value
+                        vals[key] = new_value
                         if key == 'REASONING_EFFORT':
                             file_effort_generic = value.strip().lower()
                         elif key == 'CHUNK_MAX_CHARS':
@@ -1854,16 +1997,18 @@ def refresh_model_config():
 
 
 def save_model_config(filename, model, use_reasoning, use_html_export=True, provider=None):
-    """
-    Сохраняет модель активного провайдера в файл, preserving остальные
-    строки (read-modify-write). provider=None → активный LLM_PROVIDER.
-    Остальные провайдеры и их параметры не трогаем.
+    """Сохраняет модель провайдера в файл (read-modify-write).
+
+    Строка <ПРЕФИКС>_MODEL= пишется на своё место — первой живой строкой
+    блока провайдера; остальные строки файла сохраняются. Если провайдер
+    активен, хвостовая копия («АКТИВНАЯ МОДЕЛЬ») переписывается на ту же
+    модель: копий должно быть ровно две и они обязаны совпадать.
+    provider=None → активный LLM_PROVIDER.
     """
     active_provider = provider or LLM_PROVIDER
     if active_provider not in ALLOWED_LLM_PROVIDERS:
         active_provider = 'google'
-    model_key = {'google': 'GEMINI_MODEL', 'openrouter': 'OPENROUTER_MODEL',
-                 'nvidia': 'NVIDIA_MODEL', 'opencode': 'OPENCODE_MODEL'}[active_provider]
+    model_key = MODEL_KEYS[active_provider]
     try:
         existing = []
         if os.path.exists(filename):
@@ -1871,17 +2016,21 @@ def save_model_config(filename, model, use_reasoning, use_html_export=True, prov
                 existing = f.read().splitlines()
         kept = []
         for line in existing:
-            s = line.strip()
-            if not s or s.startswith('#') or '=' not in s:
-                kept.append(line)
-                continue
-            k = s.split('=', 1)[0].strip().upper()
-            if k == model_key or (k == 'MODEL' and active_provider == 'google'):
+            k = _live_key(line)
+            if k is not None and (k == model_key
+                                  or (k == 'MODEL' and active_provider == 'google')):
                 continue
             kept.append(line)
-        if kept and kept[-1].strip() != '':
-            kept.append('')
-        kept.append(f"{model_key}={model}")
+        if not _insert_into_provider_block(kept, active_provider, f'{model_key}={model}'):
+            # Заголовка блока нет — файл переписан руками. Прежнее поведение:
+            # строка уходит в конец. В лог, чтобы это не прошло незаметно.
+            print(f"⚠️  {filename}: блок «{PROVIDER_BLOCK_HEADERS.get(active_provider)}» "
+                  f"не найден, {model_key} записан в конец файла")
+            if kept and kept[-1].strip() != '':
+                kept.append('')
+            kept.append(f'{model_key}={model}')
+        if active_provider == LLM_PROVIDER:
+            _write_active_section(kept, active_provider, model)
         with open(filename, 'w', encoding='utf-8') as f:
             f.write('\n'.join(kept) + '\n')
         # Обновляем runtime-глобалы активного провайдера.

@@ -4160,7 +4160,10 @@ def test_model_choice_commands():
         bot.OPENROUTER_CHUNK_MAX_CHARS, bot.OPENCODE_CHUNK_MAX_CHARS = saved_chunks
 
     # 6. Настоящий путь /model на временном конфиге: провайдер + модель в файл,
-    #    глобалы перечитаны.
+    #    глобалы перечитаны. Раскладка файла — как в боевом MODEL_CONFIG.txt:
+    #    блок на провайдера (заголовок + его параметры) и хвостовой раздел
+    #    «АКТИВНАЯ МОДЕЛЬ». Строка модели активного провайдера лежит дважды:
+    #    в блоке и в хвосте (читается последней), и обе копии ведёт бот.
     path = '/tmp/opencode/test_model_choice_cfg.txt'
     keys = ('LLM_PROVIDER', 'CURRENT_MODEL', 'USE_REASONING', 'USE_HTML_EXPORT',
             'MODEL_CONFIG_FILE', 'GEMINI_DEFAULT_MODEL', 'OPENROUTER_DEFAULT_MODEL',
@@ -4168,14 +4171,28 @@ def test_model_choice_commands():
     snap = {k: getattr(bot, k) for k in keys}
     gkeys = ('GEMINI_TEMPERATURE', 'OPENROUTER_TEMPERATURE', 'OPENCODE_TEMPERATURE')
     gsnap = {k: getattr(bot, k) for k in gkeys}
+
+    def tail_lines(text):
+        """Живые строки хвостового раздела «АКТИВНАЯ МОДЕЛЬ». Чистая."""
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if '═══ АКТИВНАЯ МОДЕЛЬ' in line:
+                return [x.strip() for x in lines[i + 1:]
+                        if x.strip() and not x.strip().startswith('#')]
+        return []
+
     try:
         with open(path, 'w', encoding='utf-8') as fh:
-            fh.write('LLM_PROVIDER=google\n'
+            fh.write('# ═══ GOOGLE / GEMINI ═══\n'
                      'GEMINI_MODEL=gemini-3.8-flash\n'
+                     '# ═══ OPENROUTER ═══\n'
                      'OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free\n'
+                     '# ═══ OPENCODE GO ═══\n'
                      'OPENCODE_MODEL=\n'
                      'OPENCODE_REASONING_EFFORT=low\n'
-                     'OPENCODE_CHUNK_MAX_CHARS=40000\n')
+                     'OPENCODE_CHUNK_MAX_CHARS=40000\n'
+                     '# ═══ АКТИВНАЯ МОДЕЛЬ (строки пишет бот командой /model) ═══\n'
+                     'LLM_PROVIDER=google\n')
         bot.MODEL_CONFIG_FILE = path
         new_model = bot.apply_model_selection('opencode', 'deepseek-v4.1-flash')
         text = open(path, encoding='utf-8').read()
@@ -4190,6 +4207,12 @@ def test_model_choice_commands():
               'OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free' in text, text)
         check('model: ровно одна строка LLM_PROVIDER',
               text.count('LLM_PROVIDER=') == 1, text)
+        check('model: строка модели — копия в блоке и копия в хвосте',
+              text.count('OPENCODE_MODEL=deepseek-v4.1-flash') == 2, text)
+        check('model: в хвосте — провайдер и его модель',
+              tail_lines(text) == ['LLM_PROVIDER=opencode',
+                                   'OPENCODE_MODEL=deepseek-v4.1-flash'],
+              tail_lines(text))
 
         # Повторный выбор другой модели: строки не плодятся.
         bot.apply_model_selection('google', 'gemini-3.8-flash')
@@ -4201,12 +4224,34 @@ def test_model_choice_commands():
               (bot.LLM_PROVIDER, bot.CURRENT_MODEL))
         check('model: правка не съела OPENCODE_MODEL',
               'OPENCODE_MODEL=deepseek-v4.1-flash' in text2, text2)
+        check('model: в хвосте остался только активный провайдер',
+              tail_lines(text2) == ['LLM_PROVIDER=google',
+                                    'GEMINI_MODEL=gemini-3.8-flash'],
+              tail_lines(text2))
+        check('model: у Gemini тоже две копии',
+              text2.count('GEMINI_MODEL=gemini-3.8-flash') == 2, text2)
 
         # OPENCODE_* из файла доходят до глобалов.
         check('opencode: effort из файла', bot.OPENCODE_REASONING_EFFORT == 'low',
               bot.OPENCODE_REASONING_EFFORT)
         check('opencode: чанк из файла', bot.OPENCODE_CHUNK_MAX_CHARS == '40000',
               bot.OPENCODE_CHUNK_MAX_CHARS)
+
+        # 6b. Копии разъехались (правка файла руками): действует последняя
+        #     строка, но загрузчик говорит об этом вслух — раньше молчал.
+        import contextlib
+        import io
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write('OPENCODE_MODEL=OLD-MODEL\n'
+                     'LLM_PROVIDER=opencode\n'
+                     'OPENCODE_MODEL=deepseek-v4.1-flash\n')
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            got = bot.load_model_config(path)[0]
+        check('model: расхождение копий — победила последняя строка',
+              got == 'deepseek-v4.1-flash', got)
+        check('model: о расхождении копий сказано в логе',
+              'Дубликат ключа OPENCODE_MODEL' in buf.getvalue(), buf.getvalue())
     finally:
         for k, v in snap.items():
             setattr(bot, k, v)
