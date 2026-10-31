@@ -52,7 +52,7 @@ OPENROUTER_CHUNK_MAX_CHARS=80000   # ~30K токенов входа; потол�
 # 09:00–13:00 МСК
 OPENCODE_MODEL=glm-5.3-flash
 OPENCODE_TEMPERATURE=0
-OPENCODE_REASONING_EFFORT=medium
+OPENCODE_REASONING_EFFORT=low   # low medium high 
 OPENCODE_CHUNK_MAX_CHARS=100000
 
 # ═══ NVIDIA ═════════════════════════════════════════════════════════════════
