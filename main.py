@@ -1083,12 +1083,17 @@ def get_model_generation_config(model_name, provider=None):
         # (каталог моделей шлюза, поле context_length). Бесплатный уровень
         # тратит общий rolling-запас на 7 дней, дальше шлюз отдаёт 429
         # («Free-tier only — uses your rolling 7-day allowance, then returns a
-        # rate-limit error»). Потолок ответа 32 768 — как у той же модели на
-        # OpenCode Go: скрытые рассуждения идут из него же (живой замер 28.10
-        # на счётных задачах — до 20 685 токенов рассуждений).
+        # rate-limit error»).
+        # Потолок ответа 120 000, а не 32 768: скрытые рассуждения идут из того
+        # же бюджета, и на reasoning_effort=high модель тратит его целиком.
+        # Живой замер 02.11 на реальном чате (61 330 знаков входа): при
+        # потолке 32 768 — finish_reason=length, content пустой, ~99k знаков
+        # рассуждений; при 65 536 — нормальный текст (33 349 токенов выхода).
+        # 120 000 — запас к замеру; каталог модели заявляет выход до 128 000,
+        # и шлюз принимает max_completion_tokens=120000 (живая проверка, 200).
         config.update({
             'context_limit_tokens': 1048576,
-            'output_max_tokens': 32768,
+            'output_max_tokens': 120000,
             'chunk_max_chars': 60000,
         })
         config['chunk_overlap_chars'] = chunk_overlap_for(config['chunk_max_chars'])
@@ -3475,6 +3480,27 @@ def _first_choice_text(response):
         return None
 
 
+def _empty_response_error(model, response=None, suffix=''):
+    """Текст ошибки пустого ответа; при finish_reason=length — подсказка.
+
+    length + пустой content означает, что модель потратила весь потолок
+    ответа на рассуждения: reasoning_effort съедает max_completion_tokens,
+    и на текст ничего не остаётся. Без подсказки владелец видит только
+    «нет текста» и не знает причины. Чистая; response может быть None.
+    """
+    finish = None
+    try:
+        if response is not None and response.choices:
+            finish = getattr(response.choices[0], 'finish_reason', None)
+    except Exception:
+        finish = None
+    hint = ''
+    if finish == 'length':
+        hint = (' — модель потратила весь потолок ответа на рассуждения; '
+                'уменьшите reasoning (low/medium) или период анализа')
+    return f"❌ Пустой ответ модели {model} (нет текста{hint}){suffix}"
+
+
 def is_valid_summary(text):
     """
     Проверяет, что ответ содержит саммари, а не сырой JSON.
@@ -4024,8 +4050,9 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
                 # иначе None упадёт ниже в dedupe/join и убьёт весь анализ
                 # после всех успешных чанков. Ошибка уходит в обычный добой.
                 if not chunk_summary or not str(chunk_summary).strip():
-                    error_msg = (f"❌ Пустой ответ модели {actual_model} "
-                                 f"(чанк {chunk_idx}, сообщения {start_idx}-{end_idx})")
+                    error_msg = _empty_response_error(
+                        actual_model, response,
+                        f" (чанк {chunk_idx}, сообщения {start_idx}-{end_idx})")
                     print(f"   {error_msg}")
                     await _safe_notify(
                         notify,
@@ -4344,7 +4371,7 @@ async def create_summary(chunks, chat_id_str, model=None, use_reasoning=False,
         # Пустой ответ (content=None) — честная ошибка, а не успех:
         # иначе None упадёт у вызывателя на .startswith/.
         if not summary or not str(summary).strip():
-            return (f"❌ Пустой ответ модели {actual_model} (нет текста)", None)
+            return (_empty_response_error(actual_model, response), None)
 
         # Порядок тем по важности (тот же ранкер, что и в многочанковом
         # пути; здесь множество сообщений — единственный чанк).

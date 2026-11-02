@@ -1180,6 +1180,17 @@ def test_none_choices_is_error():
               bot._first_choice_text(SimpleNamespace(
                   choices=[SimpleNamespace(
                       message=SimpleNamespace(content=' txt '))])) == ' txt ', '')
+        check('helper: length+пустой текст → подсказка про потолок',
+              'потолок ответа' in bot._empty_response_error(
+                  'm', SimpleNamespace(
+                      choices=[SimpleNamespace(finish_reason='length')])), '')
+        check('helper: stop+пустой текст → без подсказки',
+              'потолок ответа' not in bot._empty_response_error(
+                  'm', SimpleNamespace(
+                      choices=[SimpleNamespace(finish_reason='stop')])), '')
+        check('helper: суффикс чанка дописывается',
+              'чанк 2' in bot._empty_response_error(
+                  'm', None, ' (чанк 2, сообщения 1-2)'), '')
 
         def fake_msg(mid, sender):
             return {'message_id': mid, 'sender': sender,
@@ -4313,7 +4324,7 @@ def test_model_choice_commands():
         bot.TOKENHARBOR_CHUNK_MAX_CHARS = ''
         th = bot.get_model_generation_config('deepseek-v4.1-flash:free', provider='tokenharbor')
         check('tokenharbor: окно 1 048 576', th['context_limit_tokens'] == 1048576, th)
-        check('tokenharbor: выход 32768', th['output_max_tokens'] == 32768, th)
+        check('tokenharbor: выход 120000', th['output_max_tokens'] == 120000, th)
         check('tokenharbor: чанк 60K из профиля', th['chunk_max_chars'] == 60000, th)
         bot.TOKENHARBOR_CHUNK_MAX_CHARS = saved_th_chunk
 
