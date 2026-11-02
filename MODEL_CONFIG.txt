@@ -82,6 +82,6 @@ NVIDIA_CHUNK_MAX_CHARS=40000
 # Модель внизу — повтор строки модели активного провайдера. Читается
 # последней, поэтому именно она решает, какая модель пойдёт в анализ.
 
-LLM_PROVIDER=opencode
+LLM_PROVIDER=tokenharbor
 
-OPENCODE_MODEL=glm-5.3-flash
+TOKENHARBOR_MODEL=deepseek-v4.1-flash:free

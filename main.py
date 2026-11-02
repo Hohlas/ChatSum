@@ -464,6 +464,16 @@ MODEL_CHOICES = (
 # перезапуск его сбрасывает, ничего страшного.
 MODEL_CHOICE_TTL_SEC = 300
 
+# Уровни reasoning в порядке номеров меню. Кортеж, а не set: порядок цифр
+# должен быть стабильным между сообщениями и запусками.
+REASONING_CHOICES = ('none', 'low', 'medium', 'high')
+REASONING_LABELS = {
+    'none': 'без рассуждений',
+    'low': 'низкий',
+    'medium': 'средний',
+    'high': 'высокий',
+}
+
 
 def format_model_menu(current_provider=None, current_model=None):
     """Нумерованный список моделей для /model. Чистая (читает два глобала)."""
@@ -482,6 +492,34 @@ def format_model_menu(current_provider=None, current_model=None):
     return '\n'.join(lines)
 
 
+def format_reasoning_menu(provider=None, model=None):
+    """Нумерованный список уровней reasoning для выбранной модели. Чистая.
+
+    Текущее значение берётся у провайдера модели: в MODEL_CONFIG.txt
+    reasoning задаётся на провайдера (одна строка <ПРЕФИКС>_REASONING_EFFORT),
+    а не на каждое имя модели. Отмеченное ✅ и есть «прежнее значение»,
+    которое останется, если номер не отправлять.
+    """
+    prov = provider or LLM_PROVIDER
+    current = str(provider_reasoning_effort(prov) or '').strip().lower()
+    shown_model = model if model is not None else CURRENT_MODEL
+    lines = ['🧠 **Выберите уровень рассуждений**', '']
+    lines.append(f'Модель: `{shown_model or "не задана"}` '
+                 f'({provider_display_name(prov)})')
+    lines.append('')
+    for number, effort in enumerate(REASONING_CHOICES, 1):
+        mark = ' ✅' if effort == current else ''
+        lines.append(f'{number}. {effort} — {REASONING_LABELS[effort]}{mark}')
+    lines += [
+        '',
+        f'Сейчас: {reasoning_display(prov)}',
+        f'Отправьте номер (1–{len(REASONING_CHOICES)}) в этот чат '
+        f'в течение {MODEL_CHOICE_TTL_SEC // 60} минут.',
+        'Если не отправлять — останется текущее значение.',
+    ]
+    return '\n'.join(lines)
+
+
 def parse_model_choice(text):
     """'2' → номер из MODEL_CHOICES; иначе None. Чистая."""
     s = str(text or '').strip()
@@ -489,6 +527,15 @@ def parse_model_choice(text):
         return None
     number = int(s)
     return number if 1 <= number <= len(MODEL_CHOICES) else None
+
+
+def parse_reasoning_choice(text):
+    """'1'..'4' → номер из REASONING_CHOICES; иначе None. Чистая."""
+    s = str(text or '').strip()
+    if not s.isdigit():
+        return None
+    number = int(s)
+    return number if 1 <= number <= len(REASONING_CHOICES) else None
 
 
 # Команда выбора модели: '/model', псевдоним '/models' и их голые формы в теме
@@ -2157,6 +2204,67 @@ def save_model_config(filename, model, use_reasoning, use_html_export=True, prov
     except Exception as e:
         print(f"❌ Ошибка при сохранении {filename}: {e}")
         return False
+
+
+def save_reasoning_effort(filename, provider, effort):
+    """Пишет <ПРЕФИКС>_REASONING_EFFORT=<effort> в блок провайдера.
+
+    Пустая строка — осознанный сброс (дефолт модели): load_model_config
+    трактует пустое значение как «параметр не отправлять». Значение не из
+    ALLOWED_REASONING_EFFORTS не пишется. Меняет runtime-глобал провайдера;
+    USE_REASONING трогаем только у активного провайдера.
+    """
+    if provider not in MODEL_KEYS:
+        print(f"⚠️ Неизвестный провайдер {provider!r} — reasoning не записан")
+        return False
+    key = REASONING_EFFORT_KEYS.get(provider)
+    if not key:
+        return False
+    value = str(effort or '').strip().lower()
+    if value and value not in ALLOWED_REASONING_EFFORTS:
+        print(f"⚠️ Неверное значение reasoning {effort!r} для {provider}: "
+              f"допустимые {', '.join(REASONING_CHOICES)}")
+        return False
+    try:
+        lines = []
+        if os.path.exists(filename):
+            with open(filename, 'r', encoding='utf-8') as fh:
+                lines = fh.read().splitlines()
+        new_line = f'{key}={value}'
+        replaced = False
+        for i, line in enumerate(lines):
+            if _live_key(line) == key:
+                lines[i] = new_line
+                replaced = True
+                break
+        if not replaced:
+            # Рядом с моделью провайдера: первая живая строка модели — это
+            # копия в блоке (хвостовая идёт ниже). Нет модели — первым живым
+            # в блоке, как это делает save_model_config.
+            model_key = MODEL_KEYS[provider]
+            insert_at = None
+            for i, line in enumerate(lines):
+                if _live_key(line) == model_key:
+                    insert_at = i + 1
+                    break
+            if insert_at is not None:
+                lines.insert(insert_at, new_line)
+            elif not _insert_into_provider_block(lines, provider, new_line):
+                while lines and lines[-1].strip() == '':
+                    lines.pop()
+                if lines:
+                    lines.append('')
+                lines.append(new_line)
+        with open(filename, 'w', encoding='utf-8') as fh:
+            fh.write('\n'.join(lines) + '\n')
+    except Exception as e:
+        print(f"❌ Ошибка при сохранении reasoning в {filename}: {e}")
+        return False
+
+    globals()[key] = value
+    if provider == LLM_PROVIDER:
+        USE_REASONING = bool(value) and value != 'none'
+    return True
 
 
 # Загружаем конфигурацию из файлов при старте
@@ -6859,7 +6967,7 @@ async def handle_config_command(event):
 `/remove_priority username` - убрать из приоритетных
 `/set_model model_name` - сменить модель AI (активного провайдера)
 `/set_provider google|openrouter|nvidia|opencode|tokenharbor` - сменить провайдера
-`/model` или `/models` - выбрать модель по номеру из списка
+`/model` или `/models` - выбрать модель и reasoning по номеру из списка
 
 **Обновление:**
 `/reload_config` - перезагрузить конфигурацию из файлов
@@ -7134,6 +7242,13 @@ async def handle_set_provider_command(event):
 # In-memory: перезапуск бота просто сбрасывает ожидание.
 _MODEL_CHOICE_PENDING = {'chat_id': None, 'expires_at': 0.0}
 
+# Ожидание номера reasoning после выбора модели: тот же чат и дедлайн, плюс
+# провайдер и модель, для которых выбирается уровень. Отдельный словарь, а не
+# флаг: список отвечает за конкретную выбранную модель.
+_REASONING_CHOICE_PENDING = {
+    'chat_id': None, 'provider': None, 'model': None, 'expires_at': 0.0,
+}
+
 
 async def _model_choice_reply(chat_id, text, reply_to=None):
     await telegram_client.send_message(chat_id, text, reply_to=reply_to)
@@ -7142,10 +7257,13 @@ async def _model_choice_reply(chat_id, text, reply_to=None):
 async def apply_model_choice_by_number(number, chat_id, reply_to=None):
     """Применяет выбор из MODEL_CHOICES и отвечает в тот же чат.
 
+    Сразу после подтверждения показывает список reasoning для выбранной
+    модели и ждёт номер: без ответа прежний reasoning не меняется.
     Возвращает True, если выбор применён: вызыватель решает, удалять ли
     сообщение с номером.
     """
     global LLM_PROVIDER, CURRENT_MODEL, USE_REASONING, USE_HTML_EXPORT
+    global _REASONING_CHOICE_PENDING
     provider, model, label = MODEL_CHOICES[number - 1]
     async with config_lock:
         old_provider, old_model = LLM_PROVIDER, CURRENT_MODEL
@@ -7159,7 +7277,47 @@ async def apply_model_choice_by_number(number, chat_id, reply_to=None):
         f'Изменения вступят в силу для следующего анализа.'
     )
     await _model_choice_reply(chat_id, text, reply_to=reply_to)
+    _REASONING_CHOICE_PENDING = {
+        'chat_id': chat_id,
+        'provider': provider,
+        'model': new_model,
+        'expires_at': time.monotonic() + MODEL_CHOICE_TTL_SEC,
+    }
+    await _model_choice_reply(
+        chat_id, format_reasoning_menu(provider, new_model), reply_to=reply_to)
     return True
+
+
+async def apply_reasoning_choice_by_number(number, chat_id, reply_to=None):
+    """Применяет уровень reasoning из REASONING_CHOICES и отвечает в чат.
+
+    Уровень пишется в блок провайдера выбранной модели. Если номер не
+    прислали, эта функция не вызывается и прежнее значение остаётся.
+    """
+    global _REASONING_CHOICE_PENDING
+    pending = _REASONING_CHOICE_PENDING or {}
+    provider = pending.get('provider') or LLM_PROVIDER
+    model = pending.get('model') or CURRENT_MODEL
+    effort = REASONING_CHOICES[number - 1]
+    before = str(provider_reasoning_effort(provider) or '').strip().lower()
+    async with config_lock:
+        ok = save_reasoning_effort(MODEL_CONFIG_FILE, provider, effort)
+    if ok:
+        text = (
+            f'✅ Reasoning изменён ({provider_display_name(provider)}): '
+            f'**{before or "не задан"}** → **{effort}**\n\n'
+            f'Модель: `{model}`\n'
+            f'Reasoning: {reasoning_display(provider)}\n'
+            f'Сохранено в `{MODEL_CONFIG_FILE}`. '
+            f'Изменения вступят в силу для следующего анализа.'
+        )
+    else:
+        text = f'❌ Не удалось сохранить reasoning в `{MODEL_CONFIG_FILE}`'
+    _REASONING_CHOICE_PENDING = {
+        'chat_id': None, 'provider': None, 'model': None, 'expires_at': 0.0,
+    }
+    await _model_choice_reply(chat_id, text, reply_to=reply_to)
+    return bool(ok)
 
 
 async def _run_model_command(event, raw_number=''):
@@ -7169,13 +7327,19 @@ async def _run_model_command(event, raw_number=''):
     ждём следующим сообщением в том же чате. `raw_number` — уже разобранный
     текст номера ('' — номера нет).
     """
-    global _MODEL_CHOICE_PENDING
+    global _MODEL_CHOICE_PENDING, _REASONING_CHOICE_PENDING
     chat = await event.get_chat()
     chat_name = chat.title if hasattr(chat, 'title') else "Private"
     print(f"\n📥 Команда: /model {raw_number} | Чат: {chat_name}")
     # Отвечаем там же, где спросили: в теме форума — в эту тему, иначе в чат.
     topic = reply_topic_id(event)
     await event.delete()
+
+    # Новая команда /model отменяет незавершённый выбор reasoning прошлой
+    # модели: иначе следующая цифра попала бы в старый список.
+    _REASONING_CHOICE_PENDING = {
+        'chat_id': None, 'provider': None, 'model': None, 'expires_at': 0.0,
+    }
 
     if raw_number:
         number = parse_model_choice(raw_number)
@@ -7209,8 +7373,28 @@ async def handle_model_command(event):
 
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^\s*(\d{1,2})\s*$'))
 async def handle_model_choice_number(event):
-    """Номер из списка /model. Любые другие цифры бот не трогает."""
-    global _MODEL_CHOICE_PENDING
+    """Номер из списка /model, затем — из списка reasoning.
+
+    Оба шага живут в одном обработчике осознанно: reasoning спрашивается сразу
+    после выбора модели, и отдельный обработчик на тот же шаблон перехватил бы
+    ту же самую цифру, которой только что выбрали модель. Любые другие цифры
+    бот не трогает.
+    """
+    global _MODEL_CHOICE_PENDING, _REASONING_CHOICE_PENDING
+
+    if model_choice_is_active(_REASONING_CHOICE_PENDING, event.chat_id):
+        number = parse_reasoning_choice(event.raw_text)
+        if number is None:
+            return
+        chat = await event.get_chat()
+        chat_name = chat.title if hasattr(chat, 'title') else "Private"
+        print(f"\n📥 Выбор reasoning по номеру: {number} | Чат: {chat_name}")
+        topic = reply_topic_id(event)
+        await apply_reasoning_choice_by_number(
+            number, event.chat_id, reply_to=topic)
+        await event.delete()
+        return
+
     if not model_choice_is_active(_MODEL_CHOICE_PENDING, event.chat_id):
         return
     number = parse_model_choice(event.raw_text)
@@ -7467,7 +7651,7 @@ async def handle_help_command(event):
 `/remove_priority username` - убрать из приоритетных
 `/set_model model_name` - сменить модель AI (активного провайдера)
 `/set_provider google|openrouter|nvidia|opencode|tokenharbor` - сменить провайдера
-`/model` или `/models` - выбрать модель по номеру из списка
+`/model` или `/models` - выбрать модель и reasoning по номеру из списка
 
 `/reload_config` - перезагрузить из файлов
 

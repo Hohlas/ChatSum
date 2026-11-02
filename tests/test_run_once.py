@@ -4120,11 +4120,14 @@ def test_topic_model_command():
         return None
 
     saved = (bot.telegram_client, bot.topic_command_context,
-             bot.RESULTS_DESTINATION, bot._MODEL_CHOICE_PENDING)
+             bot.RESULTS_DESTINATION, bot._MODEL_CHOICE_PENDING,
+             bot._REASONING_CHOICE_PENDING)
     bot.telegram_client = Client()
     bot.topic_command_context = fake_ctx
     bot.RESULTS_DESTINATION = dest
     bot._MODEL_CHOICE_PENDING = {'chat_id': None, 'expires_at': 0.0}
+    bot._REASONING_CHOICE_PENDING = {
+        'chat_id': None, 'provider': None, 'model': None, 'expires_at': 0.0}
     loop = asyncio.get_event_loop()
     try:
         with _quiet():
@@ -4168,7 +4171,8 @@ def test_topic_model_command():
               (posted, deleted, ctx_calls))
     finally:
         (bot.telegram_client, bot.topic_command_context,
-         bot.RESULTS_DESTINATION, bot._MODEL_CHOICE_PENDING) = saved
+         bot.RESULTS_DESTINATION, bot._MODEL_CHOICE_PENDING,
+         bot._REASONING_CHOICE_PENDING) = saved
 
 
 def test_model_choice_commands():
@@ -4221,6 +4225,35 @@ def test_model_choice_commands():
     check('model: «0» → None', bot.parse_model_choice('0') is None)
     check('model: «1a» → None', bot.parse_model_choice('1a') is None)
     check('model: пусто → None', bot.parse_model_choice('') is None)
+
+    # 3a. Меню reasoning: четыре уровня, текущее значение отмечено.
+    saved_th_eff = (bot.OPENCODE_REASONING_EFFORT, bot.TOKENHARBOR_REASONING_EFFORT)
+    try:
+        bot.OPENCODE_REASONING_EFFORT = 'medium'
+        rmenu = bot.format_reasoning_menu('opencode', 'deepseek-v4.1-flash')
+        check('reasoning-menu: четыре уровня',
+              all(f'{i}. {eff}' in rmenu for i, eff in enumerate(bot.REASONING_CHOICES, 1)),
+              rmenu)
+        check('reasoning-menu: текущее значение отмечено',
+              'medium — средний ✅' in rmenu, rmenu)
+        check('reasoning-menu: модель и провайдер названы',
+              'deepseek-v4.1-flash' in rmenu and 'OpenCode Go' in rmenu, rmenu)
+        check('reasoning-menu: без ответа останется текущее',
+              'останется текущее значение' in rmenu, rmenu)
+        bot.TOKENHARBOR_REASONING_EFFORT = ''
+        empty = bot.format_reasoning_menu('tokenharbor', 'deepseek-v4.1-flash:free')
+        check('reasoning-menu: пусто → дефолт модели, без отметки',
+              'не задан → дефолт модели' in empty and '✅' not in empty, empty)
+        check('reasoning-menu: разбор «1» → 1',
+              bot.parse_reasoning_choice('1') == 1)
+        check('reasoning-menu: разбор «4» → 4',
+              bot.parse_reasoning_choice('4') == 4)
+        check('reasoning-menu: разбор «5» вне списка → None',
+              bot.parse_reasoning_choice('5') is None)
+        check('reasoning-menu: разбор «x» → None',
+              bot.parse_reasoning_choice('x') is None)
+    finally:
+        (bot.OPENCODE_REASONING_EFFORT, bot.TOKENHARBOR_REASONING_EFFORT) = saved_th_eff
 
     # 3b. Разбор самой команды: /model, псевдоним /models, голая форма.
     check('model-cmd: «/model» — команда без номера',
@@ -4478,12 +4511,16 @@ def test_model_command_flow():
     path = '/tmp/opencode/test_model_flow_cfg.txt'
     keys = ('LLM_PROVIDER', 'CURRENT_MODEL', 'MODEL_CONFIG_FILE',
             'GEMINI_DEFAULT_MODEL', 'OPENROUTER_DEFAULT_MODEL',
-            'OPENCODE_DEFAULT_MODEL', 'NVIDIA_DEFAULT_MODEL')
+            'OPENCODE_DEFAULT_MODEL', 'NVIDIA_DEFAULT_MODEL',
+            'GEMINI_REASONING_EFFORT', 'OPENROUTER_REASONING_EFFORT',
+            'OPENCODE_REASONING_EFFORT', 'TOKENHARBOR_REASONING_EFFORT',
+            'USE_REASONING')
     snap = {k: getattr(bot, k) for k in keys}
     # Провайдер на входе — из живого MODEL_CONFIG.txt: он может быть любым
     # (бот пишет туда выбор командой /model), привязываться к 'google' нельзя.
     initial_provider = bot.LLM_PROVIDER
-    saved = (bot.telegram_client, bot._MODEL_CHOICE_PENDING)
+    saved = (bot.telegram_client, bot._MODEL_CHOICE_PENDING,
+             bot._REASONING_CHOICE_PENDING)
     loop = asyncio.get_event_loop()
     chat_id = -1000000000123
     try:
@@ -4495,6 +4532,8 @@ def test_model_command_flow():
         bot.MODEL_CONFIG_FILE = path
         bot.telegram_client = Client()
         bot._MODEL_CHOICE_PENDING = {'chat_id': None, 'expires_at': 0.0}
+        bot._REASONING_CHOICE_PENDING = {
+            'chat_id': None, 'provider': None, 'model': None, 'expires_at': 0.0}
 
         # 1. /model без номера: список ушёл в тот же чат, ожидание включено.
         with _quiet():
@@ -4541,7 +4580,38 @@ def test_model_command_flow():
               'LLM_PROVIDER=opencode' in text and 'OPENCODE_MODEL=deepseek-v4.1-flash' in text,
               text)
 
-        # 4. /model 1 выбирает сразу, без ожидания.
+        # 3b. Сразу после модели — список reasoning для неё.
+        check('flow: reasoning-список показан',
+              len(posted) >= 2 and 'Выберите уровень рассуждений' in posted[1][1], posted)
+        check('flow: reasoning ждёт номер в этом чате',
+              bot._REASONING_CHOICE_PENDING['chat_id'] == chat_id,
+              bot._REASONING_CHOICE_PENDING)
+        check('flow: reasoning привязан к выбранной модели',
+              bot._REASONING_CHOICE_PENDING['provider'] == 'opencode'
+              and bot._REASONING_CHOICE_PENDING['model'] == 'deepseek-v4.1-flash',
+              bot._REASONING_CHOICE_PENDING)
+
+        # 3c. Номер reasoning пишет OPENCODE_REASONING_EFFORT и сбрасывает ожидание.
+        posted.clear()
+        deleted.clear()
+        with _quiet():
+            loop.run_until_complete(bot.handle_model_choice_number(Event('3')))
+        check('flow: reasoning выбран (medium)',
+              bot.OPENCODE_REASONING_EFFORT == 'medium', bot.OPENCODE_REASONING_EFFORT)
+        check('flow: reasoning записан в файл',
+              'OPENCODE_REASONING_EFFORT=medium' in open(path, encoding='utf-8').read())
+        check('flow: подтверждение reasoning',
+              bool(posted) and 'medium' in posted[0][1], posted)
+        check('flow: ожидание reasoning сброшено',
+              bot._REASONING_CHOICE_PENDING['chat_id'] is None,
+              bot._REASONING_CHOICE_PENDING)
+        check('flow: цифра reasoning удалена', deleted == ['3'], deleted)
+        check('flow: USE_REASONING включён', bot.USE_REASONING is True,
+              bot.USE_REASONING)
+
+        # 4. /model 1 выбирает сразу, без ожидания. Reasoning не отправляем —
+        #    у openrouter должно остаться прежнее значение.
+        openrouter_effort_before = bot.OPENROUTER_REASONING_EFFORT
         posted.clear()
         with _quiet():
             loop.run_until_complete(bot.handle_model_command(Event('/model 1', number='1')))
@@ -4552,6 +4622,13 @@ def test_model_command_flow():
               posted)
         check('flow: /model 1 не включает ожидание',
               bot._MODEL_CHOICE_PENDING['chat_id'] is None, bot._MODEL_CHOICE_PENDING)
+        check('flow: /model 1 — reasoning ждёт номер',
+              bot._REASONING_CHOICE_PENDING['chat_id'] == chat_id
+              and bot._REASONING_CHOICE_PENDING['provider'] == 'openrouter',
+              bot._REASONING_CHOICE_PENDING)
+        check('flow: без ответа прежний reasoning не тронут',
+              bot.OPENROUTER_REASONING_EFFORT == openrouter_effort_before,
+              (bot.OPENROUTER_REASONING_EFFORT, openrouter_effort_before))
 
         # 4b. Псевдоним /models: тот же список и то же ожидание номера.
         posted.clear()
@@ -4563,6 +4640,9 @@ def test_model_command_flow():
         check('flow: /models удалён', deleted == ['/models'], deleted)
         check('flow: /models включает ожидание',
               bot._MODEL_CHOICE_PENDING['chat_id'] == chat_id, bot._MODEL_CHOICE_PENDING)
+        check('flow: /models отменил ожидание reasoning',
+              bot._REASONING_CHOICE_PENDING['chat_id'] is None,
+              bot._REASONING_CHOICE_PENDING)
         bot._MODEL_CHOICE_PENDING = {'chat_id': None, 'expires_at': 0.0}
 
         # 5. Номер вне диапазона — предупреждение, без переключения.
@@ -4573,7 +4653,8 @@ def test_model_command_flow():
         check('flow: №9 — провайдер прежний', bot.LLM_PROVIDER == 'openrouter',
               bot.LLM_PROVIDER)
     finally:
-        (bot.telegram_client, bot._MODEL_CHOICE_PENDING) = saved
+        (bot.telegram_client, bot._MODEL_CHOICE_PENDING,
+         bot._REASONING_CHOICE_PENDING) = saved
         for k, v in snap.items():
             setattr(bot, k, v)
         try:
