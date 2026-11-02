@@ -1102,8 +1102,9 @@ def preflight_actions_env():
             and not os.getenv('GOOGLE_API_KEYS', '').strip()
             and not os.getenv('OPENROUTER_API_KEY', '').strip()
             and not os.getenv('OPENCODE_GO_API_KEY', '').strip()
+            and not os.getenv('TOKENHARBOR_API_KEY', '').strip()
             and not os.getenv('NVIDIA_API_KEY', '').strip()):
-        print("❌ Не задан ни один LLM-ключ (GOOGLE_API_KEY/GOOGLE_API_KEYS, OPENROUTER_API_KEY, OPENCODE_GO_API_KEY или NVIDIA_API_KEY). Проверьте Secrets в настройках репозитория.")
+        print("❌ Не задан ни один LLM-ключ (GOOGLE_API_KEY/GOOGLE_API_KEYS, OPENROUTER_API_KEY, OPENCODE_GO_API_KEY, TOKENHARBOR_API_KEY или NVIDIA_API_KEY). Проверьте Secrets в настройках репозитория.")
         ok = False
     return ok
 

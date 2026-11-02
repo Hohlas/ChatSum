@@ -4154,7 +4154,7 @@ def test_topic_model_command():
         with _quiet():
             loop.run_until_complete(bot.handle_topic_command(Event('model 9')))
         check('topic-model: «model 9» — предупреждение о диапазоне',
-              bool(posted) and 'от 1 до 4' in posted[0][1], posted)
+              bool(posted) and 'от 1 до 5' in posted[0][1], posted)
 
         # Чужой чат: голая 'model' — обычный текст, диспетчер не срабатывает.
         posted.clear()
@@ -4177,8 +4177,8 @@ def test_model_choice_commands():
     Проверяет и подпись списка, и настоящую запись в MODEL_CONFIG.txt на
     временном файле (боевой файл не трогаем).
     """
-    # 1. Каталог выбора: четыре модели владельца, порядок = номера.
-    check('model: четыре позиции в списке', len(bot.MODEL_CHOICES) == 4, bot.MODEL_CHOICES)
+    # 1. Каталог выбора: пять моделей владельца, порядок = номера.
+    check('model: пять позиций в списке', len(bot.MODEL_CHOICES) == 5, bot.MODEL_CHOICES)
     check('model: №1 — Qwen через OpenRouter',
           bot.MODEL_CHOICES[0][:2] == ('openrouter', 'qwen/qwen3.8-flash'),
           bot.MODEL_CHOICES[0])
@@ -4191,6 +4191,9 @@ def test_model_choice_commands():
     check('model: No4 — GLM-5.3-Flash через OpenCode Go',
           bot.MODEL_CHOICES[3][:2] == ('opencode', 'glm-5.3-flash'),
           bot.MODEL_CHOICES[3])
+    check('model: No5 — DeepSeek Free через Token Harbor',
+          bot.MODEL_CHOICES[4][:2] == ('tokenharbor', 'deepseek-v4.1-flash:free'),
+          bot.MODEL_CHOICES[4])
 
     # 2. Текст списка: номера, провайдеры и отметка текущей модели.
     menu = bot.format_model_menu('openrouter', 'qwen/qwen3.8-flash')
@@ -4213,7 +4216,8 @@ def test_model_choice_commands():
     check('model: «1» → 1', bot.parse_model_choice('1') == 1, bot.parse_model_choice('1'))
     check('model: « 3 » → 3', bot.parse_model_choice(' 3 ') == 3)
     check('model: «4» → 4', bot.parse_model_choice('4') == 4)
-    check('model: «5» вне списка → None', bot.parse_model_choice('5') is None)
+    check('model: «5» → 5', bot.parse_model_choice('5') == 5)
+    check('model: «6» вне списка → None', bot.parse_model_choice('6') is None)
     check('model: «0» → None', bot.parse_model_choice('0') is None)
     check('model: «1a» → None', bot.parse_model_choice('1a') is None)
     check('model: пусто → None', bot.parse_model_choice('') is None)
@@ -4269,16 +4273,31 @@ def test_model_choice_commands():
         check('glm: окно 1M', glm['context_limit_tokens'] == 1000000, glm)
         check('glm: выход 32768', glm['output_max_tokens'] == 32768, glm)
         check('glm: чанк 100K из профиля', glm['chunk_max_chars'] == 100000, glm)
+        # Token Harbor: та же модель DeepSeek, что на OpenCode Go, но бесплатный
+        # шлюз. Чанк из MODEL_CONFIG.txt (TOKENHARBOR_CHUNK_MAX_CHARS) важнее
+        # профиля, поэтому здесь переопределение временно очищено.
+        saved_th_chunk = bot.TOKENHARBOR_CHUNK_MAX_CHARS
+        bot.TOKENHARBOR_CHUNK_MAX_CHARS = ''
+        th = bot.get_model_generation_config('deepseek-v4.1-flash:free', provider='tokenharbor')
+        check('tokenharbor: окно 1 048 576', th['context_limit_tokens'] == 1048576, th)
+        check('tokenharbor: выход 32768', th['output_max_tokens'] == 32768, th)
+        check('tokenharbor: чанк 60K из профиля', th['chunk_max_chars'] == 60000, th)
+        bot.TOKENHARBOR_CHUNK_MAX_CHARS = saved_th_chunk
 
         # 5b. Подпись reasoning для сообщений о смене модели: значение из
         #     конфига + имя ключа, чтобы владелец видел, где это править.
         saved_effort = (bot.GEMINI_REASONING_EFFORT, bot.OPENROUTER_REASONING_EFFORT,
-                        bot.NVIDIA_REASONING_EFFORT, bot.OPENCODE_REASONING_EFFORT)
+                        bot.NVIDIA_REASONING_EFFORT, bot.OPENCODE_REASONING_EFFORT,
+                        bot.TOKENHARBOR_REASONING_EFFORT)
         try:
             bot.OPENCODE_REASONING_EFFORT = 'medium'
             check('reasoning: opencode — значение и имя ключа',
                   bot.reasoning_display('opencode') == 'medium (OPENCODE_REASONING_EFFORT)',
                   bot.reasoning_display('opencode'))
+            bot.TOKENHARBOR_REASONING_EFFORT = 'low'
+            check('reasoning: tokenharbor — значение и имя ключа',
+                  bot.reasoning_display('tokenharbor') == 'low (TOKENHARBOR_REASONING_EFFORT)',
+                  bot.reasoning_display('tokenharbor'))
             bot.GEMINI_REASONING_EFFORT = 'high'
             check('reasoning: google — свой ключ',
                   bot.reasoning_display('google') == 'high (GEMINI_REASONING_EFFORT)',
@@ -4293,7 +4312,8 @@ def test_model_choice_commands():
                   bot.reasoning_display() == bot.reasoning_display(bot.LLM_PROVIDER))
         finally:
             (bot.GEMINI_REASONING_EFFORT, bot.OPENROUTER_REASONING_EFFORT,
-             bot.NVIDIA_REASONING_EFFORT, bot.OPENCODE_REASONING_EFFORT) = saved_effort
+             bot.NVIDIA_REASONING_EFFORT, bot.OPENCODE_REASONING_EFFORT,
+             bot.TOKENHARBOR_REASONING_EFFORT) = saved_effort
         ds_nv = bot.get_model_generation_config('deepseek-ai/deepseek-v4.1-flash',
                                                 provider='nvidia')
         check('deepseek NVIDIA: выход 16384 (как было)',
@@ -4310,7 +4330,7 @@ def test_model_choice_commands():
     path = '/tmp/opencode/test_model_choice_cfg.txt'
     keys = ('LLM_PROVIDER', 'CURRENT_MODEL', 'USE_REASONING', 'USE_HTML_EXPORT',
             'MODEL_CONFIG_FILE', 'GEMINI_DEFAULT_MODEL', 'OPENROUTER_DEFAULT_MODEL',
-            'NVIDIA_DEFAULT_MODEL', 'OPENCODE_DEFAULT_MODEL')
+            'NVIDIA_DEFAULT_MODEL', 'OPENCODE_DEFAULT_MODEL', 'TOKENHARBOR_DEFAULT_MODEL')
     snap = {k: getattr(bot, k) for k in keys}
     gkeys = ('GEMINI_TEMPERATURE', 'OPENROUTER_TEMPERATURE', 'OPENCODE_TEMPERATURE')
     gsnap = {k: getattr(bot, k) for k in gkeys}
@@ -4418,6 +4438,14 @@ def test_model_choice_commands():
               'https://opencode.ai/inference/go/openai/v1'),
           bot.opencode_client.base_url)
 
+    # 7b. Клиент Token Harbor: адрес шлюза tokenharbor.ai, без спец-заголовков
+    #     (шлюз OpenAI-совместимый, ключ — обычный Bearer).
+    check('tokenharbor: клиент создан',
+          bot.tokenharbor_client is not None, bot.tokenharbor_client)
+    check('tokenharbor: адрес шлюза — tokenharbor.ai/v1',
+          str(bot.tokenharbor_client.base_url).startswith('https://tokenharbor.ai/v1'),
+          bot.tokenharbor_client.base_url)
+
 
 def test_model_command_flow():
     """Сценарий /model: список → номер в том же чате → переключение.
@@ -4473,10 +4501,11 @@ def test_model_command_flow():
             loop.run_until_complete(bot.handle_model_command(Event('/model')))
         check('flow: список отправлен в чат команды',
               bool(posted) and posted[0][0] == chat_id, posted)
-        check('flow: в списке все четыре модели',
+        check('flow: в списке все пять моделей',
               all(x in posted[0][1] for x in ('1. Qwen 3.8 Flash', '2. DeepSeek',
                                               '3. Gemini 3.8 Flash',
-                                              '4. GLM-5.3-Flash')), posted[0][1])
+                                              '4. GLM-5.3-Flash',
+                                              '5. DeepSeek V4.1 Flash Free')), posted[0][1])
         check('flow: команда /model удалена', deleted == ['/model'], deleted)
         check('flow: ожидание номера включено',
               bot._MODEL_CHOICE_PENDING['chat_id'] == chat_id,
@@ -4540,7 +4569,7 @@ def test_model_command_flow():
         posted.clear()
         with _quiet():
             loop.run_until_complete(bot.handle_model_command(Event('/model 9', number='9')))
-        check('flow: №9 — предупреждение', bool(posted) and 'от 1 до 4' in posted[0][1], posted)
+        check('flow: №9 — предупреждение', bool(posted) and 'от 1 до 5' in posted[0][1], posted)
         check('flow: №9 — провайдер прежний', bot.LLM_PROVIDER == 'openrouter',
               bot.LLM_PROVIDER)
     finally:

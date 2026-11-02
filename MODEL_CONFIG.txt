@@ -1,9 +1,9 @@
 # Model settings, tracked in git. One push to main updates VPS and Actions, no Secrets/Variables change.
 # File wins over env; env is fallback only.
-# private.txt holds ONLY keys (TELEGRAM_*, GOOGLE_API_KEY*, OPENROUTER_API_KEY*, OPENCODE_GO_API_KEY).
+# private.txt holds ONLY keys (TELEGRAM_*, GOOGLE_API_KEY*, OPENROUTER_API_KEY*, OPENCODE_GO_API_KEY, NVIDIA_API_KEY, TOKENHARBOR_API_KEY).
 # All MODEL / TEMPERATURE / REASONING_EFFORT / CHUNK_MAX_CHARS live here, per provider.
 # REASONING_EFFORT: none low medium high.
-# LLM_PROVIDER: google | openrouter | opencode | nvidia (default google).
+# LLM_PROVIDER: google | openrouter | opencode | nvidia | tokenharbor (default google).
 # Выбор по номерам — команда /model в боте (пишет сюда же).
 
 # ═══ КАК УСТРОЕН ФАЙЛ ═══════════════════════════════════════════════════════
@@ -55,6 +55,19 @@ OPENCODE_TEMPERATURE=0
 OPENCODE_REASONING_EFFORT=low   # low medium high 
 OPENCODE_CHUNK_MAX_CHARS=100000
 
+# ═══ TOKENHARBOR ════════════════════════════════════════════════════════════
+# Шлюз tokenharbor.ai (OpenAI-совместимый), ключ TOKENHARBOR_API_KEY в private.txt.
+# Модели бесплатного уровня — с суффиксом ':free' (deepseek-v4.1-flash:free,
+# mimo-v2.6-flash:free). Имя без ':free' — платный маршрут.
+# Бесплатный уровень тратит общий запас на 7 дней, дальше 429 (сообщение шлюза);
+# свой запас у каждого ключа.
+# deepseek-v4.1-flash:free — та же модель, что и DeepSeek на OpenCode Go:
+# контекст 1 048 576, ответ в запросе режем 32 768 (рассуждения из него же).
+TOKENHARBOR_MODEL=deepseek-v4.1-flash:free
+TOKENHARBOR_TEMPERATURE=0
+TOKENHARBOR_REASONING_EFFORT=low   # low medium high 
+TOKENHARBOR_CHUNK_MAX_CHARS=100000
+
 # ═══ NVIDIA ═════════════════════════════════════════════════════════════════
 NVIDIA_MODEL=deepseek-ai/deepseek-v4.1-flash
 NVIDIA_TEMPERATURE=0
@@ -62,9 +75,9 @@ NVIDIA_REASONING_EFFORT=low
 NVIDIA_CHUNK_MAX_CHARS=40000
 
 # ═══ АКТИВНАЯ МОДЕЛЬ (строки пишет бот командой /model) ═════════════════════
-# LLM_PROVIDER: google | openrouter | opencode | nvidia (default google).
-# /model даёт четыре номера: openrouter (Qwen), opencode (DeepSeek),
-# google (Gemini), opencode (GLM-5.3-Flash).
+# LLM_PROVIDER: google | openrouter | opencode | nvidia | tokenharbor (default google).
+# /model даёт пять номеров: openrouter (Qwen), opencode (DeepSeek),
+# google (Gemini), opencode (GLM-5.3-Flash), tokenharbor (DeepSeek Free).
 # NVIDIA выбирается только через /set_provider nvidia.
 # Модель внизу — повтор строки модели активного провайдера. Читается
 # последней, поэтому именно она решает, какая модель пойдёт в анализ.

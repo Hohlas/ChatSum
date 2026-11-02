@@ -181,6 +181,7 @@ echo "--- Secrets (LLM-провайдеры; private.txt хранит тольк
 gh_set_secret OPENROUTER_API_KEY "$(get_var OPENROUTER_API_KEY)" 0
 gh_set_secret OPENCODE_GO_API_KEY "$(get_var OPENCODE_GO_API_KEY)" 0
 gh_set_secret NVIDIA_API_KEY "$(get_var NVIDIA_API_KEY)" 0
+gh_set_secret TOKENHARBOR_API_KEY "$(get_var TOKENHARBOR_API_KEY)" 0
 
 echo "--- Variables (публичные; секретные значения кладите в Secrets) ---"
 PROVIDER="$(get_var LLM_PROVIDER)";       [ -n "$PROVIDER" ] || PROVIDER="google"
@@ -217,6 +218,14 @@ gh_set_var NVIDIA_MODEL "$NV_MODEL"
 gh_set_var NVIDIA_TEMPERATURE "$NV_TEMP"
 gh_set_var NVIDIA_REASONING_EFFORT "$NV_EFFORT"
 gh_set_var NVIDIA_CHUNK_MAX_CHARS "$NV_CHUNK"
+TH_MODEL="$(get_var TOKENHARBOR_MODEL)";            [ -n "$TH_MODEL" ] || TH_MODEL="deepseek-v4.1-flash:free"
+TH_TEMP="$(get_var TOKENHARBOR_TEMPERATURE)";       [ -n "$TH_TEMP" ] || TH_TEMP="0"
+TH_EFFORT="$(get_var TOKENHARBOR_REASONING_EFFORT)"; [ -n "$TH_EFFORT" ] || TH_EFFORT="none"
+TH_CHUNK="$(get_var TOKENHARBOR_CHUNK_MAX_CHARS)";  [ -n "$TH_CHUNK" ] || TH_CHUNK="100000"
+gh_set_var TOKENHARBOR_MODEL "$TH_MODEL"
+gh_set_var TOKENHARBOR_TEMPERATURE "$TH_TEMP"
+gh_set_var TOKENHARBOR_REASONING_EFFORT "$TH_EFFORT"
+gh_set_var TOKENHARBOR_CHUNK_MAX_CHARS "$TH_CHUNK"
 
 echo ""
 if [ "$DRY_RUN" = 1 ]; then

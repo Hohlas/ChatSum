@@ -1,6 +1,6 @@
 # Ключи и Telegram. Только секреты — параметров модели здесь нет,
 # они живут в MODEL_CONFIG.txt отдельно на провайдер
-# (GEMINI_* / OPENROUTER_* / NVIDIA_* + LLM_PROVIDER).
+# (GEMINI_* / OPENROUTER_* / NVIDIA_* / OPENCODE_* / TOKENHARBOR_* + LLM_PROVIDER).
 
 # Конфигурация Telegram API
 TELEGRAM_API_ID=ваш_api_id
@@ -25,6 +25,9 @@ GOOGLE_API_KEY3=AIzaSy...
 
 # Ключ NVIDIA (https://build.nvidia.com) для NVIDIA_MODEL.
 # NVIDIA_API_KEY=nvapi-...
+
+# Ключ Token Harbor (https://tokenharbor.ai) для TOKENHARBOR_MODEL.
+# TOKENHARBOR_API_KEY=thk_live_...
 
 # Model settings live in MODEL_CONFIG.txt (LLM_PROVIDER, *_MODEL,
 # *_TEMPERATURE, *_REASONING_EFFORT, *_CHUNK_MAX_CHARS) — tracked in git,
