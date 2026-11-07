@@ -5,10 +5,14 @@
 """
 
 import asyncio
+import json
 import os
 import re
 import sys
 from datetime import datetime, timedelta
+
+from telegraph.exceptions import TelegraphException
+from telegraph.utils import html_to_nodes
 
 # Тест живёт в tests/, а main.py/run_once.py — в корне репо.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -157,6 +161,7 @@ def main():
     test_telegraph_toc()
     test_telegraph_link_stars()
     test_telegraph_part_nav()
+    test_telegraph_payload_limit()
     test_html_report_spoilers()
     test_dedupe_topics()
     test_rank_topics_by_importance()
@@ -2944,6 +2949,62 @@ def test_telegraph_part_nav():
           and '<p><b><a href="https://telegra.ph/P2">← ЧАСТЬ 2</a></b></p>' in html
           and '<p><b><a href="https://telegra.ph/P4">ЧАСТЬ 4 →</a></b></p>' in html,
           html)
+
+
+def test_telegraph_payload_limit():
+    """Размер части меряется нагрузкой API (JSON узлов), а не байтами HTML.
+
+    Инцидент 07.11.2026: часть с 49265 байт HTML отвергнута с CONTENT_TOO_BIG.
+    Живой замер API: 65512 байт нагрузки принято, 65541 — отклонено
+    (предел 65536 = 64 КиБ). На саммари с обилием ссылок JSON примерно в
+    1.3 раза больше HTML, поэтому порог 50000 «по HTML» не защищал.
+    """
+    md = (
+        '💡 **Тема**\n'
+        '*Идея.*\n\n'
+        + '\n'.join(f'[User{i}](https://t.me/c/1/{i}): строка текста номер {i}'
+                    for i in range(40))
+        + '\n'
+    )
+    html = bot.convert_markdown_to_html(md)
+    size = bot.telegraph_payload_size(html)
+    expected = len(json.dumps(html_to_nodes(html), ensure_ascii=False,
+                              separators=(',', ':')).encode('utf-8'))
+    check('payload: совпадает с нагрузкой библиотеки', size == expected, (size, expected))
+    check('payload: JSON больше HTML на ссылках',
+          size > len(html.encode('utf-8')), (size, len(html.encode('utf-8'))))
+    check('payload: пустой HTML — мизер', bot.telegraph_payload_size('') < 10,
+          bot.telegraph_payload_size(''))
+    check('payload: наш порог ниже предела API',
+          bot.MAX_TELEGRAPH_PAYLOAD < 65536, bot.MAX_TELEGRAPH_PAYLOAD)
+
+    footer = '\n---\ncreated by [ChatSumBot](https://github.com/Hohlas/ChatSum) \n'
+    with_nav = bot.build_part_page_content(
+        '💡 **Тема**\nтекст', footer,
+        prev_part=(1, 'https://telegra.ph/CHast-1-11-07'),
+        next_part=(3, 'https://telegra.ph/CHast-3-11-07'))
+    overhead = (bot.telegraph_payload_size(bot.convert_markdown_to_html(with_nav))
+                - bot.telegraph_payload_size(bot.convert_markdown_to_html('💡 **Тема**\nтекст' + footer)))
+    check('payload: ссылки «назад/вперёд» укладываются в запас',
+          0 < overhead < 65536 - bot.MAX_TELEGRAPH_PAYLOAD, overhead)
+
+    class FakeTooBig:
+        def create_page(self, **kwargs):
+            raise TelegraphException('CONTENT_TOO_BIG')
+
+    loop = asyncio.get_event_loop()
+    raised = False
+    with _quiet():
+        try:
+            loop.run_until_complete(bot.publish_to_telegraph(
+                'Заголовок', '💡 **Тема**\nтекст',
+                telegraph_client=FakeTooBig(), raise_too_big=True))
+        except bot.TelegraphContentTooBig:
+            raised = True
+        r = loop.run_until_complete(bot.publish_to_telegraph(
+            'Заголовок', '💡 **Тема**\nтекст', telegraph_client=FakeTooBig()))
+    check('too_big: выброшено исключение для переразбиения', raised)
+    check('too_big: без флага — прежнее поведение (None)', r is None, r)
 
 
 def test_html_report_spoilers():

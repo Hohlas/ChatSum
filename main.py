@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from telegraph import Telegraph
 from telegraph.exceptions import RetryAfterError
+from telegraph.utils import html_to_nodes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -5172,7 +5173,46 @@ async def edit_telegraph_page(page_url, title, content, author_name="ChatSumBot"
     return False
 
 
-async def publish_to_telegraph(title, content, author_name="Chat Filter Bot", telegraph_client=None, max_retries=3):
+class TelegraphContentTooBig(Exception):
+    """API отверг страницу по размеру (CONTENT_TOO_BIG)."""
+
+
+# Предел API — 65536 байт нагрузки (замер 2026-11-07: 65512 принято, 65541 нет).
+# Берём 60000: запас на ссылки «назад/вперёд» и на состав узлов.
+MAX_TELEGRAPH_PAYLOAD = 60000
+# Сколько раз переразбивать весь набор, если API всё же сказал CONTENT_TOO_BIG.
+MAX_TELEGRAPH_RESPLITS = 2
+
+
+def telegraph_payload_size(html_content):
+    """Размер нагрузки, которую реально видит API Telegraph.
+
+    Библиотека не отправляет HTML: create_page превращает его в дерево узлов
+    (html_to_nodes) и шлёт JSON'ом (json_dumps, ensure_ascii=False). Ошибка
+    CONTENT_TOO_BIG считается по этой нагрузке, а не по байтам HTML — живой
+    замер 2026-11-07: 65512 байт принято, 65541 отклонено (предел 64 КиБ).
+    На саммари с обилием ссылок JSON примерно в 1.3 раза больше HTML, поэтому
+    измерение по HTML занижает размер и часть уходит за предел незамеченной.
+
+    Args:
+        html_content: HTML уже после convert_markdown_to_html
+
+    Returns:
+        Размер JSON-нагрузки в байтах UTF-8.
+    """
+    try:
+        nodes = html_to_nodes(html_content)
+    except Exception as e:
+        # Формат не по зубам парсеру библиотеки: публикация всё равно упадёт
+        # в publish_to_telegraph, но делитель должен видеть «большой» размер.
+        print(f"⚠️  Не удалось посчитать нагрузку Telegraph: {e}")
+        return len(html_content.encode('utf-8')) * 2
+    payload = json.dumps(nodes, ensure_ascii=False, separators=(',', ':'))
+    return len(payload.encode('utf-8'))
+
+
+async def publish_to_telegraph(title, content, author_name="Chat Filter Bot", telegraph_client=None,
+                               max_retries=3, raise_too_big=False):
     """
     Публикует статью в Telegraph с обработкой ограничений частоты запросов (flood control).
     
@@ -5182,12 +5222,15 @@ async def publish_to_telegraph(title, content, author_name="Chat Filter Bot", te
         author_name: Имя автора (опционально)
         telegraph_client: Существующий клиент Telegraph (для переиспользования аккаунта)
         max_retries: Максимальное количество попыток при flood control (по умолчанию 3)
+        raise_too_big: при CONTENT_TOO_BIG бросить TelegraphContentTooBig вместо None —
+            вызывающий код умеет переразбить набор частей и повторить
     
     Returns:
         URL опубликованной статьи или None при ошибке
     """
     retry_count = 0
     base_delay = 3  # Базовая задержка из сообщения об ошибке Telegraph
+    html_content = ''
     
     while retry_count <= max_retries:
         try:
@@ -5234,7 +5277,11 @@ async def publish_to_telegraph(title, content, author_name="Chat Filter Bot", te
             print(f"❌ Ошибка при публикации в Telegraph: {error_str}")
             if 'CONTENT_TOO_BIG' in error_str:
                 html_size = len(html_content.encode('utf-8'))
-                print(f"   📏 Размер HTML: {html_size} байт (лимит Telegraph ~64KB)")
+                payload_size = telegraph_payload_size(html_content)
+                print(f"   📏 HTML: {html_size} байт, нагрузка API: {payload_size} байт "
+                      f"(лимит 65536 = 64 КиБ)")
+                if raise_too_big:
+                    raise TelegraphContentTooBig(error_str) from e
             import traceback
             traceback.print_exc()
             return None
@@ -6084,7 +6131,7 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                 cur = []
                 for item in items:
                     test = separator.join(cur + [item]) + footer
-                    if len(convert_markdown_to_html(test).encode('utf-8')) > max_size and cur:
+                    if telegraph_payload_size(convert_markdown_to_html(test)) > max_size and cur:
                         res.append(separator.join(cur))
                         cur = [item]
                     else:
@@ -6094,34 +6141,37 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                 return res
 
             article_title = f"Саммари чата: {chat_name}"
-            
-            # Делим очищенный саммари на темы для публикации в Telegraph
-            # (лимит ~64KB HTML на страницу, оставляем запас ~50KB)
-            MAX_PART_HTML = 50000
+
+            # Делим очищенный саммари на темы для публикации в Telegraph.
+            # Меряем не байты HTML: библиотека шлёт JSON дерева узлов
+            # (create_page → html_to_nodes → json_dumps), и CONTENT_TOO_BIG
+            # считается по этой нагрузке (см. telegraph_payload_size).
             topics = [t.strip() for t in clean_summary.split('\n---\n') if t.strip()]
-            parts = _split_content(topics, '\n---\n', bot_footer, MAX_PART_HTML)
-            # Дополнительное дробление: если часть всё ещё превышает лимит,
-            # разбиваем её по параграфам (\n\n)
-            final_parts = []
-            for part in parts:
-                if len(convert_markdown_to_html(part + bot_footer).encode('utf-8')) > MAX_PART_HTML:
-                    sub_topics = [p.strip() for p in part.split('\n\n') if p.strip()]
-                    sub_parts = _split_content(sub_topics, '\n\n', bot_footer, MAX_PART_HTML)
-                    # Если всё ещё слишком большие — бьём по строкам
-                    for sp in sub_parts:
-                        if len(convert_markdown_to_html(sp + bot_footer).encode('utf-8')) > MAX_PART_HTML:
-                            lines = [l for l in sp.split('\n') if l.strip()]
-                            line_parts = _split_content(lines, '\n', bot_footer, MAX_PART_HTML)
-                            final_parts.extend(line_parts)
-                        else:
-                            final_parts.append(sp)
-                else:
-                    final_parts.append(part)
-            parts = final_parts
-            if len(parts) > 1:
-                summary_parts = [(f"Часть {i + 1}", content, None, None) for i, content in enumerate(parts)]
-            else:
-                summary_parts = [(None, parts[0] if parts else clean_summary, None, None)]
+
+            def _split_into_parts(payload_limit):
+                """Части по темам; крупная часть дробится по абзацам, затем по строкам."""
+                result = []
+                for part in _split_content(topics, '\n---\n', bot_footer, payload_limit):
+                    if telegraph_payload_size(convert_markdown_to_html(part + bot_footer)) > payload_limit:
+                        sub_topics = [p.strip() for p in part.split('\n\n') if p.strip()]
+                        for sp in _split_content(sub_topics, '\n\n', bot_footer, payload_limit):
+                            if telegraph_payload_size(convert_markdown_to_html(sp + bot_footer)) > payload_limit:
+                                lines = [l for l in sp.split('\n') if l.strip()]
+                                result.extend(_split_content(lines, '\n', bot_footer, payload_limit))
+                            else:
+                                result.append(sp)
+                    else:
+                        result.append(part)
+                return result
+
+            def _summary_parts_from(parts_list):
+                if len(parts_list) > 1:
+                    return [(f"Часть {i + 1}", content, None, None)
+                            for i, content in enumerate(parts_list)]
+                return [(None, parts_list[0] if parts_list else clean_summary, None, None)]
+
+            parts = _split_into_parts(MAX_TELEGRAPH_PAYLOAD)
+            summary_parts = _summary_parts_from(parts)
             
             if len(summary_parts) > 1:
                 if post_as_telegram:
@@ -6148,41 +6198,75 @@ async def run_analysis(chat_id, chat_name, hours=None, days=None, limit=None,
                     
                     article_urls = []
                     published_pages = []
-                    for part_idx, (part_title, part_content, start_idx, end_idx) in enumerate(summary_parts, 1):
-                        # Ссылка «назад» известна сразу (предыдущая часть уже
-                        # опубликована); «вперёд» — только после публикации
-                        # следующей, её дописываем вторым проходом.
-                        prev_page = published_pages[-1] if published_pages else None
-                        prev_part = (prev_page['num'], prev_page['url']) if prev_page else None
-                        part_with_footer = build_part_page_content(
-                            part_content, bot_footer, prev_part=prev_part)
-                        part_article_title = f"Саммари чата: {chat_name} - Часть {part_idx}"
-                        
-                        part_url = await publish_to_telegraph(
-                            part_article_title, 
-                            part_with_footer, 
-                            author_name="ChatSumBot",
-                            telegraph_client=telegraph_client
-                        )
-                        
-                        if part_url:
-                            article_urls.append((part_title, part_url))
-                            published_pages.append({
-                                'num': part_idx,
-                                'url': part_url,
-                                'title': part_article_title,
-                                'body': part_content,
-                                'prev': prev_part,
-                            })
-                            print(f"   ✅ Часть {part_idx}: {part_url}")
-                        else:
-                            print(f"   ❌ Не удалось опубликовать часть {part_idx}")
-                            article_urls.append((part_title, None))
-                        
-                        # Пауза между публикациями (кроме последней части)
-                        if part_idx < len(summary_parts):
-                            print(f"   ⏳ Пауза 4 секунды перед следующей публикацией...")
-                            await asyncio.sleep(4)
+                    current_limit = MAX_TELEGRAPH_PAYLOAD
+
+                    async def _publish_parts(parts_to_publish):
+                        """Публикует части по порядку.
+
+                        Returns:
+                            (article_urls, published_pages, too_big): too_big —
+                            API отверг часть по размеру, набор надо переразбить.
+                        """
+                        urls, pages = [], []
+                        for part_idx, (part_title, part_content, start_idx, end_idx) in enumerate(parts_to_publish, 1):
+                            # Ссылка «назад» известна сразу (предыдущая часть уже
+                            # опубликована); «вперёд» — только после публикации
+                            # следующей, её дописываем вторым проходом.
+                            prev_page = pages[-1] if pages else None
+                            prev_part = (prev_page['num'], prev_page['url']) if prev_page else None
+                            part_with_footer = build_part_page_content(
+                                part_content, bot_footer, prev_part=prev_part)
+                            part_article_title = f"Саммари чата: {chat_name} - Часть {part_idx}"
+
+                            try:
+                                part_url = await publish_to_telegraph(
+                                    part_article_title,
+                                    part_with_footer,
+                                    author_name="ChatSumBot",
+                                    telegraph_client=telegraph_client,
+                                    raise_too_big=True,
+                                )
+                            except TelegraphContentTooBig:
+                                # Дальше публиковать нет смысла — набор будет
+                                # переразбит целиком (см. цикл ниже).
+                                print(f"   ❌ Часть {part_idx} отклонена API: CONTENT_TOO_BIG")
+                                urls.append((part_title, None))
+                                return urls, pages, True
+
+                            if part_url:
+                                urls.append((part_title, part_url))
+                                pages.append({
+                                    'num': part_idx,
+                                    'url': part_url,
+                                    'title': part_article_title,
+                                    'body': part_content,
+                                    'prev': prev_part,
+                                })
+                                print(f"   ✅ Часть {part_idx}: {part_url}")
+                            else:
+                                print(f"   ❌ Не удалось опубликовать часть {part_idx}")
+                                urls.append((part_title, None))
+
+                            # Пауза между публикациями (кроме последней части)
+                            if part_idx < len(parts_to_publish):
+                                print(f"   ⏳ Пауза 4 секунды перед следующей публикацией...")
+                                await asyncio.sleep(4)
+                        return urls, pages, False
+
+                    for resplit in range(MAX_TELEGRAPH_RESPLITS + 1):
+                        article_urls, published_pages, too_big = await _publish_parts(summary_parts)
+                        if not too_big or resplit == MAX_TELEGRAPH_RESPLITS:
+                            break
+                        # API отверг часть по размеру, хотя наш замер был в норме:
+                        # делим ВЕСЬ текст на N+1 частей (порог уменьшается
+                        # пропорционально), а не только ту часть, на которой
+                        # сработала ошибка. Страницы, созданные в этой попытке,
+                        # остаются без ссылок — удалять их API не умеет.
+                        target_count = len(summary_parts) + 1
+                        current_limit = int(current_limit * len(summary_parts) / target_count)
+                        print(f"⚠️  Переразбиваю весь текст на {target_count} частей "
+                              f"(порог {current_limit} байт нагрузки)...")
+                        summary_parts = _summary_parts_from(_split_into_parts(current_limit))
                     
                     # Второй проход: ссылка «вперёд» на каждой части, кроме
                     # последней опубликованной. Правка содержимого — единственный

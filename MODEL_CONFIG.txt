@@ -67,7 +67,7 @@ OPENCODE_CHUNK_MAX_CHARS=100000
 # 61 330 знаков входа → finish_reason=length, текст пустой; 65 536 → ответ есть).
 TOKENHARBOR_MODEL=deepseek-v4.1-flash:free
 TOKENHARBOR_TEMPERATURE=0
-TOKENHARBOR_REASONING_EFFORT=high
+TOKENHARBOR_REASONING_EFFORT=medium
 TOKENHARBOR_CHUNK_MAX_CHARS=100000
 
 # ═══ NVIDIA ═════════════════════════════════════════════════════════════════
