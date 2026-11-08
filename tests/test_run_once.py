@@ -177,10 +177,14 @@ def main():
     test_run_analysis_reuses_passed_topic()
     test_reply_topic_id()
     test_topic_command_re()
+    test_topic_command_public_re()
+    test_sender_is_results_admin()
+    test_safe_delete_event()
     test_topic_command_context()
     test_topic_command_routing()
     test_topic_schedule_helpers()
     test_topic_dispatch()
+    test_topic_command_incoming()
     test_topic_model_command()
     test_model_choice_commands()
     test_model_command_flow()
@@ -4133,6 +4137,102 @@ def test_topic_command_re():
               bot.TOPIC_COMMAND_RE.match(text) is None, text)
 
 
+def test_topic_command_public_re():
+    """Публичный шаблон темы: sum/copy/sch/unsch/HH:MM — да; model/число — нет."""
+    yes = ['sum', 'sum1d-', 'sum 1d+', 'copy 3h', 'Sum2d', 'sch', 'sch_list',
+           'unsch', '22:33 sum1d', '9:05 1d+', 'unsch t.me/chat']
+    no = ['model', 'models', 'model 2', 'Models 3', '12:30 встреча',
+          'доклад 12:30', 'summary', 'help', '/sum1d']
+    for text in yes:
+        check(f'public-topic: {text!r} — команда',
+              bool(bot.TOPIC_COMMAND_PUBLIC_RE.match(text)), text)
+    for text in no:
+        check(f'public-topic: {text!r} — не команда',
+              bot.TOPIC_COMMAND_PUBLIC_RE.match(text) is None, text)
+
+
+def test_sender_is_results_admin():
+    """Права отправителя: админ/создатель → True; 'me'/пусто/ошибка → False."""
+    calls = []
+
+    class Perms:
+        def __init__(self, is_admin=False, is_creator=False):
+            self.is_admin = is_admin
+            self.is_creator = is_creator
+
+    class Client:
+        async def get_permissions(self, dest, user):
+            calls.append(user)
+            if user == 999:
+                raise RuntimeError('api down')
+            return Perms(is_admin=(user == 1), is_creator=(user == 3))
+
+    saved = (bot.telegram_client, bot.RESULTS_DESTINATION,
+             dict(bot._RESULTS_ADMIN_CACHE))
+    bot.telegram_client = Client()
+    bot.RESULTS_DESTINATION = -100
+    bot._RESULTS_ADMIN_CACHE.clear()
+    loop = asyncio.get_event_loop()
+    try:
+        check('admin-check: админ → True',
+              loop.run_until_complete(bot.sender_is_results_admin(1)) is True)
+        check('admin-check: создатель → True',
+              loop.run_until_complete(bot.sender_is_results_admin(3)) is True)
+        check('admin-check: не-админ → False',
+              loop.run_until_complete(bot.sender_is_results_admin(2)) is False)
+
+        calls.clear()
+        loop.run_until_complete(bot.sender_is_results_admin(1))
+        check('admin-check: успешный ответ из кэша без запроса', calls == [], calls)
+
+        check('admin-check: ошибка API → отказ',
+              loop.run_until_complete(bot.sender_is_results_admin(999)) is False)
+        calls.clear()
+        loop.run_until_complete(bot.sender_is_results_admin(999))
+        check('admin-check: ошибка не кэшируется', calls == [999], calls)
+
+        calls.clear()
+        bot.RESULTS_DESTINATION = 'me'
+        check('admin-check: «me» → False',
+              loop.run_until_complete(bot.sender_is_results_admin(1)) is False)
+        check('admin-check: «me» без запроса', calls == [], calls)
+
+        bot.RESULTS_DESTINATION = -100
+        check('admin-check: пустой id → False',
+              loop.run_until_complete(bot.sender_is_results_admin(None)) is False)
+    finally:
+        (bot.telegram_client, bot.RESULTS_DESTINATION, _cache) = saved
+        bot._RESULTS_ADMIN_CACHE.clear()
+        bot._RESULTS_ADMIN_CACHE.update(_cache)
+
+
+def test_safe_delete_event():
+    """Удаление best-effort: отказ Telegram не роняет обработку команды."""
+    class BadEvent:
+        async def delete(self):
+            raise RuntimeError('нет прав на удаление')
+
+    class OkEvent:
+        deleted = False
+
+        async def delete(self):
+            self.deleted = True
+
+    loop = asyncio.get_event_loop()
+    with _quiet():
+        try:
+            loop.run_until_complete(bot._safe_delete_event(BadEvent()))
+            ok = True
+        except Exception:
+            ok = False
+    check('safe-delete: отказ удаления не роняет обработку', ok)
+
+    ev = OkEvent()
+    with _quiet():
+        loop.run_until_complete(bot._safe_delete_event(ev))
+    check('safe-delete: обычное удаление работает', ev.deleted is True)
+
+
 def _topic_fakes():
     """Фейки группы результатов: форум с темами + чаты-источники в диалогах."""
     from types import SimpleNamespace as NS
@@ -4365,6 +4465,78 @@ def test_topic_dispatch():
     finally:
         (bot.telegram_client, bot.topic_command_context, bot.process_chat_command,
          bot._schedule_list_text) = saved
+
+
+def test_topic_command_incoming():
+    """Чужой админ в теме → выполняется; не-админ → отказ без выполнения."""
+    from types import SimpleNamespace as NS
+
+    dest = -1000000000999
+    posted, dispatched = [], []
+
+    class Event:
+        chat_id = dest
+        id = 88
+        sender_id = 555
+        raw_text = 'sum20'
+        message = NS(reply_to=NS(forum_topic=True, reply_to_msg_id=7))
+
+    class Foreign(Event):
+        chat_id = -1000000000777
+
+    class Client:
+        async def send_message(self, d, text, reply_to=None):
+            posted.append((d, text, reply_to))
+
+    async def fake_dispatch(event):
+        dispatched.append(event.raw_text)
+
+    async def is_admin(sid):
+        return True
+
+    async def not_admin(sid):
+        return False
+
+    saved = (bot.telegram_client, bot.RESULTS_DESTINATION, bot._is_actions_mode,
+             bot.sender_is_results_admin, bot._dispatch_topic_command)
+    bot.telegram_client = Client()
+    bot.RESULTS_DESTINATION = dest
+    bot._is_actions_mode = lambda: False
+    bot._dispatch_topic_command = fake_dispatch
+    loop = asyncio.get_event_loop()
+    try:
+        bot.sender_is_results_admin = is_admin
+        with _quiet():
+            loop.run_until_complete(bot.handle_topic_command_incoming(Event()))
+        check('incoming-topic: админ → команда выполнена',
+              dispatched == ['sum20'] and posted == [], (dispatched, posted))
+
+        dispatched.clear()
+        posted.clear()
+        bot.sender_is_results_admin = not_admin
+        with _quiet():
+            loop.run_until_complete(bot.handle_topic_command_incoming(Event()))
+        check('incoming-topic: не-админ → отказ без выполнения',
+              dispatched == [] and posted
+              and posted[0][0] == dest and posted[0][2] == 7
+              and 'Нет прав' in posted[0][1], (dispatched, posted))
+
+        dispatched.clear()
+        posted.clear()
+        bot.sender_is_results_admin = is_admin
+        with _quiet():
+            loop.run_until_complete(bot.handle_topic_command_incoming(Foreign()))
+        check('incoming-topic: чужой чат → тишина',
+              dispatched == [] and posted == [], (dispatched, posted))
+
+        bot.RESULTS_DESTINATION = 'me'
+        with _quiet():
+            loop.run_until_complete(bot.handle_topic_command_incoming(Event()))
+        check('incoming-topic: «me» → тишина',
+              dispatched == [] and posted == [], (dispatched, posted))
+    finally:
+        (bot.telegram_client, bot.RESULTS_DESTINATION, bot._is_actions_mode,
+         bot.sender_is_results_admin, bot._dispatch_topic_command) = saved
 
 
 def test_topic_model_command():

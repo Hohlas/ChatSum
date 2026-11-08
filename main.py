@@ -6867,8 +6867,10 @@ async def process_chat_command(event, use_ai=True, topic_ctx=None):
         params = " ".join(parts[1:]) if len(parts) > 1 else "(по умолчанию 24h)"
         print(f"\n📥 Команда: {command_name} {params} | Чат: {chat_name_log}")
 
-        # Удаляем команду из чата (для приватности)
-        await event.delete()
+        # Удаляем команду из чата (для приватности). Best-effort: своё
+        # сообщение уходит всегда, чужое — только с админ-правом «Удалять
+        # сообщения», и Telegram может отказать молча — анализ всё равно идём.
+        await _safe_delete_event(event)
         
         # Тема уже известна, если команда пришла из неё — не ищем заново
         topic_id = home_topic or await get_or_create_topic(chat_name)
@@ -7737,18 +7739,136 @@ TOPIC_COMMAND_RE = re.compile(
     r'|^unsch(?=\s|$)'
     r'|^\d{1,2}:\d{2}\s+(?:/?(?:sum|copy)|\d)',
     re.IGNORECASE)
+# Подмножество TOPIC_COMMAND_RE для ЧУЖИХ администраторов: ветки model/models
+# здесь нет — выбор модели остаётся только за владельцем. Голое число тоже не
+# попадает: им управляет отдельный обработчик (handle_model_choice_number).
+TOPIC_COMMAND_PUBLIC_RE = re.compile(
+    r'^(?:sum|copy)(?=[\d+\-]|\s|$)'
+    r'|^(?:sch|sch_list)$'
+    r'|^unsch(?=\s|$)'
+    r'|^\d{1,2}:\d{2}\s+(?:/?(?:sum|copy)|\d)',
+    re.IGNORECASE)
 TOPIC_SCHED_RE = re.compile(r'^(\d{1,2}):(\d{2})\s+(.+)$')
+
+
+async def _safe_delete_event(event):
+    """Удалить сообщение-команду, не роняя обработку (best-effort).
+
+    Своё сообщение удаляется всегда; чужое — только если у аккаунта бота есть
+    админ-право «Удалять сообщения» в группе. Telegram может отказать без
+    исключения (просто не удалит) — поэтому удаление здесь не условие
+    выполнения команды, а уборка после неё.
+    """
+    try:
+        await event.delete()
+    except Exception as e:
+        print(f"⚠️ Не удалось удалить команду: {e}")
+
+
+async def _deny_topic_command(event):
+    """Короткий отказ в правах в ту же тему/группу (best-effort)."""
+    topic_id = reply_topic_id(getattr(event, 'message', None))
+    try:
+        await telegram_client.send_message(
+            RESULTS_DESTINATION,
+            "🚫 Нет прав: команды в этой группе выполняют только администраторы.",
+            reply_to=topic_id)
+    except Exception as e:
+        print(f"⚠️ Не удалось отправить отказ в правах: {e}")
+
+
+# Кэш проверки прав: sender_id -> (is_admin, monotonic_ts). Живёт за ран.
+_RESULTS_ADMIN_CACHE = {}
+RESULTS_ADMIN_CACHE_SEC = 600
+
+
+async def sender_is_results_admin(sender_id):
+    """True, если отправитель — админ/создатель группы результатов.
+
+    Отказ при сомнении («fail-closed»): 'me', пустой id или ошибка запроса →
+    False (чужие команды не выполняем и не удаляем). Успешный ответ кэшируем
+    на RESULTS_ADMIN_CACHE_SEC, чтобы не звать get_permissions на каждой
+    команде; ошибку НЕ кэшируем — временная помеха не должна «заморозить»
+    отказ настоящему админу.
+    """
+    if RESULTS_DESTINATION == 'me' or not sender_id:
+        return False
+    now = time.monotonic()
+    cached = _RESULTS_ADMIN_CACHE.get(sender_id)
+    if cached and now - cached[1] < RESULTS_ADMIN_CACHE_SEC:
+        return cached[0]
+    try:
+        perms = await telegram_client.get_permissions(RESULTS_DESTINATION, sender_id)
+    except Exception as e:
+        print(f"⚠️ Не удалось проверить права отправителя {sender_id}: {e}")
+        return False
+    is_admin = bool(getattr(perms, 'is_admin', False)
+                    or getattr(perms, 'is_creator', False))
+    _RESULTS_ADMIN_CACHE[sender_id] = (is_admin, now)
+    return is_admin
+
+
+async def _dispatch_topic_command(event):
+    """Общее тело команд из темы: владелец и чужие администраторы.
+
+    Ветки `model`/`models` здесь нет — она живёт только у владельца
+    (handle_topic_command). Источник — чат по названию темы; ответ — в ту же
+    тему. Команда удаляется после отработки (см. _safe_delete_event).
+    """
+    ctx = await topic_command_context(event)
+    if ctx is None:
+        if is_results_topic_message(event):
+            await _drop_topic_command(
+                event, "❌ В этой теме нет чата с таким названием — команда удалена.")
+        return
+    source_chat_id, source_name, home_topic = ctx
+    text = (event.raw_text or '').strip()
+    print(f"\n📥 Команда из темы: {text} | Тема: {source_name} ({source_chat_id})")
+
+    if text.lower() in ('sch', 'sch_list'):
+        await _safe_delete_event(event)
+        await telegram_client.send_message(
+            RESULTS_DESTINATION, await _schedule_list_text(), reply_to=home_topic)
+        return
+
+    if re.match(r'^unsch(\s|$)', text, re.IGNORECASE):
+        _, msg = await _schedule_remove_chat(source_chat_id, source_name)
+        await _safe_delete_event(event)
+        await telegram_client.send_message(RESULTS_DESTINATION, msg, reply_to=home_topic)
+        return
+
+    m = TOPIC_SCHED_RE.match(text)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        if hour > 23 or minute > 59:
+            await _safe_delete_event(event)
+            await telegram_client.send_message(
+                RESULTS_DESTINATION,
+                "⚠️ Время должно быть в диапазоне 00:00–23:59.",
+                reply_to=home_topic)
+            return
+        _, msg = await _schedule_add_slot(
+            source_chat_id, source_name, hour, minute, m.group(3).strip())
+        await _safe_delete_event(event)
+        await telegram_client.send_message(RESULTS_DESTINATION, msg, reply_to=home_topic)
+        return
+
+    parsed = parse_chat_command_args(text)
+    if parsed is None:
+        return
+    await process_chat_command(event, use_ai=parsed['use_ai'], topic_ctx=ctx)
 
 
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=TOPIC_COMMAND_RE))
 async def handle_topic_command(event):
     """Команда из темы группы результатов в режиме VPS (без ведущего '/').
 
-    Срабатывает только на сообщения в группе результатов; в остальных чатах
-    команды пишутся со слешем. Источник анализа/расписания — чат, название
-    которого совпадает с названием темы. Исключение — `model`/`models`:
-    выбор модели не зависит от чата-источника, поэтому работает в любой теме
-    группы результатов, включая General.
+    Только сообщения владельца (outgoing=True — «отправлено с этого аккаунта»).
+    Срабатывает на сообщения в группе результатов; в остальных чатах команды
+    пишутся со слешем. Источник анализа/расписания — чат, название которого
+    совпадает с названием темы. Исключение — `model`/`models`: выбор модели не
+    зависит от чата-источника, поэтому работает в любой теме группы
+    результатов, включая General.
     """
     if _is_actions_mode():
         return
@@ -7762,48 +7882,29 @@ async def handle_topic_command(event):
             await _run_model_command(
                 event, '' if number is None else str(number))
             return
-    ctx = await topic_command_context(event)
-    if ctx is None:
-        if is_results_topic_message(event):
-            await _drop_topic_command(
-                event, "❌ В этой теме нет чата с таким названием — команда удалена.")
-        return
-    source_chat_id, source_name, home_topic = ctx
-    text = (event.raw_text or '').strip()
-    print(f"\n📥 Команда из темы: {text} | Тема: {source_name} ({source_chat_id})")
+    await _dispatch_topic_command(event)
 
-    if text.lower() in ('sch', 'sch_list'):
-        await event.delete()
-        await telegram_client.send_message(
-            RESULTS_DESTINATION, await _schedule_list_text(), reply_to=home_topic)
-        return
 
-    if re.match(r'^unsch(\s|$)', text, re.IGNORECASE):
-        _, msg = await _schedule_remove_chat(source_chat_id, source_name)
-        await event.delete()
-        await telegram_client.send_message(RESULTS_DESTINATION, msg, reply_to=home_topic)
-        return
+@telegram_client.on(events.NewMessage(incoming=True, pattern=TOPIC_COMMAND_PUBLIC_RE))
+async def handle_topic_command_incoming(event):
+    """Команда из группы результатов от ДРУГОГО администратора (режим VPS).
 
-    m = TOPIC_SCHED_RE.match(text)
-    if m:
-        hour, minute = int(m.group(1)), int(m.group(2))
-        if hour > 23 or minute > 59:
-            await event.delete()
-            await telegram_client.send_message(
-                RESULTS_DESTINATION,
-                "⚠️ Время должно быть в диапазоне 00:00–23:59.",
-                reply_to=home_topic)
-            return
-        _, msg = await _schedule_add_slot(
-            source_chat_id, source_name, hour, minute, m.group(3).strip())
-        await event.delete()
-        await telegram_client.send_message(RESULTS_DESTINATION, msg, reply_to=home_topic)
+    Обработчики владельца подписаны на outgoing=True, поэтому чужие сообщения
+    им не видны. Здесь слушаем входящие, но берём только группу результатов:
+    sum/copy/sch/unsch от администраторов выполняются так же, как у владельца,
+    с удалением команды. Не-администратору — короткий отказ в теме.
+    `model`/`models` и голое число сюда не доходят (шаблон их не матчит).
+    """
+    if _is_actions_mode():
         return
-
-    parsed = parse_chat_command_args(text)
-    if parsed is None:
+    if RESULTS_DESTINATION == 'me':
         return
-    await process_chat_command(event, use_ai=parsed['use_ai'], topic_ctx=ctx)
+    if getattr(event, 'chat_id', None) != RESULTS_DESTINATION:
+        return
+    if not await sender_is_results_admin(getattr(event, 'sender_id', None)):
+        await _deny_topic_command(event)
+        return
+    await _dispatch_topic_command(event)
 
 
 @telegram_client.on(events.NewMessage(outgoing=True, pattern=r'^/sum'))
@@ -8177,6 +8278,23 @@ async def main():
                 print(f"   ℹ️  Форум не включен: все сообщения в общий чат")
                 print(f"   💡 Чтобы включить темы, зайдите в настройки канала:")
                 print(f"      Управление каналом → Темы → Включить")
+
+            # Право «Удалять сообщения» нужно, чтобы бот убирал команды других
+            # администраторов: своё сообщение он удаляет без прав, чужое — нет.
+            try:
+                perms = await telegram_client.get_permissions(
+                    RESULTS_DESTINATION, 'me')
+                can_delete = bool(getattr(perms, 'delete_messages', False)
+                                  or getattr(perms, 'is_creator', False))
+                if can_delete:
+                    print("   ✅ Право «Удалять сообщения» есть — команды "
+                          "других администраторов будут удаляться")
+                else:
+                    print("   ⚠️  Нет права «Удалять сообщения»: команды других "
+                          "администраторов выполнятся, но останутся в чате.")
+                    print("   💡 Включите это право в админке группы результатов.")
+            except Exception as e:
+                print(f"   ⚠️  Не удалось проверить право на удаление: {e}")
         except Exception as e:
             print(f"   ⚠️  Не могу получить доступ к каналу: {e}")
             print(f"   💡 Убедитесь что вы являетесь владельцем/админом канала")
@@ -8202,38 +8320,6 @@ async def main():
     print(f"   • Приоритетные пользователи: {', '.join(PRIORITY_USERS) if PRIORITY_USERS else 'Нет'}")
     print(f"   • Минимальная длина сообщения: {MIN_MESSAGE_LENGTH} символов")
     
-    print("\n📌 Доступные команды:")
-    print("  Анализ:")
-    print("    /sum - анализ чата с AI (по времени или количеству)")
-    print("    /sum 3h - последние 3 часа")
-    print("    /sum 45 - последние 45 сообщений")
-    print("    /sum 600-800 - сообщения с 600-го по 800-е от конца")
-    print("    /sum 2d-3d - сообщения от 3 до 2 дней назад")
-    print("    /sum 1d+ - анализ + публикация в исходном чате")
-    print("  Экспорт:")
-    print("    /copy - экспорт без AI (для ручного анализа)")
-    print("    /copy 3h - экспорт за 3 часа")
-    print("    /copy 50 - экспорт 50 сообщений")
-    print("    /copy 600-800 - экспорт сообщений с 600-го по 800-е от конца")
-    print("    /copy 2d-3d - экспорт сообщений от 3 до 2 дней назад")
-    print("  Конфигурация:")
-    print("    /config - показать конфигурацию")
-    print("    /show_model - показать настройки модели AI")
-    print("    /set_model - сменить модель AI (активного провайдера)")
-    print("    /set_provider - сменить провайдера (google|openrouter|nvidia)")
-    print("    /model, /models - список моделей с номерами и выбор по номеру")
-    print("    /add_excluded, /remove_excluded - управление исключенными")
-    print("    /add_priority, /remove_priority - управление приоритетными")
-    print("    /reload_config - перезагрузить из файлов")
-    print("  Расписание:")
-    print("    /sch HH:MM период - запланировать ежедневное саммари")
-    print("    /sch_list - показать расписание")
-    print("    /unsch - удалить чат из расписания")
-    print("  Справка:")
-    print("    /help - полная справка по командам")
-    print("  Из темы канала результатов (без слеша):")
-    print("    sum1d / copy 3h / 22:33 sum1d / sch / unsch - чат берётся из названия темы")
-    print("    model [2] - модели: список и выбор по номеру (любая тема группы, вкл. General)")
     print("\n💡 Отправьте команду /sum в любом чате для анализа с AI")
     print("💡 Используйте /copy для экспорта без затрат на API")
     print("=" * 60)
