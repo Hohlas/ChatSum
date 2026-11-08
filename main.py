@@ -68,19 +68,6 @@ def validate_config():
     api_id = os.getenv('TELEGRAM_API_ID', '')
     api_hash = os.getenv('TELEGRAM_API_HASH', '')
     phone = os.getenv('TELEGRAM_PHONE', '')
-    google_key = os.getenv('GOOGLE_API_KEY', '').strip()
-    extra_google_keys = [
-        value.strip()
-        for key, value in os.environ.items()
-        if re.fullmatch(r'GOOGLE_API_KEY\d+', key) and value.strip()
-    ]
-    bundle_google_keys = [
-        k for k in re.split(r'[\s,;]+', os.getenv('GOOGLE_API_KEYS', '')) if k.strip()
-    ]
-    openrouter_key = os.getenv('OPENROUTER_API_KEY', '').strip()
-    nvidia_key = os.getenv('NVIDIA_API_KEY', '').strip()
-    opencode_key = os.getenv('OPENCODE_GO_API_KEY', '').strip()
-    tokenharbor_key = os.getenv('TOKENHARBOR_API_KEY', '').strip()
     llm_model = (
         os.getenv('GEMINI_MODEL', '').strip()
         or os.getenv('OPENROUTER_MODEL', '').strip()
@@ -143,14 +130,15 @@ def validate_config():
     elif not phone.startswith('+'):
         errors.append("TELEGRAM_PHONE должен начинаться с '+' (например, +79001234567)")
     
-    # Проверка LLM-ключей: годится любой провайдер (google / openrouter / nvidia / opencode / tokenharbor).
+    # Проверка LLM-ключей: годится любой провайдер. Ключей может быть
+    # несколько на провайдера (ротация по 429) — берём весь список
+    # (BASE, BASE<N>, BASE+S), как это делает бот на старте.
     # private.txt хранит только ключи; параметры модели — в MODEL_CONFIG.txt.
-    valid_google_keys = [k for k in ([google_key] + extra_google_keys + bundle_google_keys) if k and k not in placeholders]
-    has_llm_key = bool(valid_google_keys or (openrouter_key and openrouter_key not in placeholders)
-                       or (nvidia_key and nvidia_key not in placeholders)
-                       or (opencode_key and opencode_key not in placeholders)
-                       or (tokenharbor_key and tokenharbor_key not in placeholders))
-    if not has_llm_key:
+    valid_keys = [k for base in ('GOOGLE_API_KEY', 'OPENROUTER_API_KEY',
+                                 'NVIDIA_API_KEY', 'OPENCODE_GO_API_KEY',
+                                 'TOKENHARBOR_API_KEY')
+                  for k in load_api_keys(base) if k and k not in placeholders]
+    if not valid_keys:
         errors.append("Не найден ни один валидный ключ: GOOGLE_API_KEY(N/KEYS) / OPENROUTER_API_KEY / NVIDIA_API_KEY / OPENCODE_GO_API_KEY / TOKENHARBOR_API_KEY")
     
     # Проверка модели (любой провайдер)
@@ -160,30 +148,39 @@ def validate_config():
     return errors
 
 
-def load_google_api_keys():
-    """
-    Загружает список Google API ключей из private.txt / environment.
-    Поддерживает GOOGLE_API_KEY, GOOGLE_API_KEY1, GOOGLE_API_KEY2, ...
-    (любое количество) и сводный GOOGLE_API_KEYS — ключи через запятую,
-    точку с запятой, пробелы или переносы строк (им тоже нет потолка).
+def load_api_keys(base_name):
+    """Список ключей провайдера из private.txt / environment.
+
+    Общий загрузчик для OpenAI-совместимых шлюзов (openrouter, nvidia,
+    opencode, tokenharbor) — аналог списка Google. Поддерживает
+    BASE, BASE1, BASE2, ... (любое количество) и сводный BASE+S (ключи
+    через запятую, точку с запятой, пробелы или переносы строк — без
+    потолка). Порядок: primary → indexed (численно) → bundle, дубликаты
+    режутся с сохранением порядка.
+
+    Нужен для ротации по 429: у бесплатных ключей Token Harbor свой
+    недельный запас, и переход на следующий ключ продлевает работу.
+    Чистая логика, исключений не бросает.
     """
     keys = []
 
-    primary_key = os.getenv('GOOGLE_API_KEY', '').strip()
+    primary_key = os.getenv(base_name, '').strip()
     if primary_key:
         keys.append(primary_key)
 
     indexed_keys = []
+    pattern = re.compile(re.escape(base_name) + r'(\d+)$')
     for env_key, env_value in os.environ.items():
-        if re.fullmatch(r'GOOGLE_API_KEY\d+', env_key):
+        m = pattern.fullmatch(env_key)
+        if m:
             value = env_value.strip()
             if value:
-                indexed_keys.append((env_key, value))
+                indexed_keys.append((int(m.group(1)), value))
 
-    indexed_keys.sort(key=lambda item: int(re.search(r'(\d+)$', item[0]).group(1)))
+    indexed_keys.sort(key=lambda item: item[0])
     keys.extend([value for _, value in indexed_keys])
 
-    bundle = os.getenv('GOOGLE_API_KEYS', '')
+    bundle = os.getenv(base_name + 'S', '')
     if bundle:
         keys.extend([k for k in re.split(r'[\s,;]+', bundle) if k.strip()])
 
@@ -196,6 +193,22 @@ def load_google_api_keys():
             unique_keys.append(key)
 
     return unique_keys
+
+
+# Базовые имена env-переменных OpenAI-совместимых провайдеров.
+# Google грузится тем же загрузчиком с базой GOOGLE_API_KEY (см. ниже).
+LLM_KEY_ENV_BASE = {
+    'openrouter': 'OPENROUTER_API_KEY',
+    'nvidia': 'NVIDIA_API_KEY',
+    'opencode': 'OPENCODE_GO_API_KEY',
+    'tokenharbor': 'TOKENHARBOR_API_KEY',
+}
+
+
+def load_google_api_keys():
+    """Список Google API ключей (GOOGLE_API_KEY, GOOGLE_API_KEY1..N,
+    сводный GOOGLE_API_KEYS) — через общий load_api_keys."""
+    return load_api_keys('GOOGLE_API_KEY')
 
 
 def mask_api_key(api_key):
@@ -265,26 +278,33 @@ def load_env_config():
 def _check_llm_key_chars():
     """Проверяет ASCII у ключей активного провайдера (иначе exit).
 
-    Google: все ключи круга. OpenRouter/NVIDIA/OpenCode/TokenHarbor: одиночный ключ.
+    Google и OpenAI-совместимые шлюзы: проверяем ВСЕ ключи круга — у шлюзов
+    ключей может быть несколько (ротация по 429), и битый второй ключ должен
+    ловиться на старте, а не 401 посреди анализа. Одиночная переменная —
+    фолбэк, если список пуст (старые конфиги/тесты).
     Имя историческое-обёртка _check_google_key_chars оставлена ниже.
     """
-    single_keys = {
-        'openrouter': OPENROUTER_API_KEY,
-        'nvidia': NVIDIA_API_KEY,
-        'opencode': OPENCODE_API_KEY,
-        'tokenharbor': TOKENHARBOR_API_KEY,
-    }
-    if LLM_PROVIDER in single_keys:
+    if LLM_PROVIDER in LLM_KEY_ENV_BASE:
         label = provider_display_name()
-        key = single_keys[LLM_PROVIDER]
-        print(f"🔑 Проверка ключа {label}: {mask_api_key(key)} (длина {len(key)} символов)")
-        try:
-            (key or '').encode('ascii')
-            print("     ✅ API-ключ корректный (ASCII)")
-        except UnicodeEncodeError:
-            print("     ❌ ОШИБКА: API-ключ содержит недопустимые символы!")
-            print("     Проверьте файл private.txt на наличие невидимых символов")
-            raise SystemExit(1)
+        single_keys = {
+            'openrouter': OPENROUTER_API_KEY,
+            'nvidia': NVIDIA_API_KEY,
+            'opencode': OPENCODE_API_KEY,
+            'tokenharbor': TOKENHARBOR_API_KEY,
+        }
+        keys = LLM_API_KEYS.get(LLM_PROVIDER) or []
+        if not keys:
+            keys = [single_keys.get(LLM_PROVIDER, '')]
+        print(f"🔑 Проверка ключей {label}: {len(keys)}")
+        for idx, key in enumerate(keys, 1):
+            print(f"   • Ключ {idx}: {mask_api_key(key)} (длина {len(key)} символов)")
+            try:
+                (key or '').encode('ascii')
+            except UnicodeEncodeError:
+                print("     ❌ ОШИБКА: API-ключ содержит недопустимые символы!")
+                print("     Проверьте файл private.txt на наличие невидимых символов")
+                raise SystemExit(1)
+        print("     ✅ API-ключи корректные (ASCII)")
         return
     _check_google_key_chars()
 
@@ -339,8 +359,10 @@ NVIDIA_API_KEY = os.getenv('NVIDIA_API_KEY', '').strip()
 # OpenCode Go — подписка opencode.ai (Console → API key). Ключ называется
 # OPENCODE_GO_API_KEY и живёт в private.txt рядом с остальными.
 OPENCODE_API_KEY = os.getenv('OPENCODE_GO_API_KEY', '').strip()
-# Token Harbor — шлюз tokenharbor.ai (OpenAI-совместимый). Ключ называется
-# TOKENHARBOR_API_KEY (вид thk_live_...). Второй ключ *_1 кодом не используется.
+# Token Harbor — шлюз tokenharbor.ai (OpenAI-совместимый). Ключи: основной
+# TOKENHARBOR_API_KEY (вид thk_live_...) и дополнительные TOKENHARBOR_API_KEY1,
+# KEY2, KEY3, ... / сводный TOKENHARBOR_API_KEYS — ротация по 429
+# (список соберёт load_api_keys, ключей сколько угодно).
 TOKENHARBOR_API_KEY = os.getenv('TOKENHARBOR_API_KEY', '').strip()
 ALLOWED_LLM_PROVIDERS = ('google', 'openrouter', 'nvidia', 'opencode', 'tokenharbor')
 LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'google').strip().lower() or 'google'
@@ -1193,7 +1215,17 @@ def extract_api_error_message(error):
 
 def is_quota_exceeded_error(error_message):
     """
-    Проверяет, что ошибка связана с исчерпанием квоты Gemini.
+    Проверяет, что ошибка связана с исчерпанием квоты/запаса запросов.
+
+    Кроме google-шаблонов ловим шаблоны OpenAI-совместимых шлюзов
+    (OpenRouter, Token Harbor и т.п.): у них 429 «запас на период
+    исчерпан» приходит другими словами. Без этих строк сухой 429 шлюза
+    уходил в ветку «временный сбой» и трижды долбил тот же исчерпанный
+    ключ (живой случай 2026-11-08: free_tier_limit_reached Token Harbor,
+    три повтора 10с+20с на ключ × 5 попыток внешнего цикла).
+
+    Минутный лимит (rate limit) сюда намеренно НЕ входит: там повтор
+    на том же ключе лечит, идёт старым путём. Чистая логика.
     """
     if not error_message:
         return False
@@ -1203,6 +1235,11 @@ def is_quota_exceeded_error(error_message):
         'quota exceeded' in error_lower
         or 'resource_exhausted' in error_lower
         or 'generaterequestsperdayperprojectpermodel-freetier' in error_lower
+        # OpenAI-совместимые шлюзы: исчерпан запас, повтор не поможет.
+        or 'insufficient_quota' in error_lower
+        or 'exceeded your current quota' in error_lower
+        or 'free allowance' in error_lower
+        or 'free_tier_limit_reached' in error_lower
     )
 
 
@@ -1638,79 +1675,92 @@ async def execute_gemini_request(request_params, notify=None):
 
 
 async def _execute_single_key_request(request_params, notify=None):
-    """Запрос для openrouter/nvidia/opencode/tokenharbor: один ключ, без ротации.
+    """Запрос для openrouter/nvidia/opencode/tokenharbor.
 
     503/UNAVAILABLE — пауза SERVER_OVERLOAD_PAUSE_SEC и выход наружу
-    (повтор делает внешний цикл). 429-квота — сразу наружу без сна (сухой
-    ключ от повторов не мокреет). 500/502/504 и таймауты — короткие повторы
-    на том же ключе.
+    (повтор делает внешний цикл). 429-квота — сразу следующий ключ, без
+    повторов и сна (сухой ключ от повторов не мокреет); если ключ
+    последний — наружу. 500/502/504 и таймауты — короткие повторы на том
+    же ключе. Провайдер с одним ключом ведёт себя как раньше.
     notify: async fn(text) — краткая диагностика в канал (503-сон).
     None — тишина.
     """
     max_retries = 3
+    provider = LLM_PROVIDER
+    keys = LLM_API_KEYS.get(provider) or []
+    key_attempts = max(1, len(keys))
     last_error = None
-    # Медленные бесплатные модели отвечают минутами: короткий общий таймаут
-    # приводил бы к повторам всего тяжелого запроса заново. Google-клиент
-    # не трогаем (у него свой круг ключей и свои 60с).
-    try:
-        client = get_active_llm_client().with_options(timeout=600.0)
-    except Exception:
-        client = get_active_llm_client()
-    # Копия параметров: при 402 «can only afford N» потолок ответа ужимается
-    # здесь, а dict вызывателя (он переиспользует его для повтора с усиленным
-    # промптом) должен остаться нетронутым.
-    params = dict(request_params)
-    cap_clamped = False
-    for retry in range(max_retries):
+
+    for key_attempt in range(key_attempts):
+        # Медленные бесплатные модели отвечают минутами: короткий общий
+        # таймаут приводил бы к повторам всего тяжёлого запроса заново.
+        # Клиент берём заново на каждой смене ключа (ротация уже
+        # пересобрала глобальный клиент под новый ключ).
         try:
-            return await client.chat.completions.create(**params)
-        except Exception as e:
-            last_error = e
-            error_str = str(e)
-            if is_quota_rate_limit(e):
-                raise
-            if is_server_overloaded(error_str):
-                _log_response_headers(e, provider_display_name())
-                pause_txt = _format_pause_sec(SERVER_OVERLOAD_PAUSE_SEC)
-                print(f"   ⏳ Сервер перегружен, ждём {pause_txt}...")
-                await _safe_notify(
-                    notify,
-                    f"⏳ 503 от {provider_display_name()}: жду {pause_txt} — "
-                    f"дальше добой/повтор")
-                await asyncio.sleep(SERVER_OVERLOAD_PAUSE_SEC)
-                raise
-            # 402: баланс не покрывает резерв под вход + потолок ответа.
-            # Провайдер сам говорит, сколько токенов ответа ещё тянет —
-            # ужимаем потолок до этого числа и пробуем ещё раз (один раз:
-            # ниже пола не режем, а повтор с тем же потолком бесполезен).
-            affordable = _affordable_output_tokens(
-                extract_api_error_message(e))
-            current_cap = params.get('max_completion_tokens')
-            if (getattr(e, 'status_code', None) == 402 and affordable
-                    and not cap_clamped and current_cap):
-                new_cap = max(MIN_AFFORDABLE_OUTPUT_TOKENS,
-                              int(affordable * 0.9))
-                if new_cap < current_cap:
-                    print(f"   💸 402: баланса хватает на {affordable:,} "
-                          f"токенов ответа — ужимаю потолок "
-                          f"{current_cap:,} → {new_cap:,} и повторяю")
+            client = get_active_llm_client().with_options(timeout=600.0)
+        except Exception:
+            client = get_active_llm_client()
+        # Копия параметров: при 402 «can only afford N» потолок ответа
+        # ужимается здесь, а dict вызывателя (он переиспользует его для
+        # повтора с усиленным промптом) должен остаться нетронутым.
+        # На каждый ключ — своя копия (после ротации ужим не наследуется).
+        params = dict(request_params)
+        cap_clamped = False
+        for retry in range(max_retries):
+            try:
+                return await client.chat.completions.create(**params)
+            except Exception as e:
+                last_error = e
+                error_str = str(e)
+                if is_quota_rate_limit(e):
+                    # Квота: ключ сухой. Есть следующий — переключаемся без
+                    # сна; это последний ключ — наружу (повтор не поможет).
+                    if key_attempt < key_attempts - 1:
+                        rotate_llm_api_key(provider, "квота исчерпана, сразу следующий ключ")
+                        break
+                    raise
+                if is_server_overloaded(error_str):
+                    _log_response_headers(e, provider_display_name())
+                    pause_txt = _format_pause_sec(SERVER_OVERLOAD_PAUSE_SEC)
+                    print(f"   ⏳ Сервер перегружен, ждём {pause_txt}...")
                     await _safe_notify(
                         notify,
-                        f"💸 {provider_display_name()}: баланса хватает на "
-                        f"{affordable:,} токенов ответа — ужимаю потолок "
-                        f"до {new_cap:,}")
-                    params['max_completion_tokens'] = new_cap
-                    cap_clamped = True
+                        f"⏳ 503 от {provider_display_name()}: жду {pause_txt} — "
+                        f"дальше добой/повтор")
+                    await asyncio.sleep(SERVER_OVERLOAD_PAUSE_SEC)
+                    raise
+                # 402: баланс не покрывает резерв под вход + потолок ответа.
+                # Провайдер сам говорит, сколько токенов ответа ещё тянет —
+                # ужимаем потолок до этого числа и пробуем ещё раз (один раз:
+                # ниже пола не режем, а повтор с тем же потолком бесполезен).
+                affordable = _affordable_output_tokens(
+                    extract_api_error_message(e))
+                current_cap = params.get('max_completion_tokens')
+                if (getattr(e, 'status_code', None) == 402 and affordable
+                        and not cap_clamped and current_cap):
+                    new_cap = max(MIN_AFFORDABLE_OUTPUT_TOKENS,
+                                  int(affordable * 0.9))
+                    if new_cap < current_cap:
+                        print(f"   💸 402: баланса хватает на {affordable:,} "
+                              f"токенов ответа — ужимаю потолок "
+                              f"{current_cap:,} → {new_cap:,} и повторяю")
+                        await _safe_notify(
+                            notify,
+                            f"💸 {provider_display_name()}: баланса хватает на "
+                            f"{affordable:,} токенов ответа — ужимаю потолок "
+                            f"до {new_cap:,}")
+                        params['max_completion_tokens'] = new_cap
+                        cap_clamped = True
+                        continue
+                is_retryable = any(
+                    code in error_str for code in ('503', '429', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED')
+                ) or _is_timeout_text(error_str) or _is_connection_error(e)
+                if is_retryable and retry < max_retries - 1:
+                    delay = (retry + 1) * 10
+                    print(f"   ⚠️  Временный сбой, повтор через {delay}с (попытка {retry + 2}/{max_retries})...")
+                    await asyncio.sleep(delay)
                     continue
-            is_retryable = any(
-                code in error_str for code in ('503', '429', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED')
-            ) or _is_timeout_text(error_str) or _is_connection_error(e)
-            if is_retryable and retry < max_retries - 1:
-                delay = (retry + 1) * 10
-                print(f"   ⚠️  Временный сбой, повтор через {delay}с (попытка {retry + 2}/{max_retries})...")
-                await asyncio.sleep(delay)
-                continue
-            raise
+                raise
     if last_error:
         raise last_error
 
@@ -2311,6 +2361,14 @@ GOOGLE_API_KEYS = load_google_api_keys()
 current_google_key_index = 0
 google_analysis_counter = 0
 
+# Ключи OpenAI-совместимых провайдеров: список + позиция ротации.
+LLM_API_KEYS = {provider: load_api_keys(base)
+                for provider, base in LLM_KEY_ENV_BASE.items()}
+current_llm_key_index = {provider: 0 for provider in LLM_KEY_ENV_BASE}
+# Монотонный счётчик ротации (персистится в state, как google_analysis_counter):
+# новый ран стартует с живого ключа, а не возвращается к сухим.
+llm_key_cursor = {provider: 0 for provider in LLM_KEY_ENV_BASE}
+
 # Создаём асинхронный HTTP-клиент с настройками таймаута и лимитов соединений
 # 600с: модели с обдумыванием отвечают минутами (непоточный запрос ждёт
 # полный ответ); 180с рвало такие запросы на полуслове (сессия 27).
@@ -2363,19 +2421,19 @@ def create_llm_client(provider, api_key):
 
 
 def create_openrouter_client(api_key=None):
-    return create_llm_client('openrouter', api_key or OPENROUTER_API_KEY)
+    return create_llm_client('openrouter', api_key or get_current_llm_api_key('openrouter'))
 
 
 def create_nvidia_client(api_key=None):
-    return create_llm_client('nvidia', api_key or NVIDIA_API_KEY)
+    return create_llm_client('nvidia', api_key or get_current_llm_api_key('nvidia'))
 
 
 def create_opencode_client(api_key=None):
-    return create_llm_client('opencode', api_key or OPENCODE_API_KEY)
+    return create_llm_client('opencode', api_key or get_current_llm_api_key('opencode'))
 
 
 def create_tokenharbor_client(api_key=None):
-    return create_llm_client('tokenharbor', api_key or TOKENHARBOR_API_KEY)
+    return create_llm_client('tokenharbor', api_key or get_current_llm_api_key('tokenharbor'))
 
 
 def _rebuild_llm_clients():
@@ -2392,6 +2450,18 @@ def get_current_google_api_key():
     if not GOOGLE_API_KEYS:
         return GOOGLE_API_KEY
     return GOOGLE_API_KEYS[current_google_key_index]
+
+
+def get_current_llm_api_key(provider):
+    """Активный ключ OpenAI-совместимого провайдера (по позиции ротации).
+
+    Пустой список (ключ не задан) → '' — create_llm_client упадёт честной
+    401, валидация конфига ловит раньше.
+    """
+    keys = LLM_API_KEYS.get(provider) or []
+    if not keys:
+        return ''
+    return keys[current_llm_key_index.get(provider, 0) % len(keys)]
 
 
 google_client = create_google_client(get_current_google_api_key())
@@ -2424,15 +2494,70 @@ def get_active_llm_client():
 
 def get_active_llm_key_masked():
     """Маска активного ключа для логов (значений не печатаем)."""
-    if LLM_PROVIDER == 'openrouter':
-        return mask_api_key(OPENROUTER_API_KEY)
-    if LLM_PROVIDER == 'nvidia':
-        return mask_api_key(NVIDIA_API_KEY)
-    if LLM_PROVIDER == 'opencode':
-        return mask_api_key(OPENCODE_API_KEY)
-    if LLM_PROVIDER == 'tokenharbor':
-        return mask_api_key(TOKENHARBOR_API_KEY)
+    if LLM_PROVIDER in LLM_KEY_ENV_BASE:
+        return mask_api_key(get_current_llm_api_key(LLM_PROVIDER))
     return mask_api_key(get_current_google_api_key())
+
+
+def _rebuild_provider_client(provider, api_key):
+    """Пересобрать клиент одного OpenAI-совместимого провайдера под ключ."""
+    global openrouter_client, nvidia_client, opencode_client, tokenharbor_client
+    if provider == 'openrouter':
+        openrouter_client = create_openrouter_client(api_key)
+    elif provider == 'nvidia':
+        nvidia_client = create_nvidia_client(api_key)
+    elif provider == 'opencode':
+        opencode_client = create_opencode_client(api_key)
+    elif provider == 'tokenharbor':
+        tokenharbor_client = create_tokenharbor_client(api_key)
+
+
+def set_llm_api_key_index(provider, index):
+    """Переключить активный ключ провайдера и пересобрать его клиент."""
+    keys = LLM_API_KEYS.get(provider) or []
+    if not keys:
+        return
+    current_llm_key_index[provider] = index % len(keys)
+    _rebuild_provider_client(provider, keys[current_llm_key_index[provider]])
+
+
+def rotate_llm_api_key(provider, reason=None):
+    """Следующий ключ провайдера по кругу + сдвиг монотонного курсора.
+
+    Аналог rotate_google_api_key для OpenAI-совместимых шлюзов: при 429
+    (запас исчерпан) сухой ключ не мокреет от повторов — сразу следующий.
+    """
+    keys = LLM_API_KEYS.get(provider) or []
+    if not keys:
+        return None
+
+    llm_key_cursor[provider] = llm_key_cursor.get(provider, 0) + 1
+    set_llm_api_key_index(provider, current_llm_key_index.get(provider, 0) + 1)
+    active_key = get_current_llm_api_key(provider)
+    if reason:
+        print(f"🔄 Переключение {provider} API key: {reason}")
+    print(f"   🔑 Активный ключ: {mask_api_key(active_key)} "
+          f"({current_llm_key_index[provider] + 1}/{len(keys)})")
+    return active_key
+
+
+def get_llm_key_cursor(provider):
+    """Монотонный счётчик ротации провайдера — персистится между ранами."""
+    return llm_key_cursor.get(provider, 0)
+
+
+def set_llm_key_cursor(provider, value):
+    """Восстановить курсор из state: старт с ключа value % len."""
+    keys = LLM_API_KEYS.get(provider) or []
+    try:
+        cursor = int(value)
+    except (TypeError, ValueError):
+        return
+    if cursor < 0:
+        return
+    llm_key_cursor[provider] = cursor
+    if keys:
+        set_llm_api_key_index(provider, cursor)
 
 
 def set_google_api_key_index(index):
@@ -7591,7 +7716,7 @@ async def handle_reload_config_command(event):
 ⭐ Приоритетные пользователи: {len(PRIORITY_USERS)}
 📄 Промпт: {len(ANALYSIS_PROMPT)} символов
 🤖 Провайдер: {LLM_PROVIDER} ({provider_display_name()}), модель: {CURRENT_MODEL}
-🔑 Ключи: Google {len(GOOGLE_API_KEYS)}, OpenRouter {'да' if OPENROUTER_API_KEY else 'нет'}, NVIDIA {'да' if NVIDIA_API_KEY else 'нет'}, TokenHarbor {'да' if TOKENHARBOR_API_KEY else 'нет'}
+🔑 Ключи: Google {len(GOOGLE_API_KEYS)}, OpenRouter {len(LLM_API_KEYS.get('openrouter') or [])}, NVIDIA {len(LLM_API_KEYS.get('nvidia') or [])}, TokenHarbor {len(LLM_API_KEYS.get('tokenharbor') or [])}
 
 💡 Используйте `/config` для просмотра деталей
 """
@@ -8068,7 +8193,7 @@ async def main():
             'nvidia': NVIDIA_CHUNK_MAX_CHARS, 'opencode': OPENCODE_CHUNK_MAX_CHARS,
             'tokenharbor': TOKENHARBOR_CHUNK_MAX_CHARS}[LLM_PROVIDER]
     print(f"   • REASONING_EFFORT={_eff or 'не задан'} / CHUNK_MAX_CHARS={_chk or 'не задан'} / TEMPERATURE={provider_temperature()}")
-    print(f"   • Ключи: Google {len(GOOGLE_API_KEYS)}, OpenRouter {'да' if OPENROUTER_API_KEY else 'нет'}, NVIDIA {'да' if NVIDIA_API_KEY else 'нет'}, OpenCode Go {'да' if OPENCODE_API_KEY else 'нет'}, TokenHarbor {'да' if TOKENHARBOR_API_KEY else 'нет'}")
+    print(f"   • Ключи: Google {len(GOOGLE_API_KEYS)}, OpenRouter {len(LLM_API_KEYS.get('openrouter') or [])}, NVIDIA {len(LLM_API_KEYS.get('nvidia') or [])}, OpenCode Go {len(LLM_API_KEYS.get('opencode') or [])}, TokenHarbor {len(LLM_API_KEYS.get('tokenharbor') or [])}")
     print(f"   • Экспорт результатов: {'HTML файлы 📄' if USE_HTML_EXPORT else 'Telegraph 🌐'}")
     
     # Показываем настройки фильтрации

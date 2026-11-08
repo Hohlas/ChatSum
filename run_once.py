@@ -123,6 +123,45 @@ def task_key(entry):
 
 
 KEY_CURSOR_STATE_FIELD = 'google_key_cursor'
+# Курсоры ротации OpenAI-совместимых провайдеров: {'provider': counter}.
+LLM_KEY_CURSOR_STATE_FIELD = 'llm_key_cursor'
+
+
+def restore_llm_key_cursors(main, state):
+    """Продолжить ротацию ключей шлюзов с места прошлого рана.
+
+    Без этого каждый ран стартует с ключа 1 (процесс эфемерный), а у
+    бесплатных ключей Token Harbor сух тот, чей недельный запас исчерпан.
+    Не роняет: main без хелперов (тестовые фейки) — молча пропускаем.
+    """
+    cursors = (state or {}).get(LLM_KEY_CURSOR_STATE_FIELD)
+    if not isinstance(cursors, dict):
+        return
+    setter = getattr(main, 'set_llm_key_cursor', None)
+    if not callable(setter):
+        return
+    for provider, value in cursors.items():
+        try:
+            setter(provider, value)
+        except Exception:
+            pass
+
+
+def store_llm_key_cursors(main, state):
+    """Записать курсоры ротации шлюзов в state (продолжение в след. ране)."""
+    getter = getattr(main, 'get_llm_key_cursor', None)
+    providers = getattr(main, 'LLM_API_KEYS', None)
+    if not callable(getter) or not isinstance(providers, dict):
+        return state
+    cursors = {}
+    for provider in providers:
+        try:
+            cursors[provider] = int(getter(provider))
+        except Exception:
+            pass
+    if cursors:
+        state[LLM_KEY_CURSOR_STATE_FIELD] = cursors
+    return state
 
 
 def restore_key_cursor(main, state):
@@ -147,6 +186,7 @@ def restore_key_cursor(main, state):
     n = len(getattr(main, 'GOOGLE_API_KEYS', []) or [])
     if n:
         print(f"🔑 Курсор ключей из state: {cursor} → старт с ключа {cursor % n + 1}/{n}")
+    restore_llm_key_cursors(main, state)
     return cursor
 
 
@@ -159,7 +199,7 @@ def store_key_cursor(main, state):
         state[KEY_CURSOR_STATE_FIELD] = int(getter())
     except Exception:
         pass
-    return state
+    return store_llm_key_cursors(main, state)
 
 
 # ──────────────────────────────────────────────
@@ -722,6 +762,26 @@ def merge_counters(local_counters, remote_counters):
     return merged
 
 
+def merge_key_cursors(local_cursors, remote_cursors):
+    """max по каждому провайдеру — монотонность ротации ключей шлюзов.
+
+    Как у google_key_cursor: гонка двух лидеров не должна откатывать
+    счётчик, иначе сухие ключи долбятся по второму кругу.
+    """
+    merged = {}
+    for source in (remote_cursors, local_cursors):
+        if not isinstance(source, dict):
+            continue
+        for provider, value in source.items():
+            try:
+                v = int(value)
+            except (TypeError, ValueError):
+                continue
+            if v >= 0 and v > merged.get(provider, -1):
+                merged[provider] = v
+    return merged
+
+
 def merge_states(local, remote):
     """Union двух state-словарей в пользу свежих/больших значений (pure)."""
     merged = dict(local or {})
@@ -741,6 +801,10 @@ def merge_states(local, remote):
                                          int(remote.get('google_key_cursor', 0) or 0))
     except (TypeError, ValueError):
         pass
+    llm_cursors = merge_key_cursors(_as_dict((local or {}).get(LLM_KEY_CURSOR_STATE_FIELD)),
+                                   _as_dict(remote.get(LLM_KEY_CURSOR_STATE_FIELD)))
+    if llm_cursors:
+        merged[LLM_KEY_CURSOR_STATE_FIELD] = llm_cursors
     return merged
 
 

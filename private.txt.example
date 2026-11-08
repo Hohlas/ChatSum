@@ -18,15 +18,21 @@ GOOGLE_API_KEY3=AIzaSy...
 # push_github_secrets.sh заберёт все, бот ротирует их по кругу.
 
 # Ключ OpenRouter (https://openrouter.ai/keys) для OPENROUTER_MODEL.
+# Дополнительные ключи — OPENROUTER_API_KEY1, KEY2, KEY3, ... (ротация по 429).
 # OPENROUTER_API_KEY=sk-or-v1-...
 
 # Ключ подписки OpenCode Go (https://opencode.ai/console) для OPENCODE_MODEL.
+# Дополнительные ключи — OPENCODE_GO_API_KEY1, KEY2, KEY3, ... (ротация по 429).
 # OPENCODE_GO_API_KEY=...
 
 # Ключ NVIDIA (https://build.nvidia.com) для NVIDIA_MODEL.
+# Дополнительные ключи — NVIDIA_API_KEY1, KEY2, KEY3, ... (ротация по 429).
 # NVIDIA_API_KEY=nvapi-...
 
 # Ключ Token Harbor (https://tokenharbor.ai) для TOKENHARBOR_MODEL.
+# Дополнительные ключи — TOKENHARBOR_API_KEY1, KEY2, KEY3, ... : у бесплатного
+# уровня свой недельный запас у каждого ключа, ротация по 429 продлевает
+# работу (push_github_secrets.sh заберёт все, бот ротирует их по кругу).
 # TOKENHARBOR_API_KEY=thk_live_...
 
 # Model settings live in MODEL_CONFIG.txt (LLM_PROVIDER, *_MODEL,

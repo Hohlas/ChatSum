@@ -136,6 +136,7 @@ def main():
     test_refresh_runtime_files()
     test_inbox_start_notice_shows_model()
     test_rotate_advances_cursor()
+    test_llm_key_rotation()
     test_duty_gap()
     test_work_wedge()
     test_leader_watch_inherit()
@@ -150,6 +151,7 @@ def main():
     test_model_display_label()
     test_reasoning_effort_config()
     test_flat_rotation()
+    test_gateway_quota_429()
     test_collect_order_and_parents()
     test_handoff()
     test_startup_election()
@@ -1554,6 +1556,133 @@ def test_rotate_advances_cursor():
          bot.google_analysis_counter, bot.google_client) = saved
 
 
+def test_llm_key_rotation():
+    """429 шлюза: сухой ключ → сразу следующий по кругу, без сна; один ключ —
+    наружу; курсор переносится в state и не откатывается merge'ем."""
+    import httpx
+    from openai import RateLimitError
+    from types import SimpleNamespace
+
+    # 1. Общий загрузчик ключей: BASE, BASE<N> (числовая сортировка), BASE+S.
+    saved_env = dict(os.environ)
+    try:
+        for k in list(os.environ):
+            if k == 'TOKENHARBOR_API_KEY' or k == 'TOKENHARBOR_API_KEYS' \
+                    or re.fullmatch(r'TOKENHARBOR_API_KEY\d+', k):
+                del os.environ[k]
+        os.environ['TOKENHARBOR_API_KEY'] = 'th1'
+        os.environ['TOKENHARBOR_API_KEY1'] = 'th1b'
+        os.environ['TOKENHARBOR_API_KEY10'] = 'th10'
+        os.environ['TOKENHARBOR_API_KEY2'] = 'th2'
+        os.environ['TOKENHARBOR_API_KEYS'] = 'b1,b2\nb1'
+        keys = bot.load_api_keys('TOKENHARBOR_API_KEY')
+        check('llm-ключи: порядок primary→N(с 1)→bundle + дедуп',
+              keys == ['th1', 'th1b', 'th2', 'th10', 'b1', 'b2'], keys)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
+
+    # 2. 429 (запас исчерпан) на первом ключе → ротация и успех на втором.
+    payload = {'error': {'message': "You've used this period's free allowance "
+                                    "(free_tier_limit_reached)",
+                         'type': 'free_tier_limit_reached'}}
+    req = httpx.Request('POST', 'https://tokenharbor.ai/v1/chat/completions')
+    quota_err = RateLimitError(
+        message=f"Error code: 429 - {payload}",
+        response=httpx.Response(429, json=payload, request=req), body=payload)
+
+    calls = {'n': 0}
+
+    class _FakeClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=self)
+
+        def with_options(self, **_kw):
+            return self
+
+        async def create(self, **_params):
+            calls['n'] += 1
+            # первый ключ (индекс 0) сухой, второй отдаёт ответ
+            if bot.current_llm_key_index['tokenharbor'] == 0:
+                raise quota_err
+            return {'ok': True}
+
+    saved = (dict(bot.LLM_API_KEYS), dict(bot.current_llm_key_index),
+             dict(bot.llm_key_cursor), bot.LLM_PROVIDER,
+             bot.get_active_llm_client, bot.tokenharbor_client)
+    try:
+        bot.LLM_API_KEYS['tokenharbor'] = ['k1', 'k2']
+        bot.current_llm_key_index['tokenharbor'] = 0
+        bot.llm_key_cursor['tokenharbor'] = 0
+        bot.LLM_PROVIDER = 'tokenharbor'
+        bot.get_active_llm_client = lambda: _FakeClient()
+        with _quiet():
+            out = asyncio.get_event_loop().run_until_complete(
+                bot._execute_single_key_request({'model': 'deepseek-v4.1-flash:free'}))
+        check('llm-ротация: 429 на ключе 1 → успех на ключе 2',
+              out == {'ok': True} and calls['n'] == 2, (out, calls['n']))
+        check('llm-ротация: курсор и индекс сдвинуты',
+              bot.get_llm_key_cursor('tokenharbor') == 1
+              and bot.current_llm_key_index['tokenharbor'] == 1,
+              (bot.get_llm_key_cursor('tokenharbor'),
+               bot.current_llm_key_index['tokenharbor']))
+
+        # 3. Один ключ: 429 уходит наружу без повторов (как раньше).
+        bot.LLM_API_KEYS['tokenharbor'] = ['only']
+        bot.current_llm_key_index['tokenharbor'] = 0
+        calls['n'] = 0
+        raised = False
+        try:
+            with _quiet():
+                asyncio.get_event_loop().run_until_complete(
+                    bot._execute_single_key_request({'model': 'x'}))
+        except RateLimitError:
+            raised = True
+        check('llm-ротация: один ключ — 429 наружу за 1 запрос',
+              raised and calls['n'] == 1, (raised, calls['n']))
+    finally:
+        (bot.LLM_API_KEYS, bot.current_llm_key_index, bot.llm_key_cursor,
+         bot.LLM_PROVIDER, bot.get_active_llm_client,
+         bot.tokenharbor_client) = saved
+
+    # 4. Курсор: set/get, перенос через state, merge берёт max.
+    saved2 = (dict(bot.LLM_API_KEYS), dict(bot.current_llm_key_index),
+              dict(bot.llm_key_cursor), bot.tokenharbor_client)
+    try:
+        bot.LLM_API_KEYS['tokenharbor'] = ['a', 'b', 'c']
+        bot.llm_key_cursor['tokenharbor'] = 0
+        bot.set_llm_key_cursor('tokenharbor', 7)
+        check('llm-курсор: set 7 при 3 ключах → индекс 1',
+              bot.get_llm_key_cursor('tokenharbor') == 7
+              and bot.current_llm_key_index['tokenharbor'] == 1,
+              (bot.get_llm_key_cursor('tokenharbor'),
+               bot.current_llm_key_index['tokenharbor']))
+        st = {}
+        run_once.store_key_cursor(bot, st)
+        check('llm-курсор: записан в state',
+              st.get(run_once.LLM_KEY_CURSOR_STATE_FIELD, {}).get('tokenharbor') == 7,
+              st.get(run_once.LLM_KEY_CURSOR_STATE_FIELD))
+        bot.llm_key_cursor['tokenharbor'] = 0
+        run_once.restore_key_cursor(bot, st)
+        check('llm-курсор: восстановлен',
+              bot.get_llm_key_cursor('tokenharbor') == 7,
+              bot.get_llm_key_cursor('tokenharbor'))
+        merged = run_once.merge_states(
+            {'llm_key_cursor': {'tokenharbor': 3, 'openrouter': 5}},
+            {'llm_key_cursor': {'tokenharbor': 9}})
+        check('llm-курсор: merge берёт max по провайдеру',
+              merged.get('llm_key_cursor') == {'tokenharbor': 9, 'openrouter': 5},
+              merged.get('llm_key_cursor'))
+
+        class NoCursor:
+            LLM_API_KEYS = {}
+        run_once.restore_key_cursor(NoCursor(), {'llm_key_cursor': {'x': 1}})
+        check('llm-курсор: main без хелперов не падает', True)
+    finally:
+        (bot.LLM_API_KEYS, bot.current_llm_key_index, bot.llm_key_cursor,
+         bot.tokenharbor_client) = saved2
+
+
 def test_duty_gap():
     """Самодиагностика пропусков: варнинг строго за порогом, мусор молчит."""
     from datetime import timezone
@@ -2122,6 +2251,88 @@ def test_flat_rotation():
                  'Error code: 502', 'Error code: 504', '', None):
         check(f'503: чужое ({str(text)[:24]}) — не держим',
               bot.is_server_overloaded(text) is False, '')
+
+
+def test_gateway_quota_429():
+    """429-запас OpenAI-совместимого шлюза — квота, а не «временный сбой».
+
+    Живой случай 2026-11-08 (Token Harbor, free_tier_limit_reached): текст
+    шлюза не подходил под google-шаблоны, сухой 429 уходил в ветку повторов
+    и трижды долбил тот же исчерпанный ключ (10с+20с) × 5 попыток внешнего
+    цикла. Минутный лимит по-прежнему идёт путём повторов.
+    """
+    import httpx
+    from openai import APIStatusError, RateLimitError
+    from types import SimpleNamespace
+
+    gateway_msg = (
+        "You've used this period's free allowance. Your next rolling "
+        "7-day period starts on 11 Nov 2026 at 13:51 UTC. Use the paid "
+        "model 'deepseek-v4.1-flash' to keep going, or subscribe to a "
+        "Token Harbor Pass for a recurring included allowance across more "
+        "models. https://tokenharbor.ai/pricing")
+    payload = {'error': {'message': gateway_msg,
+                         'type': 'free_tier_limit_reached',
+                         'code': 'free_tier_limit_reached'}}
+    req = httpx.Request('POST', 'https://tokenharbor.ai/v1/chat/completions')
+    err429 = RateLimitError(
+        message=f"Error code: 429 - {payload}",
+        response=httpx.Response(429, json=payload, request=req),
+        body=payload)
+
+    check('шлюз: 429-запас опознан как квота',
+          bot.is_quota_exceeded_error(gateway_msg) is True, '')
+    check('шлюз: RateLimitError шлюза → is_quota_rate_limit',
+          bot.is_quota_rate_limit(err429) is True, '')
+    check('шлюз: 429 виден в тексте ошибки', '429' in str(err429), str(err429)[:60])
+    for text in ('insufficient_quota', 'exceeded your current quota'):
+        check(f'шлюз: квота по шаблону ({text})',
+              bot.is_quota_exceeded_error(text) is True, '')
+
+    # Минутный лимит: повтор на том же ключе лечит — не квота.
+    per_minute = ('Rate limit reached for default-model on requests per min '
+                  '(RPM): Limit 60, Used 60. Please try again in 1.1s.')
+    pm_payload = {'error': {'message': per_minute, 'type': 'rate_limit_exceeded'}}
+    pm_err = APIStatusError(
+        message='429',
+        response=httpx.Response(429, json=pm_payload, request=req),
+        body=pm_payload)
+    check('шлюз: минутный лимит — не квота',
+          bot.is_quota_exceeded_error(per_minute) is False, '')
+    check('шлюз: минутный лимит — RateLimitError не квота',
+          bot.is_quota_rate_limit(pm_err) is False, '')
+
+    # Поведение: сухая квота уходит наружу СРАЗУ — один запрос, без повторов.
+    # Ключ у провайдера один (иначе ротация по ключам — отдельный тест).
+    calls = {'n': 0}
+
+    class _FakeClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=self)
+
+        def with_options(self, **_kw):
+            return self
+
+        async def create(self, **_params):
+            calls['n'] += 1
+            raise err429
+
+    saved = (bot.get_active_llm_client, dict(bot.LLM_API_KEYS))
+    raised = False
+    try:
+        bot.LLM_API_KEYS = {**bot.LLM_API_KEYS, bot.LLM_PROVIDER: ['only']}
+        bot.get_active_llm_client = lambda: _FakeClient()
+        try:
+            with _quiet():
+                asyncio.get_event_loop().run_until_complete(
+                    bot._execute_single_key_request(
+                        {'model': 'deepseek-v4.1-flash:free'}))
+        except Exception as e:
+            raised = 'free_tier_limit_reached' in str(e)
+    finally:
+        bot.get_active_llm_client, bot.LLM_API_KEYS = saved
+    check('шлюз: сухая квота — 1 запрос и наружу (без 10/20с-повторов)',
+          raised and calls['n'] == 1, (raised, calls['n']))
 
 
 def test_collect_order_and_parents():

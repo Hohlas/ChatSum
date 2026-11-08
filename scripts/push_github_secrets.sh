@@ -134,37 +134,52 @@ gh_set_var() {  # name value
   fi
 }
 
+# push_key_family BASE REQUIRED
+#   BASE     — имя основного секрета (например TOKENHARBOR_API_KEY)
+#   REQUIRED — 1/0: обязателен ли сам BASE
+# Публикует BASE, все BASE<N> (нумерация с 1: BASE1, BASE2, ...; числовая
+# сортировка — KEY2 < KEY10) и сводный BASE+S — ключи через перевод строки,
+# без потолка на количество. Бот (load_api_keys) разберёт по строкам/запятым
+# и уберёт дубликаты. Значения секретов не печатаются — только имена и
+# длины/число ключей.
+push_key_family() {
+  local base="$1" required="$2"
+  gh_set_secret "$base" "$(get_var "$base")" "$required"
+  local bundle names name v clean
+  bundle="$(get_var "$base")
+"
+  names="$(grep -oE "^${base}[0-9]+" private.txt 2>/dev/null | awk -v b="$base" '{ n=$0; sub("^" b, "", n); printf "%010d %s\n", n+0, $0 }' | sort | cut -d' ' -f2- || true)"
+  # shellcheck disable=SC2086  # разбиение на слова здесь намеренно (имена по одному на строке)
+  for name in $names; do
+    v="$(get_var "$name")"
+    if is_placeholder "$v"; then
+      echo "⏭️  $name пропущен (пусто или заглушка)"
+      continue
+    fi
+    gh_set_secret "$name" "$v" 0
+    bundle="$bundle$v
+"
+  done
+  clean="$(printf '%s' "$bundle" | sed '/^[[:space:]]*$/d')"
+  if [ -z "$clean" ]; then
+    echo "⏭️  ${base}S пропущен (нет ни одного ключа)"
+    return 0
+  fi
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "DRY secret   ${base}S (bundle: $(printf '%s' "$clean" | grep -c . || true) кл., значения скрыты)"
+  else
+    gh secret set "${base}S" --repo "$REPO" --body "$clean" >/dev/null
+    echo "✅ secret   ${base}S (bundle: все ключи разом)"
+  fi
+}
+
 echo "--- Secrets ---"
 gh_set_secret TELEGRAM_API_ID   "$(get_var TELEGRAM_API_ID)" 1
 gh_set_secret TELEGRAM_API_HASH "$(get_var TELEGRAM_API_HASH)" 1
 gh_set_secret TELEGRAM_PHONE    "$(get_var TELEGRAM_PHONE)" 1
 gh_set_secret TELEGRAM_SESSION  "$SESSION" 1
-gh_set_secret GOOGLE_API_KEY    "$(get_var GOOGLE_API_KEY)" 1
-# Все GOOGLE_API_KEY<N> из private.txt — сколько бы их ни было (1, 5, 20+).
-# Имена — по возрастанию N (сортировка числовая: KEY2 < KEY10).
-KEY_NAMES="$(grep -oE '^GOOGLE_API_KEY[0-9]+' private.txt 2>/dev/null | awk '{ n=$0; sub(/^GOOGLE_API_KEY/, "", n); printf "%010d %s\n", n+0, $0 }' | sort | cut -d' ' -f2- || true)"
-BUNDLE="$(get_var GOOGLE_API_KEY)
-"
-# shellcheck disable=SC2086  # разбиение на слова здесь намеренно (имена по одному на строке)
-for name in $KEY_NAMES; do
-  v="$(get_var "$name")"
-  if [ -z "$v" ] || is_placeholder "$v"; then
-    echo "⏭️  $name пропущен (пусто или заглушка)"
-    continue
-  fi
-  gh_set_secret "$name" "$v" 0
-  BUNDLE="$BUNDLE$v
-"
-done
-# Сводный секрет без потолка на количество: бот (load_google_api_keys)
-# разберёт по строкам/запятым и уберёт дубликаты. Пустые строки вычищены.
-BUNDLE_CLEAN="$(printf '%s' "$BUNDLE" | sed '/^[[:space:]]*$/d')"
-if [ "$DRY_RUN" = 1 ]; then
-  echo "DRY secret   GOOGLE_API_KEYS (bundle: $(printf '%s' "$BUNDLE_CLEAN" | grep -c . || true) кл., значения скрыты)"
-else
-  gh secret set "GOOGLE_API_KEYS" --repo "$REPO" --body "$BUNDLE_CLEAN" >/dev/null
-  echo "✅ secret   GOOGLE_API_KEYS (bundle: все ключи разом)"
-fi
+# Google: все GOOGLE_API_KEY<N> из private.txt — сколько бы их ни было.
+push_key_family GOOGLE_API_KEY 1
 GROUP_ID="$(get_var TELEGRAM_GROUP_ID)"
 case "$GROUP_ID" in
   -[0-9]*|[0-9]*)
@@ -178,10 +193,11 @@ case "$GROUP_ID" in
 esac
 
 echo "--- Secrets (LLM-провайдеры; private.txt хранит только ключи) ---"
-gh_set_secret OPENROUTER_API_KEY "$(get_var OPENROUTER_API_KEY)" 0
-gh_set_secret OPENCODE_GO_API_KEY "$(get_var OPENCODE_GO_API_KEY)" 0
-gh_set_secret NVIDIA_API_KEY "$(get_var NVIDIA_API_KEY)" 0
-gh_set_secret TOKENHARBOR_API_KEY "$(get_var TOKENHARBOR_API_KEY)" 0
+# Ротация по 429: несколько ключей на провайдера (BASE<N>) + сводный BASE+S.
+push_key_family OPENROUTER_API_KEY 0
+push_key_family OPENCODE_GO_API_KEY 0
+push_key_family NVIDIA_API_KEY 0
+push_key_family TOKENHARBOR_API_KEY 0
 
 echo "--- Variables (публичные; секретные значения кладите в Secrets) ---"
 PROVIDER="$(get_var LLM_PROVIDER)";       [ -n "$PROVIDER" ] || PROVIDER="google"

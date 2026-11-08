@@ -88,6 +88,13 @@ jobs:
           OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
           NVIDIA_API_KEY:   ${{ secrets.NVIDIA_API_KEY }}
           TOKENHARBOR_API_KEY: ${{ secrets.TOKENHARBOR_API_KEY }}
+          # Сводные секреты с дополнительными ключами (BASE+S): ротация по 429.
+          # Раннер не терпит бесконечных env — несём все ключи одной строкой
+          # (push_github_secrets.sh собирает из private.txt), бот разберёт.
+          OPENROUTER_API_KEYS:   ${{ secrets.OPENROUTER_API_KEYS }}
+          OPENCODE_GO_API_KEYS:  ${{ secrets.OPENCODE_GO_API_KEYS }}
+          NVIDIA_API_KEYS:       ${{ secrets.NVIDIA_API_KEYS }}
+          TOKENHARBOR_API_KEYS:  ${{ secrets.TOKENHARBOR_API_KEYS }}
           LLM_PROVIDER:     ${{ vars.LLM_PROVIDER }}
           GEMINI_MODEL:      ${{ vars.GEMINI_MODEL }}
           GEMINI_TEMPERATURE:      ${{ vars.GEMINI_TEMPERATURE }}
